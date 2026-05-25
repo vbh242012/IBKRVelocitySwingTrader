@@ -1,0 +1,2423 @@
+import json
+import logging
+import os
+import copy
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta
+from logging.handlers import TimedRotatingFileHandler
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import pytz
+from ib_async import IB, Index, Stock, MarketOrder, Order, util
+
+from src.config import (
+    BASE_DIR, STATE_FILE, DASHBOARD_FILE, EQUITY_HIST_FILE, HALT_FILE, FORCE_EXIT_FILE,
+    LOG_DIR, LOG_FILE,
+    IB_HOST, IB_PORT, IB_CLIENT_ID, MARKET_DATA_TYPE, VIX_MARKET_DATA_TYPE,
+    ACCOUNT_CURRENCY,
+    TRADING_MODE, LIVE_TRADING_ACK, LIVE_TRADING_ACK_PHRASE, LIVE_IB_PORTS, PAPER_IB_PORTS,
+    ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
+    MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
+    VIX_THRESHOLD, HOLD_TRADING_BARS, PROFIT_MIN_THRESHOLD, BREAK_EVEN_PCT,
+    ENTRY_START, ENTRY_END, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
+    ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
+    RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW, RSI_THRESHOLD,
+    ORB_LOOKBACK, ORB_BAR_SIZE, DAILY_LOOKBACK, DAILY_BAR_SIZE,
+    SCAN_MIN_DOLLAR_VOL,
+    SCAN_INTERVAL, ERROR_WAIT,
+    LOG_BACKUP_COUNT,
+    EQUITY_RETRY_INTERVAL,
+    TICKER_BLOCKLIST,
+    GAP_MAX_PCT,
+    MAX_DAILY_LOSS_PCT,
+    RSI_MIN_DELTA,
+    DAY_RANGE_LOCATION_MIN,
+    INTRADAY_GAIN_MIN,
+    ATR_PCT_MAX,
+    HARD_STOP_PCT,
+    RISK_PER_TRADE_PCT,
+    BEAR_PHASE_TRADING_ENABLED,
+    BEAR_PHASE_RISK_MULT,
+    BEAR_PHASE_DOLLAR_VOL_MULT,
+    BEAR_RVOL_MIN,
+    BEAR_VCP_RATIO,
+    BEAR_RSI_THRESHOLD,
+    BEAR_RSI_MIN_DELTA,
+    BEAR_GAP_MAX_PCT,
+    FRIDAY_CLOSE_HOUR,
+    FRIDAY_MIN_PROFIT_PCT,
+    MIN_CANDLES, VCP_RATIO, BREAKOUT_PCT, RVOL_MIN, SPREAD_MAX_PCT,
+    SCAN_MIN_PRICE,
+    CORR_MAX, MAX_SECTOR_COUNT, SMA200_SLOPE_LOOKBACK,
+    ENTRY_REPRICE_MAX_AGE_SEC, ENTRY_MAX_PRICE_DRIFT_PCT,
+    ENTRY_LIMIT_ASK_CUSHION_PCT, ENTRY_LIMIT_MIN_TICK, ENTRY_LIMIT_MAX_OVER_MARKET_PCT,
+    CHANDELIER_PERIOD, CHANDELIER_MULT,
+)
+from src.ib_gateway import ensure_ib_gateway_ready
+from src.indicators import apply_all
+from src.scanner import build_momentum_scanner
+
+os.makedirs(BASE_DIR, exist_ok=True)
+os.makedirs(LOG_DIR,  exist_ok=True)
+
+# Single timezone object reused throughout the module.
+# The machine runs on IST (UTC+5:30); all times must be anchored to US/Eastern
+# so market-hours checks, timestamps, and log lines are unambiguous.
+_TZ_NY = pytz.timezone('US/Eastern')
+_REJECTED_ORDER_STATUSES = {'Inactive', 'ApiCancelled', 'Cancelled'}
+
+
+class AccountDataUnavailable(RuntimeError):
+    """Raised when IBKR account summary data is not fresh enough for entries."""
+
+
+def _count_trading_days(entry_dt: datetime, now: datetime) -> int:
+    """Count complete Mon-Fri trading sessions elapsed between entry_dt and now."""
+    entry_date = entry_dt.date()
+    now_date   = now.date()
+    count      = 0
+    cursor     = entry_date
+    while cursor < now_date:
+        if cursor.weekday() < 5:
+            count += 1
+        cursor += timedelta(days=1)
+    return count
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+class _EasternFormatter(logging.Formatter):
+    def formatTime(self, record, _datefmt=None):
+        dt = datetime.fromtimestamp(record.created, _TZ_NY)
+        return dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+
+
+def _log_namer(default_name: str) -> str:
+    # TimedRotatingFileHandler default suffix: logs/trading_engine.log.2026-05-12
+    # We produce the cleaner form:             logs/trading_engine_2026-05-12.log
+    if '.log.' in default_name:
+        base, date_suffix = default_name.rsplit('.log.', 1)
+        return f"{base}_{date_suffix}.log"
+    return default_name
+
+
+logger = logging.getLogger('VelocityEngine')
+logger.setLevel(logging.INFO)
+# Guard against duplicate handlers when the module is re-imported (tests, restarts).
+if not logger.handlers:
+    _handler = TimedRotatingFileHandler(
+        LOG_FILE, when='midnight', backupCount=LOG_BACKUP_COUNT
+    )
+    _handler.namer = _log_namer
+    _handler.setFormatter(_EasternFormatter('%(asctime)s | %(levelname)s | %(message)s'))
+    _console = logging.StreamHandler(sys.stdout)
+    _console.setFormatter(_EasternFormatter('%(asctime)s | %(levelname)s | %(message)s'))
+    logger.addHandler(_handler)
+    logger.addHandler(_console)
+
+
+# ── Engine ────────────────────────────────────────────────────────────────────
+class VelocityEngine:
+    def __init__(self):
+        self.ib           = IB()
+        self.state        = self.load_state()
+
+        # Metrics written to dashboard_data.json after every cycle
+        self._last_equity:      float            = 0.0
+        self._last_settled_cash: float           = 0.0
+        self._equity_initialized: bool         = False   # True after first real IBKR fetch
+        self._last_vix:         Optional[float] = None
+        self._last_scan_ts:     Optional[str]   = None
+        self._next_scan_dt:     Optional[str]   = None   # ISO string for the web UI
+
+        # Daily loss circuit breaker
+        self._day_start_equity: Optional[float] = None
+        self._day_start_date:   Optional[str]   = None
+
+        # Bar cache: keyed by symbol, invalidated daily (date-scoped)
+        self._bar_cache: Dict[str, dict] = {}
+        # Contract cache: avoids re-qualifying the same symbol every cycle
+        self._contract_cache: Dict[str, object] = {}
+        # VIX contract cached after first successful qualification
+        self._vix_contract = None
+        # SPY regime cache: refreshed once per trading day
+        self._spy_cache: dict = {}
+        # Sector cache: symbol → industry string (stable; never invalidated)
+        self._sector_cache: Dict[str, str] = {}
+        # Symbols that failed stable same-day scan requirements. This is an IBKR
+        # pacing guard, not an alpha rule; dynamic intraday failures are never cached.
+        self._daily_scan_skip: Dict[str, str] = {}
+        # Last trading date a full protective stop-order audit was run.
+        self._last_audit_date: Optional[str] = None
+        # Avoid deleting state on one transient/partial IBKR positions snapshot.
+        self._missing_position_counts: Dict[str, int] = {}
+
+        self.connect()
+
+    # ── IB connection ──────────────────────────────────────────────────────────
+    def connect(self):
+        self._validate_deployment_mode()
+        try:
+            if not ensure_ib_gateway_ready():
+                raise RuntimeError(
+                    f"IB Gateway API port {IB_HOST}:{IB_PORT} is unavailable "
+                    "and auto-start is disabled."
+                )
+            self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
+            self.ib.reqMarketDataType(MARKET_DATA_TYPE)
+            self.ib.errorEvent            += self._on_ib_error
+            self.ib.disconnectedEvent     += self._on_ib_disconnect
+            self.ib.commissionReportEvent += self._on_commission_report
+            logger.info(
+                f"ENGINE CONNECTED: IB Gateway Ready "
+                f"(mode={TRADING_MODE}, host={IB_HOST}, port={IB_PORT}, clientId={IB_CLIENT_ID})."
+            )
+            self._write_dashboard_data(connected=True)
+        except Exception as e:
+            self._alert("CRITICAL", f"CONNECTION FAILED: Is IB Gateway open? {e}")
+            sys.exit()
+
+    def _on_ib_error(self, reqId, errorCode, errorString, contract):
+        # Codes that are purely informational and produce no actionable log noise.
+        # 162  : scanner subscription ended after reqScannerData — expected behaviour.
+        # 202  : order cancellation confirmation (startup orphan cleanup) — expected.
+        # 2104 : market data farm connected (info).
+        # 2106 : HMDS data farm connected (info).
+        # 2107 : HMDS data farm inactive (info).
+        # 2108 : market data farm inactive but available on demand (info).
+        # 2119 : market data farm connecting (info).
+        # 2158 : sec-def data farm connected (info).
+        # 10167: delayed data notice — expected when MARKET_DATA_TYPE=3.
+        # 135  : "Can't find order" — cascade when child bracket orders are already
+        #        cancelled by IB before our explicit cancel loop runs.
+        # 10147: "OrderId not found" — same cascade as 135.
+        SILENT = {135, 162, 202, 2104, 2106, 2107, 2108, 2119, 2158, 10147, 10167}
+        if errorCode in SILENT:
+            return
+        if errorCode == 10349:
+            logger.warning(f"IB preset override (10349) reqId={reqId}: {errorString}")
+            return
+        logger.warning(f"IB error {errorCode} reqId={reqId}: {errorString}")
+
+    def _on_ib_disconnect(self):
+        self._alert("ERROR", "IB DISCONNECTED: connection lost — will attempt reconnect on next cycle.")
+        self._write_dashboard_data(connected=False)
+
+    def _on_commission_report(self, trade, fill, report):
+        """Async callback: IB commission reports arrive after the fill confirmation.
+        Match by the entry order ID stored at fill time and persist to state."""
+        try:
+            commission = float(report.commission)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(commission) or commission <= 0:
+            return
+        order_id = trade.order.orderId
+        for sym, data in self.state.items():
+            if data.get('entry_order_id') == order_id:
+                data['commission'] = round(commission, 4)
+                self.save_state()
+                logger.info(
+                    f"COMMISSION: {sym} order={order_id} "
+                    f"commission=${commission:.4f}"
+                )
+                break
+
+    def _reconnect(self) -> bool:
+        self._validate_deployment_mode()
+        logger.info("RECONNECT: attempting to reconnect to IB Gateway...")
+        for attempt in range(1, 11):
+            try:
+                if not ensure_ib_gateway_ready():
+                    raise RuntimeError(
+                        f"IB Gateway API port {IB_HOST}:{IB_PORT} is unavailable "
+                        "and auto-start is disabled."
+                    )
+                self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
+                self.ib.reqMarketDataType(MARKET_DATA_TYPE)
+                logger.info(f"RECONNECT: success on attempt {attempt}")
+                self._write_dashboard_data(connected=True)
+                return True
+            except Exception as e:
+                logger.warning(f"RECONNECT: attempt {attempt}/10 failed: {e}")
+                self.ib.sleep(5)
+        self._alert("CRITICAL", "RECONNECT: all 10 attempts failed — skipping trading cycles until restored")
+        return False
+
+    def _request_vix_tickers(self):
+        """Request VIX with its own market-data type, then restore stock data mode."""
+        restore_type = None
+        if VIX_MARKET_DATA_TYPE != MARKET_DATA_TYPE:
+            restore_type = MARKET_DATA_TYPE
+            self.ib.reqMarketDataType(VIX_MARKET_DATA_TYPE)
+        try:
+            return self.ib.reqTickers(self._vix_contract)
+        finally:
+            if restore_type is not None:
+                self.ib.reqMarketDataType(restore_type)
+
+    def _fetch_vix_price(self) -> Optional[float]:
+        """Return the current/delayed VIX value, with a robust historical fallback."""
+        try:
+            vix_tickers = self._request_vix_tickers()
+        except Exception as e:
+            logger.warning(f"VIX ticker request failed ({e}); trying historical fallback.")
+            vix_tickers = []
+        if vix_tickers:
+            vix_ticker = vix_tickers[0]
+            vix_price = (
+                self._coerce_positive_price(vix_ticker.marketPrice())
+                or self._coerce_positive_price(getattr(vix_ticker, 'close', None))
+            )
+            if vix_price is not None:
+                return vix_price
+            logger.warning("VIX ticker returned no usable price; trying historical fallback.")
+        else:
+            logger.warning("VIX ticker unavailable; trying historical fallback.")
+
+        try:
+            bars = self.ib.reqHistoricalData(
+                self._vix_contract, '', '5 D', DAILY_BAR_SIZE, 'TRADES', False
+            )
+            if not bars:
+                logger.warning("VIX historical fallback returned no bars.")
+                return None
+            hist_price = self._coerce_positive_price(getattr(bars[-1], 'close', None))
+            if hist_price is None:
+                logger.warning("VIX historical fallback returned an invalid close.")
+                return None
+            logger.info(f"VIX fallback: using latest historical close {hist_price:.2f}")
+            return hist_price
+        except Exception as e:
+            logger.warning(f"VIX historical fallback failed: {e}")
+            return None
+
+    def _ensure_connected(self) -> bool:
+        if not self.ib.isConnected():
+            logger.warning("ENGINE: not connected — attempting reconnect before cycle")
+            return self._reconnect()
+        return True
+
+    def _operator_halt_active(self) -> bool:
+        """Manual kill switch: HALT_FILE presence blocks new entries only."""
+        return os.path.exists(HALT_FILE)
+
+    def _force_exit_active(self) -> bool:
+        """Emergency kill switch: FORCE_EXIT_FILE liquidates all broker positions."""
+        return os.path.exists(FORCE_EXIT_FILE)
+
+    def _alert(self, severity: str, message: str):
+        """Send high-priority operational alerts without adding external deps."""
+        severity = severity.upper()
+        log_fn = logger.error if severity in {'CRITICAL', 'ERROR'} else logger.warning
+        log_fn(f"ALERT[{severity}]: {message}")
+        if not ALERT_WEBHOOK_URL:
+            return
+        payload = json.dumps({
+            "severity": severity,
+            "message": message,
+            "ts": datetime.now(_TZ_NY).isoformat(),
+            "mode": TRADING_MODE,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            ALERT_WEBHOOK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=ALERT_TIMEOUT_SEC):
+                pass
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            logger.warning(f"ALERT: webhook delivery failed: {e}")
+
+    def _validate_deployment_mode(self):
+        """Fail closed when config points at live trading without explicit acknowledgement."""
+        mode = TRADING_MODE.strip().lower()
+        if mode not in {"paper", "live"}:
+            self._alert("CRITICAL", f"Invalid VELOCITY_TRADING_MODE={TRADING_MODE!r}; expected paper or live.")
+            sys.exit()
+        if MARKET_DATA_TYPE != 1:
+            self._alert(
+                "CRITICAL",
+                f"MARKET_DATA_TYPE={MARKET_DATA_TYPE}; live entries require real-time market data type 1.",
+            )
+            sys.exit()
+        if mode == "paper" and IB_PORT in LIVE_IB_PORTS:
+            self._alert(
+                "CRITICAL",
+                f"Paper mode refuses to connect to live-looking IB port {IB_PORT}. "
+                "Set VELOCITY_TRADING_MODE=live and explicit acknowledgement for live trading.",
+            )
+            sys.exit()
+        if mode == "live" and IB_PORT in PAPER_IB_PORTS:
+            self._alert(
+                "CRITICAL",
+                f"Live mode refuses to connect to paper-looking IB port {IB_PORT}. "
+                "Use the live IB Gateway/TWS port before enabling live trading.",
+            )
+            sys.exit()
+        if mode == "live" and LIVE_TRADING_ACK != LIVE_TRADING_ACK_PHRASE:
+            self._alert(
+                "CRITICAL",
+                "Live trading blocked: set VELOCITY_LIVE_TRADING_ACK="
+                f"{LIVE_TRADING_ACK_PHRASE} only after paper validation.",
+            )
+            sys.exit()
+
+    @staticmethod
+    def _coerce_positive_price(value) -> Optional[float]:
+        """Return a finite positive float price, or None for unusable broker values."""
+        if not isinstance(value, (int, float, np.integer, np.floating)):
+            return None
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        if np.isfinite(price) and price > 0:
+            return price
+        return None
+
+    @staticmethod
+    def _round_up_to_cent(value: float) -> float:
+        """Round up to the nearest US equity penny tick."""
+        return round(float(np.ceil(float(value) * 100.0 - 1e-9) / 100.0), 2)
+
+    @staticmethod
+    def _round_down_to_cent(value: float) -> float:
+        """Round down to the nearest US equity penny tick."""
+        return round(float(np.floor(float(value) * 100.0 + 1e-9) / 100.0), 2)
+
+    @staticmethod
+    def _calc_entry_limit_price(price, bid, ask) -> Optional[float]:
+        """Return a marketable, spread-aware BUY limit price, or None.
+
+        MOST_ACTIVE names are usually liquid, so the parent BUY should key off
+        the real ask instead of blindly adding a fixed percentage to the last or
+        midpoint. The old 0.2% cushion remains as a hard max over the validated
+        reference price, while the working limit is ask plus a small tick/cushion.
+        """
+        ref_price = VelocityEngine._coerce_positive_price(price)
+        bid_price = VelocityEngine._coerce_positive_price(bid)
+        ask_price = VelocityEngine._coerce_positive_price(ask)
+        if ref_price is None or bid_price is None or ask_price is None:
+            return None
+        if ask_price <= bid_price:
+            return None
+
+        mid = (bid_price + ask_price) / 2.0
+        if mid <= 0:
+            return None
+        spread_pct = (ask_price - bid_price) / mid
+        if spread_pct > SPREAD_MAX_PCT:
+            return None
+
+        max_limit = ref_price * (1.0 + max(0.0, ENTRY_LIMIT_MAX_OVER_MARKET_PCT))
+        if ask_price > max_limit:
+            return None
+
+        cushion = max(ENTRY_LIMIT_MIN_TICK, ask_price * max(0.0, ENTRY_LIMIT_ASK_CUSHION_PCT))
+        raw_limit = min(ask_price + cushion, max_limit)
+        limit = round(raw_limit, 2)
+        if limit < ask_price:
+            limit = VelocityEngine._round_up_to_cent(ask_price)
+        if limit > max_limit:
+            limit = VelocityEngine._round_down_to_cent(max_limit)
+        if limit < ask_price:
+            return None
+        return limit
+
+    @staticmethod
+    def _account_currency_matches(item) -> bool:
+        """Ignore non-USD account summary rows in multi-currency IBKR accounts."""
+        currency = getattr(item, 'currency', '')
+        if not isinstance(currency, str):
+            currency = ''
+        return currency in ('', 'BASE', ACCOUNT_CURRENCY)
+
+    def _stock_contract(self, sym: str):
+        if sym not in self._contract_cache:
+            contract = Stock(sym, 'SMART', 'USD')
+            qualified = self.ib.qualifyContracts(contract)
+            if not qualified:
+                raise RuntimeError(f"IBKR could not qualify contract for {sym}")
+            self._contract_cache[sym] = qualified[0]
+        return self._contract_cache[sym]
+
+    def _fresh_market_price(self, sym: str) -> Optional[float]:
+        """Fetch a fresh market price from IBKR for exit/risk decisions."""
+        try:
+            contract = self._stock_contract(sym)
+            tickers = self.ib.reqTickers(contract)
+            if not tickers:
+                return None
+            ticker = tickers[0]
+            for candidate in (
+                ticker.marketPrice(),
+                getattr(ticker, 'last', None),
+                getattr(ticker, 'close', None),
+            ):
+                price = self._coerce_positive_price(candidate)
+                if price is not None:
+                    return price
+        except Exception as e:
+            logger.warning(f"PRICE {sym}: fresh market price unavailable ({e})")
+        return None
+
+    # ── State persistence ──────────────────────────────────────────────────────
+    def load_state(self):
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, 'r') as f:
+                    state = json.load(f)
+                if isinstance(state, dict):
+                    return state
+                raise ValueError(f"state root must be dict, got {type(state).__name__}")
+            except (json.JSONDecodeError, OSError) as e:
+                backup = f"{STATE_FILE}.corrupt.{datetime.now(_TZ_NY).strftime('%Y%m%d_%H%M%S')}"
+                try:
+                    shutil.copy2(STATE_FILE, backup)
+                    self._alert(
+                        "CRITICAL",
+                        f"STATE: Could not load state file ({e}). Backed up to {backup}; starting empty.",
+                    )
+                except OSError as backup_e:
+                    self._alert(
+                        "CRITICAL",
+                        f"STATE: Could not load state file ({e}) and backup failed ({backup_e}); starting empty.",
+                    )
+            except ValueError as e:
+                backup = f"{STATE_FILE}.invalid.{datetime.now(_TZ_NY).strftime('%Y%m%d_%H%M%S')}"
+                try:
+                    shutil.copy2(STATE_FILE, backup)
+                    self._alert("CRITICAL", f"STATE: Invalid state file ({e}). Backed up to {backup}; starting empty.")
+                except OSError as backup_e:
+                    self._alert("CRITICAL", f"STATE: Invalid state file ({e}) and backup failed ({backup_e}); starting empty.")
+        return {}
+
+    def save_state(self):
+        tmp = STATE_FILE + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(self.state, f, indent=4)
+            os.replace(tmp, STATE_FILE)
+        except OSError as e:
+            self._alert("CRITICAL", f"STATE: failed to persist engine state: {e}")
+            raise
+
+    # ── Dashboard data writer ─────────────────────────────────────────────────
+    def _write_dashboard_data(self, connected: bool = True):
+        """Write engine metrics to dashboard_data.json for the web dashboard."""
+        now = datetime.now(_TZ_NY)
+        data = {
+            "equity":       self._last_equity,
+            "settled_cash": self._last_settled_cash,
+            "vix":          self._last_vix,
+            "connected":    connected,
+            "last_scan":    self._last_scan_ts,
+            "next_scan":    self._next_scan_dt,
+            "last_updated": now.isoformat(),
+        }
+        try:
+            with open(DASHBOARD_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+        except OSError as e:
+            logger.warning(f"Could not write dashboard data: {e}")
+
+        # Append equity snapshot to rolling history (kept for 60 days)
+        # Skip until the first real IBKR accountSummary() reading arrives.
+        if self._last_equity > 0 and self._equity_initialized:
+            try:
+                cutoff = now.timestamp() - 60 * 86400   # 60 days ago
+                try:
+                    with open(EQUITY_HIST_FILE, 'r') as f:
+                        history = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    history = []
+                history = [e for e in history if e.get('ts_epoch', 0) >= cutoff]
+                history.append({"ts": now.isoformat(), "ts_epoch": now.timestamp(),
+                                 "eq": round(self._last_equity, 2)})
+                with open(EQUITY_HIST_FILE, 'w') as f:
+                    json.dump(history, f)
+            except OSError as e:
+                logger.warning(f"Could not write equity history: {e}")
+
+    # ── Account ────────────────────────────────────────────────────────────────
+    def _get_account_values(self) -> Tuple[float, float]:
+        """Return (net_liquidation, settled_cash) using fresh IBKR data only.
+
+        For a cash account, AvailableFunds is not a safe substitute for
+        SettledCash. If SettledCash is missing or non-positive, new entries get
+        zero buying cash and naturally fail closed.
+        """
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                summary = self.ib.accountSummary()
+                if summary:
+                    net_liq = settled = 0.0
+                    settled_seen = False
+                    for item in summary:
+                        if not self._account_currency_matches(item):
+                            continue
+                        if item.tag == 'NetLiquidation':
+                            net_liq = float(item.value)
+                        elif item.tag == 'SettledCash':
+                            settled_seen = True
+                            settled = float(item.value)
+                    if net_liq > 0:
+                        if not settled_seen:
+                            logger.warning(
+                                "ACCOUNT: SettledCash tag missing — treating settled cash as $0.00 "
+                                "for cash-account safety"
+                            )
+                        elif settled <= 0:
+                            logger.warning(
+                                f"ACCOUNT: SettledCash=${settled:.2f} <= 0 — "
+                                "blocking new entries until cash settles"
+                            )
+                        return net_liq, max(settled, 0.0) if settled_seen else 0.0
+                logger.warning(
+                    f"ACCOUNT: accountSummary attempt {attempt}/{max_attempts} "
+                    "returned no usable data"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"ACCOUNT: accountSummary attempt {attempt}/{max_attempts} failed: {e}"
+                )
+            if attempt < max_attempts:
+                self.ib.sleep(2)
+
+        raise AccountDataUnavailable(
+            f"ACCOUNT: all {max_attempts} accountSummary attempts failed; "
+            "fresh settled cash is unavailable."
+        )
+
+    # ── Startup gate ──────────────────────────────────────────────────────────
+    def _fetch_equity_with_retry(self) -> float:
+        """Poll IBKR for NetLiquidation until a positive value is returned. Never gives up."""
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                summary = self.ib.accountSummary()
+                if summary:
+                    for item in summary:
+                        if not self._account_currency_matches(item):
+                            continue
+                        if item.tag == 'NetLiquidation':
+                            val = float(item.value)
+                            if val > 0:
+                                logger.info(f"INIT: NetLiquidation=${val:.2f} (attempt {attempt})")
+                                return val
+                logger.warning(
+                    f"INIT: Equity attempt {attempt}: NetLiquidation missing or ≤0, "
+                    f"retrying in {EQUITY_RETRY_INTERVAL}s..."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"INIT: Equity attempt {attempt} exception: {e}, "
+                    f"retrying in {EQUITY_RETRY_INTERVAL}s..."
+                )
+            self.ib.sleep(EQUITY_RETRY_INTERVAL)
+
+    def _log_startup_summary(self, equity: float):
+        """Log per-position table and capital totals at startup."""
+        if not self.state:
+            logger.info("INIT: No open positions. Full capital available.")
+            logger.info(
+                f"INIT READY | Equity=${equity:.2f} | Cash≈${equity:.2f} | Positions=0/{self._calc_max_positions(equity)}"
+            )
+            return
+        total_cost       = 0.0
+        total_unrealized = 0.0
+        logger.info("INIT: ── Open Positions ──────────────────────────────────")
+        for sym, d in self.state.items():
+            ep      = float(d.get('price', 0))
+            qty     = float(d.get('qty', 0))
+            cur     = float(d.get('current_price', ep))
+            sl      = float(d.get('stop_loss', 0))
+            unreal  = float(d.get('unrealized_pnl', (cur - ep) * qty))
+            unreal_pct = float(d.get('unrealized_pnl_pct', (cur - ep) / ep * 100 if ep else 0))
+            cost    = ep * qty
+            total_cost       += cost
+            total_unrealized += unreal
+            logger.info(
+                f"INIT:  {sym:6s} | entry=${ep:.2f} cur=${cur:.2f} qty={qty:.4g} "
+                f"cost=${cost:.2f} | unreal={unreal:+.2f} ({unreal_pct:+.1f}%) "
+                f"| SL=${sl:.2f}"
+            )
+        cash_approx = equity - total_cost
+        logger.info("INIT: ────────────────────────────────────────────────────")
+        logger.info(
+            f"INIT READY | Equity=${equity:.2f} | Invested≈${total_cost:.2f} "
+            f"| Cash≈${cash_approx:.2f} | Unrealized={total_unrealized:+.2f} "
+            f"| Positions={len(self.state)}/{self._calc_max_positions(equity)}"
+        )
+
+    def _initialize(self):
+        """
+        Two-phase startup gate.
+
+        Phase 1 (immediate): fetch equity, cancel orphaned orders, snapshot
+        positions and prices → write dashboard so the UI is live straight away.
+
+        Phase 2 (timed): sleep until PRE_ENTRY_SYNC_TIME (09:58 ET) so the
+        definitive position re-sync and chandelier stop audit happen with the
+        freshest IBKR data, right before the 10:00 AM entry window opens.
+        If the engine starts after the sync time (intraday restart, evening),
+        Phase 2 runs immediately with no sleep.
+        """
+        # ── Phase 1: immediate startup snapshot ──────────────────────────────
+        logger.info("INIT: Waiting for account equity from IBKR...")
+        equity = self._fetch_equity_with_retry()
+        self._last_equity        = equity
+        self._last_settled_cash  = 0.0      # exact settled cash is fetched in run_cycle()
+        self._equity_initialized = True
+        max_pos     = self._calc_max_positions(equity)
+        open_slots  = max(0, max_pos - len(self.state))
+        bucket_size = 0.0
+        logger.info(
+            f"INIT: Equity=${equity:.2f} | EntrySlots {open_slots}/{max_pos} | "
+            f"Bucket≈${bucket_size:.2f} until SettledCash is fetched in the first cycle"
+        )
+
+        # Cancel orphaned pending orders from a previous engine session.
+        # "Orphaned" = a symbol whose order is not attached to local state and
+        # has no live IBKR position.  We must NOT cancel active-position stop
+        # orders — those are audited in Phase 2.
+        open_orders = self.ib.reqAllOpenOrders()
+        ibkr_symbols = {
+            p.contract.symbol for p in self.ib.positions()
+            if float(getattr(p, 'position', 0) or 0) > 0
+        }
+        orphaned = [
+            t for t in open_orders
+            if str(getattr(t.order, 'action', '')).upper() in {'BUY', 'SELL'}
+            and t.contract.symbol not in self.state
+            and t.contract.symbol not in ibkr_symbols
+        ]
+        if orphaned:
+            logger.info(
+                f"INIT: Cancelling {len(orphaned)} orphaned orders "
+                f"({len(open_orders) - len(orphaned)} active-position orders preserved)."
+            )
+            for trade in orphaned:
+                try:
+                    self.ib.cancelOrder(trade.order)
+                except Exception as e:
+                    logger.warning(
+                        f"INIT: failed to cancel orphaned "
+                        f"{getattr(trade.order, 'action', '?')} order for "
+                        f"{getattr(trade.contract, 'symbol', '?')}: {e}"
+                    )
+            self.ib.sleep(2)
+
+        logger.info("INIT: Phase 1 — syncing positions for dashboard snapshot...")
+        self._sync_positions_from_ibkr()
+        if self.state:
+            self._update_position_prices()
+        self._write_dashboard_data(connected=True)
+
+        # ── Phase 2: pre-entry definitive sync + stop audit ──────────────────
+        self._wait_for_pre_entry_sync()
+
+        logger.info("INIT: Phase 2 — pre-entry re-sync and stop-order audit...")
+        self._sync_positions_from_ibkr()
+        if self.state:
+            logger.info("INIT: Auditing stop orders for open positions...")
+            self._audit_stop_orders()
+            logger.info("INIT: Fetching live prices for open positions...")
+            self._update_position_prices()
+
+        self._log_startup_summary(equity)
+        self._write_dashboard_data(connected=True)
+
+    def _wait_for_pre_entry_sync(self):
+        """
+        Sleep until PRE_ENTRY_SYNC_TIME (default 09:58 ET) so the definitive
+        position re-sync and stop audit run just before the 10:00 AM entry window.
+
+        If the engine starts after the sync time (intraday restart, evening run),
+        the method returns immediately without sleeping.
+        """
+        h, m    = PRE_ENTRY_SYNC_TIME
+        now_ny  = datetime.now(_TZ_NY)
+        target  = now_ny.replace(hour=h, minute=m, second=0, microsecond=0)
+
+        if now_ny >= target:
+            logger.info(
+                f"INIT: Already at or past {h:02d}:{m:02d} ET — "
+                f"running pre-entry sync immediately."
+            )
+            return
+
+        wait_s = (target - now_ny).total_seconds()
+        logger.info(
+            f"INIT: Waiting {wait_s / 60:.1f} min until {h:02d}:{m:02d} ET "
+            f"for pre-entry position sync & stop audit "
+            f"(entry window opens at {ENTRY_START[0]:02d}:{ENTRY_START[1]:02d} ET)."
+        )
+        self.ib.sleep(wait_s)
+
+    def _entry_good_after_time(self) -> str:
+        """Return a 10:00 ET activation string only while that time is still future."""
+        now_ny = datetime.now(_TZ_NY)
+        entry_gate = now_ny.replace(
+            hour=ENTRY_START[0],
+            minute=ENTRY_START[1],
+            second=0,
+            microsecond=0,
+        )
+        if now_ny >= entry_gate:
+            return ""
+        return (
+            f"{now_ny.strftime('%Y%m%d')} "
+            f"{ENTRY_START[0]:02d}:{ENTRY_START[1]:02d}:00 US/Eastern"
+        )
+
+    def _preflight_order(
+        self,
+        contract,
+        order,
+        sym: str,
+        *,
+        allow_protective_sell_fail_open: bool = False,
+    ) -> bool:
+        """
+        Call IBKR's whatIf API to verify an order won't be rejected before placing it.
+
+        ib.whatIfOrder() makes an internal copy (order is not mutated), sets
+        whatIf=True on the copy, and returns an OrderState.  The canonical
+        rejection signal is OrderState.warningText being non-empty — IBKR sets
+        this for every detectable problem: insufficient buying power, invalid
+        parameters, unsupported order type, market-hours violations, etc.
+
+        Returns True  → order appears acceptable; caller may call placeOrder().
+        Returns False → IBKR flagged a problem; caller should skip this order.
+
+        On whatIf exceptions, fail closed by default. The only exception is an
+        already-open position stop audit where failing to submit a protective
+        SELL can leave inventory completely unprotected.
+        """
+        try:
+            state   = self.ib.whatIfOrder(contract, order)
+            if isinstance(state, list):
+                state = state[0] if state else None
+            if state is None:
+                raise ValueError("whatIfOrder returned empty result")
+            warning = (state.warningText or '').strip()
+            if warning:
+                logger.warning(
+                    f"PREFLIGHT {sym} [{order.action} {order.orderType}]: {warning}"
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.warning(
+                f"PREFLIGHT {sym}: whatIf check failed ({e})"
+            )
+            return (
+                allow_protective_sell_fail_open
+                and getattr(order, 'action', '') == 'SELL'
+                and sym in self.state
+            )
+
+    def _audit_stop_orders(self):
+        """
+        For every open position ensure exactly one chandelier TRAIL SELL order exists.
+
+        Steps per symbol:
+        1. Find all open SELL orders for the symbol.
+        2. Cancel any that are NOT order type TRAIL (stale LMT take-profits, STP, etc.).
+        3. If no TRAIL SELL remains after cancellations, fetch ATR(22) from daily bars
+           and place a new chandelier TRAIL SELL (GTC, transmit=True).
+
+        The entry trading window (10:00–15:30 ET) applies only to new BUY entries.
+        Stop orders for existing positions are placed immediately regardless of time —
+        including pre-market startup — because GTC orders are accepted by IBKR 24/7
+        and become active at the next market open.  After placeOrder() we wait 2 s and
+        verify the order status so any unexpected rejection is caught and logged; state
+        is only updated once IB confirms the order is live (PreSubmitted / Submitted).
+        """
+        if not self.state:
+            return
+
+        # Log whether we are placing in or outside regular market hours so the
+        # operator can correlate any IB rejection messages in the log.
+        now_ny    = datetime.now(_TZ_NY)
+        in_market = (
+            now_ny.weekday() < 5
+            and (9, 30) <= (now_ny.hour, now_ny.minute) <= (16, 0)
+        )
+        if not in_market:
+            logger.info(
+                "AUDIT: market is currently closed — TRAIL stops will be submitted "
+                "as GTC orders and will activate at the next regular-hours open."
+            )
+
+        open_trades = self.ib.openTrades()
+
+        sell_by_sym: Dict[str, list] = {}
+        for t in open_trades:
+            if t.order.action == 'SELL':
+                sell_by_sym.setdefault(t.contract.symbol, []).append(t)
+
+        for sym, pos_data in list(self.state.items()):
+            qty = float(pos_data.get('qty', 0))
+            if qty <= 0:
+                logger.warning(f"AUDIT: {sym} — qty={qty}, cannot place stop")
+                continue
+
+            sell_orders  = sell_by_sym.get(sym, [])
+            raw_trail_orders = [
+                t for t in sell_orders
+                if t.order.orderType == 'TRAIL'
+                and getattr(t.orderStatus, 'status', '') not in _REJECTED_ORDER_STATUSES
+            ]
+            non_trail    = [t for t in sell_orders if t.order.orderType != 'TRAIL']
+            trail_orders = []
+            mismatched_trail = []
+            for t in raw_trail_orders:
+                try:
+                    order_qty = float(getattr(t.order, 'totalQuantity', 0) or 0)
+                except (TypeError, ValueError):
+                    order_qty = 0.0
+                try:
+                    trail_dist = float(getattr(t.order, 'auxPrice', 0) or 0)
+                except (TypeError, ValueError):
+                    trail_dist = 0.0
+                if abs(order_qty - qty) <= 1e-6 and trail_dist > 0:
+                    trail_orders.append(t)
+                else:
+                    mismatched_trail.append(t)
+
+            for t in non_trail:
+                logger.info(
+                    f"AUDIT: {sym} — cancelling non-TRAIL {t.order.orderType} SELL "
+                    f"(id={t.order.orderId})"
+                )
+                try:
+                    self.ib.cancelOrder(t.order)
+                except Exception as e:
+                    logger.warning(f"AUDIT: {sym} — cancel failed: {e}")
+            for t in mismatched_trail:
+                logger.warning(
+                    f"AUDIT: {sym} — TRAIL SELL invalid "
+                    f"(order_qty={getattr(t.order, 'totalQuantity', None)} "
+                    f"state_qty={qty:g}, aux={getattr(t.order, 'auxPrice', None)}); "
+                    f"cancelling and rebuilding"
+                )
+                try:
+                    self.ib.cancelOrder(t.order)
+                except Exception as e:
+                    logger.warning(f"AUDIT: {sym} — mismatched TRAIL cancel failed: {e}")
+            if non_trail or mismatched_trail:
+                self.ib.sleep(1)
+
+            if len(trail_orders) > 1:
+                for t in trail_orders[1:]:
+                    logger.warning(
+                        f"AUDIT: {sym} — duplicate TRAIL SELL found "
+                        f"(id={t.order.orderId}); cancelling extra protective order"
+                    )
+                    try:
+                        self.ib.cancelOrder(t.order)
+                    except Exception as e:
+                        logger.warning(f"AUDIT: {sym} — duplicate cancel failed: {e}")
+
+            if trail_orders:
+                logger.info(
+                    f"AUDIT: {sym} — TRAIL SELL confirmed "
+                    f"(id={trail_orders[0].order.orderId} "
+                    f"dist=${trail_orders[0].order.auxPrice:.2f})"
+                )
+                continue
+
+            logger.info(f"AUDIT: {sym} — no TRAIL SELL found; placing chandelier stop...")
+            try:
+                contract = self._stock_contract(sym)
+
+                bars = self.ib.reqHistoricalData(
+                    contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
+                )
+                if not isinstance(bars, list) or len(bars) < CHANDELIER_PERIOD:
+                    self._alert(
+                        "CRITICAL",
+                        f"AUDIT: {sym} — insufficient history "
+                        f"({len(bars) if isinstance(bars, list) else 0} bars), "
+                        f"cannot place stop; position is unprotected."
+                    )
+                    continue
+
+                df = util.df(bars)
+                df = apply_all(df)
+                atr_chandelier = float(df['ATR_CHAND'].iloc[-1])
+                if np.isnan(atr_chandelier) or atr_chandelier <= 0:
+                    self._alert(
+                        "CRITICAL",
+                        f"AUDIT: {sym} — ATR_CHAND invalid ({atr_chandelier}), "
+                        f"cannot place stop; position is unprotected."
+                    )
+                    continue
+
+                chandelier_dist = round(atr_chandelier * CHANDELIER_MULT, 2)
+
+                stop_order               = Order()
+                stop_order.action        = 'SELL'
+                stop_order.orderType     = 'TRAIL'
+                stop_order.totalQuantity = qty
+                stop_order.auxPrice      = chandelier_dist
+                stop_order.tif           = 'GTC'
+                stop_order.goodAfterTime = self._entry_good_after_time()
+                # outsideRth = False (default): stop only triggers during regular
+                # trading hours, preventing premature exits on thin pre/post-market moves.
+                stop_order.transmit      = True
+
+                if not self._preflight_order(
+                    contract,
+                    stop_order,
+                    sym,
+                    allow_protective_sell_fail_open=True,
+                ):
+                    self._alert(
+                        "CRITICAL",
+                        f"AUDIT: {sym} — TRAIL stop pre-flight rejected by IB; "
+                        f"position is unprotected — will retry on next cycle."
+                    )
+                    continue
+
+                stop_trade = self.ib.placeOrder(contract, stop_order)
+                # Give IB 2 s to acknowledge and assign a terminal/live status.
+                self.ib.sleep(2)
+
+                status = stop_trade.orderStatus.status
+                if status in _REJECTED_ORDER_STATUSES:
+                    self._alert(
+                        "CRITICAL",
+                        f"AUDIT: {sym} — TRAIL stop rejected by IB "
+                        f"(status={status} id={stop_trade.order.orderId}); "
+                        f"position is unprotected — will retry on next cycle."
+                    )
+                    continue  # do not update state; leave for next audit cycle
+
+                self.state[sym]['stop_dist'] = chandelier_dist
+                self.state[sym]['stop_loss'] = round(
+                    float(pos_data.get('price', 0)) - chandelier_dist, 2
+                )
+                self.save_state()
+                logger.info(
+                    f"AUDIT: {sym} — TRAIL SELL live "
+                    f"(qty={qty:.4f} dist=${chandelier_dist:.2f} "
+                    f"status={status} id={stop_trade.order.orderId})"
+                )
+            except Exception as e:
+                self._alert("CRITICAL", f"AUDIT: {sym} — failed to place TRAIL stop: {e}")
+
+    def _position_needs_stop_audit(self) -> bool:
+        """True when local state suggests a position may lack protection."""
+        for data in self.state.values():
+            if data.get('pending_exit'):
+                continue
+            try:
+                qty = float(data.get('qty', 0) or 0)
+                stop_dist = float(data.get('stop_dist', 0) or 0)
+                stop_loss = float(data.get('stop_loss', 0) or 0)
+            except (TypeError, ValueError):
+                return True
+            if qty > 0 and (stop_dist <= 0 or stop_loss <= 0):
+                return True
+        return False
+
+    def _maybe_audit_stop_orders(self):
+        """Run stop-order audit once per trading day, and immediately for unprotected state."""
+        if not self.state:
+            return
+
+        today = datetime.now(_TZ_NY).strftime('%Y-%m-%d')
+        needs_audit = self._position_needs_stop_audit()
+        if getattr(self, '_last_audit_date', None) == today and not needs_audit:
+            return
+
+        reason = "unprotected position state" if needs_audit else "daily safety check"
+        logger.info(f"AUDIT: running protective stop audit ({reason})")
+        try:
+            self._audit_stop_orders()
+            self._last_audit_date = today
+        except Exception as e:
+            self._alert(
+                "CRITICAL",
+                f"AUDIT: protective stop audit failed unexpectedly; "
+                f"positions may be unprotected ({e})",
+            )
+
+    # ── Regime / sector / correlation helpers ──────────────────────────────────
+    def _fetch_spy_trend(self) -> bool:
+        """True when SPY price > SMA50 > SMA200. Cached per trading day; fails closed."""
+        tz_ny  = pytz.timezone('US/Eastern')
+        today  = datetime.now(tz_ny).strftime('%Y-%m-%d')
+        if self._spy_cache.get('date') == today:
+            return self._spy_cache['trend']
+        try:
+            if 'SPY' not in self._contract_cache:
+                self._contract_cache['SPY'] = self._stock_contract('SPY')
+            bars = self.ib.reqHistoricalData(
+                self._contract_cache['SPY'], '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
+            )
+            if not isinstance(bars, list) or len(bars) < MA_SLOW:
+                logger.warning("SPY regime check has insufficient history — blocking new entries")
+                self._spy_cache = {'date': today, 'trend': False}
+                return False
+            df = util.df(bars)
+            df['MA50']  = df['close'].rolling(50).mean()
+            df['MA200'] = df['close'].rolling(200).mean()
+            last  = df.iloc[-1]
+            trend = bool(last['close'] > last['MA50'] and last['MA50'] > last['MA200'])
+            self._spy_cache = {'date': today, 'trend': trend}
+            return trend
+        except Exception as e:
+            logger.warning(f"SPY regime check failed: {e} — blocking new entries")
+            return False
+
+    def _get_sector(self, symbol: str, contract) -> str:
+        """Return IB industry string for symbol.  Cached; returns 'Unknown' on error."""
+        if symbol in self._sector_cache:
+            return self._sector_cache[symbol]
+        try:
+            details = self.ib.reqContractDetails(contract)
+            sector  = str(details[0].industry) if isinstance(details, list) and details else 'Unknown'
+        except Exception:
+            sector = 'Unknown'
+        self._sector_cache[symbol] = sector
+        return sector
+
+    def _compute_book_correlation(self, sym: str, df_daily: pd.DataFrame) -> float:
+        """Max absolute Pearson correlation of candidate vs current book.
+
+        Correlation is a portfolio risk gate. If the engine cannot evaluate a
+        current holding, fail closed by returning 1.0 so the entry is skipped.
+        """
+        if not self.state:
+            return 0.0
+        cand_ret = df_daily['close'].pct_change().dropna().tail(60)
+        max_corr  = 0.0
+        for book_sym in self.state:
+            if book_sym == sym:
+                continue
+            try:
+                cached = self._bar_cache.get(book_sym)
+                if cached and 'bars_daily' in cached:
+                    book_df = util.df(cached['bars_daily'])
+                else:
+                    bars = self.ib.reqHistoricalData(
+                        self._stock_contract(book_sym), '', '90 D', DAILY_BAR_SIZE, 'TRADES', True
+                    )
+                    if not isinstance(bars, list) or not bars:
+                        logger.warning(
+                            f"CORRELATION {sym}: no history for held {book_sym}; failing closed."
+                        )
+                        return 1.0
+                    book_df = util.df(bars)
+                book_ret = book_df['close'].pct_change().dropna().tail(60)
+                aligned  = pd.concat([cand_ret, book_ret], axis=1, join='inner').dropna()
+                if len(aligned) < 20:
+                    logger.warning(
+                        f"CORRELATION {sym}: insufficient overlap with held {book_sym}; failing closed."
+                    )
+                    return 1.0
+                corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
+                if not np.isnan(corr):
+                    max_corr = max(max_corr, abs(float(corr)))
+            except Exception as e:
+                logger.warning(
+                    f"CORRELATION {sym}: failed against held {book_sym} ({e}); failing closed."
+                )
+                return 1.0
+        return max_corr
+
+    def _calc_max_positions(self, equity: float) -> int:
+        """
+        Compute maximum simultaneous position capacity from total account equity.
+
+        Formula: floor(NetLiquidation / MIN_BUCKET_SIZE), capped at
+        MAX_POSITIONS_CAP. Entry placement is still separately constrained by
+        SettledCash, so a cash account cannot spend unsettled sale proceeds.
+        """
+        try:
+            equity = float(equity)
+        except (TypeError, ValueError):
+            return 0
+        if not np.isfinite(equity) or equity < MIN_BUCKET_SIZE:
+            return 0
+        return min(int(equity / MIN_BUCKET_SIZE), MAX_POSITIONS_CAP)
+
+    @staticmethod
+    def _calc_cash_entry_slots(settled: float) -> int:
+        """Return how many new-entry buckets settled cash can fund right now."""
+        deployable = VelocityEngine._deployable_settled_cash(settled)
+        if deployable < MIN_BUCKET_SIZE:
+            return 0
+        return int(deployable / MIN_BUCKET_SIZE)
+
+    @staticmethod
+    def _deployable_settled_cash(settled: float) -> float:
+        """Return the settled-cash amount allowed for new entry buckets."""
+        try:
+            settled = float(settled)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(settled) or settled <= 0:
+            return 0.0
+        pct = min(max(float(SETTLED_CASH_DEPLOYMENT_PCT), 0.0), 1.0)
+        return settled * pct
+
+    def _calc_entry_allocation(self, equity: float, settled: float, open_count: int) -> Dict[str, float]:
+        """Dynamically derive entry slots and bucket size from live account values."""
+        max_pos = self._calc_max_positions(equity)
+        capacity_slots = max(0, max_pos - max(0, int(open_count or 0)))
+        deployable_cash = self._deployable_settled_cash(settled)
+        cash_slots = (
+            int(deployable_cash / MIN_BUCKET_SIZE)
+            if deployable_cash >= MIN_BUCKET_SIZE else 0
+        )
+        entry_slots = min(capacity_slots, cash_slots)
+        bucket_size = deployable_cash / entry_slots if entry_slots > 0 else 0.0
+        return {
+            'max_pos': max_pos,
+            'capacity_slots': capacity_slots,
+            'cash_slots': cash_slots,
+            'entry_slots': entry_slots,
+            'deployable_cash': deployable_cash,
+            'bucket_size': bucket_size,
+        }
+
+    # ── Scanner ────────────────────────────────────────────────────────────────
+    def get_institutional_scan(self):
+        """Dynamic discovery of institutional momentum from every unique IBKR scanner hit."""
+        try:
+            sub  = build_momentum_scanner()
+            scan = self.ib.reqScannerData(sub)
+            seen = set()
+            symbols = []
+            for item in scan:
+                sym = item.contractDetails.contract.symbol
+                if sym not in seen:
+                    seen.add(sym)
+                    symbols.append(sym)
+            return symbols
+        except Exception as e:
+            logger.warning(f"SCAN: IB scanner failed ({e}); no new candidates this cycle")
+            return []
+
+    # ── Technical context ──────────────────────────────────────────────────────
+    def _remember_daily_scan_skip(self, symbol: str, reason: str):
+        """Cache only stable same-day scan failures to reduce IBKR pacing load."""
+        if not hasattr(self, '_daily_scan_skip') or self._daily_scan_skip is None:
+            self._daily_scan_skip = {}
+        self._daily_scan_skip[symbol] = reason
+
+    def get_technical_context(self, symbol):
+        # Contract cache — avoids re-qualifying the same symbol every 60-second cycle
+        if symbol not in self._contract_cache:
+            contract = Stock(symbol, 'SMART', 'USD')
+            self.ib.qualifyContracts(contract)
+            self._contract_cache[symbol] = contract
+        contract = self._contract_cache[symbol]
+
+        # Bar cache — daily bars are valid for one trading day; re-fetch on date change.
+        # ORB bars are also anchored to today's 9:45 AM, so same daily scope applies.
+        tz_ny      = pytz.timezone('US/Eastern')
+        now_ny     = datetime.now(tz_ny)
+        today_str  = now_ny.strftime('%Y-%m-%d')
+
+        cached = self._bar_cache.get(symbol)
+        if cached and cached.get('date') == today_str:
+            bars_orb   = cached['bars_orb']
+            bars_daily = cached['bars_daily']
+        else:
+            # 1. Opening Range High — the 9:30–9:45 AM bar of TODAY.
+            #
+            #    Using an empty endDateTime with '1 D' duration is WRONG: at 10 AM
+            #    it starts at yesterday 10 AM, so bars[0] is a yesterday bar.
+            #    Fix: anchor endDateTime to today's 9:45 AM ET so the 1-hour lookback
+            #    window (8:45–9:45 AM) contains exactly one RTH bar — the 9:30 bar.
+            #    bars[-1] is then reliably today's ORB bar regardless of current time.
+            end_of_orb = now_ny.replace(hour=9, minute=45, second=0, microsecond=0)
+            bars_orb   = self.ib.reqHistoricalData(
+                contract, end_of_orb, ORB_LOOKBACK, ORB_BAR_SIZE, 'TRADES', True
+            )
+
+            # 2. Daily Context (Trends, ATR, RSI) — prior completed daily bars
+            bars_daily = self.ib.reqHistoricalData(
+                contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
+            )
+
+            if bars_orb and bars_daily:
+                self._bar_cache[symbol] = {
+                    'date':       today_str,
+                    'bars_orb':   bars_orb,
+                    'bars_daily': bars_daily,
+                }
+
+        if not bars_orb:
+            return None
+        orb_bar = bars_orb[-1]         # last bar = the 9:30 AM bar that closed at 9:45
+        orb_high = orb_bar.high
+        day_open = float(getattr(orb_bar, 'open', np.nan))
+        if not orb_high or np.isnan(float(orb_high)) or orb_high <= 0:
+            logger.warning(f"SCAN {symbol}: ORB high invalid ({orb_high}), skipping")
+            return None
+        if np.isnan(day_open) or day_open <= 0:
+            logger.warning(f"SCAN {symbol}: day open invalid ({day_open}), skipping")
+            return None
+
+        if not bars_daily:
+            return None
+        df = util.df(bars_daily)
+        if len(df) < MIN_CANDLES:
+            logger.warning(
+                f"SCAN {symbol}: only {len(df)} daily bars — need {MIN_CANDLES}, skipping"
+            )
+            self._remember_daily_scan_skip(symbol, f"insufficient daily history (<{MIN_CANDLES})")
+            return None
+        df = apply_all(df, RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW, SMA200_SLOPE_LOOKBACK, CHANDELIER_PERIOD)
+        if np.isnan(float(df['MA200'].iloc[-1])):
+            logger.warning(f"SCAN {symbol}: MA200 is NaN (data gaps in history), skipping")
+            self._remember_daily_scan_skip(symbol, "invalid daily MA200")
+            return None
+
+        # 20-day average dollar volume — used to block low-liquidity pumps
+        avg_20d_vol    = float(df['volume'].tail(20).mean())
+        dollar_vol_20d = float((df['close'] * df['volume']).tail(20).mean())
+
+        # 3. Live price + bid-ask spread + intraday relative volume
+        tickers = self.ib.reqTickers(contract)
+        if not tickers:
+            logger.warning(f"SCAN {symbol}: live ticker unavailable, skipping")
+            return None
+        ticker = tickers[0]
+        live_price = (
+            self._coerce_positive_price(ticker.marketPrice())
+            or self._coerce_positive_price(getattr(ticker, 'last', None))
+            or self._coerce_positive_price(getattr(ticker, 'close', None))
+        )
+        if live_price is None:
+            logger.warning(f"SCAN {symbol}: live price unavailable, skipping")
+            return None
+
+        bid = float(ticker.bid) if not pd.isna(ticker.bid) else 0.0
+        ask = float(ticker.ask) if not pd.isna(ticker.ask) else 0.0
+        if bid > 0 and ask > bid:
+            spread_pct = (ask - bid) / ((bid + ask) / 2)
+        else:
+            spread_pct = float('inf')   # unavailable → fail-closed
+
+        intraday_vol = float(ticker.volume) if not pd.isna(ticker.volume) else 0.0
+        rvol = intraday_vol / avg_20d_vol if avg_20d_vol > 0 else 0.0
+        intraday_gain = (live_price - day_open) / day_open
+        try:
+            day_high = float(getattr(ticker, 'high', np.nan))
+        except (TypeError, ValueError):
+            day_high = np.nan
+        try:
+            day_low = float(getattr(ticker, 'low', np.nan))
+        except (TypeError, ValueError):
+            day_low = np.nan
+        if not pd.isna(day_high) and not pd.isna(day_low) and day_high > 0 and day_low > 0:
+            day_high = max(day_high, live_price)
+            day_low  = min(day_low, live_price)
+            day_range_location = (
+                (live_price - day_low) / (day_high - day_low)
+                if day_high > day_low else None
+            )
+        else:
+            day_range_location = None
+
+        return {
+            'orb_high':         orb_high,
+            'day_open':         day_open,
+            'ma50':             float(df['MA50'].iloc[-1]),
+            'ma200':            float(df['MA200'].iloc[-1]),
+            'atr':              float(df['ATR'].iloc[-1]),
+            'atr5':             float(df['ATR5'].iloc[-1]),
+            'atr20':            float(df['ATR20'].iloc[-1]),
+            'atr_chandelier':   float(df['ATR_CHAND'].iloc[-1]),
+            'sma200_slope':     float(df['SMA200_SLOPE'].iloc[-1]),
+            'high10':           float(df['HIGH10'].iloc[-1]),
+            'rsi':              float(df['RSI'].iloc[-1]),
+            'rsi_prev':         float(df['RSI'].iloc[-2]),
+            'close':            float(df['close'].iloc[-1]),
+            'live_price':       live_price,
+            'bid':              bid,
+            'ask':              ask,
+            'spread_pct':       spread_pct,
+            'rvol':             rvol,
+            'day_range_location': day_range_location,
+            'intraday_gain':    intraday_gain,
+            'volume':           int(df['volume'].iloc[-1]),
+            'dollar_vol_20d':   dollar_vol_20d,
+            'price_fetched_at': datetime.now(tz_ny),
+            'contract':         contract,
+            'df_daily':         df,
+        }
+
+    # ── Exit management ────────────────────────────────────────────────────────
+    def check_velocity_exits(self):
+        """Manages all forced exits: intraday hard stop, Friday close, and velocity exit."""
+        now_et          = datetime.now(_TZ_NY)
+        is_friday_close = (now_et.weekday() == 4 and now_et.hour >= FRIDAY_CLOSE_HOUR)
+        changed         = False
+
+        for sym in list(self.state.keys()):
+            data        = self.state[sym]
+            if data.get('pending') or data.get('pending_exit'):
+                continue
+            entry_price = float(data.get('price', 0))
+            if entry_price <= 0:
+                logger.warning(f"EXIT: {sym} has invalid entry price, skipping.")
+                continue
+
+            cached_cur = self._coerce_positive_price(data.get('current_price', 0))
+            fresh_cur  = self._fresh_market_price(sym)
+            if fresh_cur is not None:
+                cur = fresh_cur
+                self.state[sym]['current_price'] = round(cur, 2)
+                self.state[sym]['price_checked_at'] = now_et.isoformat()
+                changed = True
+            else:
+                cur = cached_cur or 0.0
+                logger.warning(
+                    f"EXIT: {sym} fresh price unavailable; using cached current_price "
+                    f"{cur if cur else 'unavailable'} for exit checks."
+                )
+
+            # ── 1. Intraday hard stop — uses a fresh broker price whenever available
+            if cur > 0:
+                drawdown = (cur - entry_price) / entry_price
+                if drawdown <= -HARD_STOP_PCT:
+                    logger.warning(
+                        f"HARD STOP: {sym} down {drawdown*100:.1f}% from entry "
+                        f"(${cur:.2f} vs entry ${entry_price:.2f}). Forcing exit."
+                    )
+                    self.liquidate(sym)
+                    continue
+
+                peak_price = max(float(data.get('peak_price', entry_price) or entry_price), cur)
+                if peak_price != float(data.get('peak_price', entry_price) or entry_price):
+                    self.state[sym]['peak_price'] = round(peak_price, 2)
+                    changed = True
+                if peak_price >= entry_price * (1 + BREAK_EVEN_PCT) and cur <= entry_price:
+                    logger.warning(
+                        f"BREAK-EVEN EXIT: {sym} gave back a prior "
+                        f"{BREAK_EVEN_PCT*100:.0f}%+ profit "
+                        f"(peak=${peak_price:.2f}, current=${cur:.2f}, entry=${entry_price:.2f})."
+                    )
+                    self.liquidate(sym)
+                    continue
+
+            # ── 2. Friday afternoon close — avoid carrying weekend gap risk
+            if is_friday_close and cur > 0:
+                friday_profit = (cur - entry_price) / entry_price
+                if friday_profit < FRIDAY_MIN_PROFIT_PCT:
+                    logger.warning(
+                        f"FRIDAY CLOSE: {sym} profit={friday_profit*100:.1f}% < "
+                        f"{FRIDAY_MIN_PROFIT_PCT*100:.0f}% — closing to avoid weekend risk."
+                    )
+                    self.liquidate(sym)
+                    continue
+
+            # ── 3. Velocity exit — counts Mon-Fri trading sessions, not weekend hours
+            raw_time = data.get('time', '')
+            if not raw_time:
+                logger.warning(f"EXIT: {sym} — missing entry timestamp; skipping velocity-exit check")
+                continue
+            try:
+                entry_dt = datetime.fromisoformat(raw_time)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"EXIT: {sym} — malformed entry timestamp {raw_time!r}; "
+                    "skipping velocity-exit check"
+                )
+                continue
+            if entry_dt.tzinfo is None:
+                entry_dt = _TZ_NY.localize(entry_dt)
+
+            if _count_trading_days(entry_dt, now_et) >= HOLD_TRADING_BARS:
+                price = cur
+                if price <= 0:
+                    logger.warning(f"No price data for {sym}, skipping exit check this cycle.")
+                    continue
+                profit = (price - entry_price) / entry_price
+
+                if profit < PROFIT_MIN_THRESHOLD:
+                    logger.info(f"VELOCITY EXIT: {sym} stagnant. Freeing capital for T+1.")
+                    self.liquidate(sym)
+        if changed:
+            self.save_state()
+
+    def liquidate(self, symbol):
+        # Cancel only non-protective orders before placing the market sell.
+        # Keep TRAIL SELL live as last-resort protection until IBKR confirms the
+        # market exit; if the market sell is rejected, the position is still
+        # protected by the existing broker-side stop.
+        open_trades = [t for t in self.ib.openTrades()
+                       if t.contract.symbol == symbol]
+        cancellable = [
+            trade for trade in open_trades
+            if str(getattr(trade.order, 'orderType', '')).upper() != 'TRAIL'
+        ]
+        for trade in cancellable:
+            self.ib.cancelOrder(trade.order)
+        if cancellable:
+            self.ib.sleep(1)   # allow cancellations to propagate
+
+        found_position = False
+        for p in self.ib.positions():
+            if p.contract.symbol == symbol:
+                qty = float(p.position)
+                if qty <= 0:
+                    continue
+                found_position = True
+                if symbol in self.state:
+                    self.state[symbol]['pending_exit'] = True
+                    self.save_state()
+                sell_order = MarketOrder('SELL', qty)
+                sell_contract = copy.copy(p.contract)
+                sell_contract.exchange = 'SMART'
+                try:
+                    trade = self.ib.placeOrder(sell_contract, sell_order)
+                except Exception as e:
+                    if symbol in self.state:
+                        self.state[symbol].pop('pending_exit', None)
+                        self.save_state()
+                    self._alert(
+                        "CRITICAL",
+                        f"LIQUIDATE {symbol}: market SELL placement failed; "
+                        f"state retained for retry ({e})"
+                    )
+                    continue
+                try:
+                    for _ in self.ib.loopUntil(trade.isDone, timeout=30):
+                        pass
+                except Exception as e:
+                    logger.warning(f"LIQUIDATE {symbol}: status wait failed: {e}")
+
+                status = str(getattr(trade.orderStatus, 'status', '') or '')
+                try:
+                    filled_qty = float(getattr(trade.orderStatus, 'filled', 0) or 0)
+                except (TypeError, ValueError):
+                    filled_qty = 0.0
+
+                if status in _REJECTED_ORDER_STATUSES:
+                    if symbol in self.state:
+                        self.state[symbol].pop('pending_exit', None)
+                        self.save_state()
+                    self._alert(
+                        "CRITICAL",
+                        f"LIQUIDATE {symbol}: market SELL rejected "
+                        f"(status={status}); state retained for retry"
+                    )
+                    continue
+
+                if status == 'Filled' or filled_qty >= qty:
+                    if symbol in self.state:
+                        self.state[symbol]['pending_exit'] = True
+                    self.save_state()
+                    logger.info(
+                        f"LIQUIDATE {symbol}: market SELL filled "
+                        f"(qty={filled_qty:g}, status={status}); state pending until IBKR sync confirms flat"
+                    )
+                else:
+                    self._alert(
+                        "ERROR",
+                        f"LIQUIDATE {symbol}: market SELL submitted but not confirmed "
+                        f"filled (status={status}, filled={filled_qty:g}); state retained"
+                    )
+
+        if not found_position and symbol in self.state:
+            logger.info(
+                f"LIQUIDATE {symbol}: no IBKR position found; "
+                "cancelling orphaned exits and removing stale state"
+            )
+            self._cancel_orphaned_exit_orders(symbol)
+            del self.state[symbol]
+            self.save_state()
+
+    def _cancel_orphaned_exit_orders(self, symbol: str) -> int:
+        """Cancel leftover SELL orders only after IBKR confirms no position exists."""
+        cancelled = 0
+        try:
+            open_trades = self.ib.openTrades()
+        except Exception as e:
+            logger.warning(f"SYNC: {symbol} — could not query open trades for orphan cleanup: {e}")
+            return 0
+
+        for trade in open_trades:
+            trade_symbol = getattr(getattr(trade, 'contract', None), 'symbol', None)
+            action = str(getattr(getattr(trade, 'order', None), 'action', '')).upper()
+            if trade_symbol != symbol or action != 'SELL':
+                continue
+            try:
+                self.ib.cancelOrder(trade.order)
+                cancelled += 1
+            except Exception as e:
+                logger.warning(f"SYNC: {symbol} — orphan SELL cancel failed: {e}")
+
+        if cancelled:
+            logger.info(f"SYNC: {symbol} — cancelled {cancelled} orphaned SELL exit orders")
+            self.ib.sleep(1)
+        return cancelled
+
+    def _score_candidate(self, ctx: dict) -> float:
+        """
+        Rank a passing candidate 0-100.  Four components:
+          - Trend     (30 pts): MA50-MA200 separation, saturates at 6%
+          - RVOL      (25 pts): relative volume excess above 2.5× floor, saturates at 5×
+          - Momentum  (25 pts): RSI acceleration (0-15) + RSI level quality (0-10)
+          - Liquidity (20 pts): bid-ask spread tightness (0% spread = full 20 pts)
+        """
+        ma50       = ctx['ma50']
+        ma200      = ctx['ma200']
+        rsi        = ctx['rsi']
+        rsi_p      = ctx['rsi_prev']
+        rvol       = ctx.get('rvol', RVOL_MIN)
+        spread_pct = ctx.get('spread_pct', 0.0)
+
+        # 1. Trend strength (0-30): MA50-MA200 gap, saturates at 6% separation
+        sep   = (ma50 - ma200) / ma200 * 100 if ma200 else 0.0
+        trend = max(0.0, min(sep * 5.0, 30.0))
+
+        # 2. RVOL quality (0-25): excess above floor, saturates at 2× floor (5×)
+        rvol_score = min(max(rvol - RVOL_MIN, 0.0) / RVOL_MIN * 25.0, 25.0)
+
+        # 3. Momentum (0-25): RSI acceleration + level
+        rsi_delta = rsi - rsi_p
+        accel     = min(max(rsi_delta * 1.5, 0.0), 15.0)
+        if   rsi <= 70: level = 10.0
+        elif rsi <= 75: level = 5.0
+        else:           level = max(0.0, 10.0 - (rsi - 75) * 2.0)
+        momentum = accel + level
+
+        # 4. Liquidity (0-20): tighter spread earns more points
+        liquidity = max(0.0, (SPREAD_MAX_PCT - spread_pct) / SPREAD_MAX_PCT * 20.0)
+
+        return round(trend + rvol_score + momentum + liquidity, 2)
+
+    def _entry_price_is_still_valid(
+        self,
+        sym: str,
+        ctx: dict,
+        price: float,
+        breakout_pct: float = BREAKOUT_PCT,
+        gap_max_pct: float = GAP_MAX_PCT,
+    ) -> bool:
+        """Re-check fast-moving entry gates immediately before sending an order."""
+        if np.isnan(price) or price <= 0:
+            logger.warning(f"SKIP {sym}: refreshed entry price invalid ({price})")
+            return False
+
+        if price < SCAN_MIN_PRICE:
+            logger.warning(
+                f"SKIP {sym}: refreshed entry price ${price:.2f} below "
+                f"minimum ${SCAN_MIN_PRICE:.2f}"
+            )
+            return False
+
+        orb_h = float(ctx.get('orb_high', 0.0))
+        if orb_h <= 0 or price <= orb_h:
+            logger.warning(
+                f"SKIP {sym}: refreshed price ${price:.2f} no longer clears ORB ${orb_h:.2f}"
+            )
+            return False
+
+        if price > orb_h * (1 + gap_max_pct):
+            logger.warning(
+                f"SKIP {sym}: refreshed price ${price:.2f} is beyond "
+                f"{gap_max_pct*100:.0f}% gap cap from ORB ${orb_h:.2f}"
+            )
+            return False
+
+        return True
+
+    def _sync_positions_from_ibkr(self):
+        """
+        Reconcile self.state against actual IBKR positions every cycle.
+        - Symbols in IBKR but missing from state → added (e.g. filled while engine restarted)
+        - Symbols in state but NOT in IBKR     → removed (stop/target/manual close hit)
+        This makes state always match reality, regardless of order fill timing.
+        """
+        ibkr_pos = {p.contract.symbol: p for p in self.ib.positions()}
+        missing_counts = getattr(self, '_missing_position_counts', {})
+        changed  = False
+
+        # Add missing IBKR positions and update changed quantities. IBKR is the
+        # source of truth for quantity after partial fills, manual adjustments,
+        # splits, or broker-side corrections.
+        for sym, pos in ibkr_pos.items():
+            ibkr_qty = float(pos.position)
+            if ibkr_qty <= 0:
+                continue
+
+            qty = round(ibkr_qty, 4)
+            avg_cost = float(pos.avgCost) if pos.avgCost else 0.0
+            if avg_cost <= 0:
+                logger.warning(
+                    f"SYNC: {sym} — avgCost={avg_cost} from IBKR; "
+                    f"velocity-exit profit check will be skipped until price is corrected."
+                )
+
+            if sym not in self.state:
+                self.state[sym] = {
+                    'price':           round(avg_cost, 2),
+                    'fill_price':      round(avg_cost, 2),
+                    'broker_avg_cost': round(avg_cost, 4),
+                    'time':            datetime.now(_TZ_NY).isoformat(),
+                    'qty':             qty,
+                    'stop_loss':       0.0,
+                    'peak_price':      round(avg_cost, 2),
+                    'volume':          0,
+                    'score':           None,
+                }
+                logger.info(f"SYNC: Added {sym} from IBKR (qty={pos.position} avg=${avg_cost:.2f})")
+                changed = True
+            else:
+                missing_counts.pop(sym, None)
+                if self.state[sym].pop('pending_exit', None):
+                    logger.warning(
+                        f"SYNC: {sym} still present at IBKR after pending exit; "
+                        "clearing pending_exit and continuing risk management."
+                    )
+                    changed = True
+                state_qty = float(self.state[sym].get('qty', 0))
+                if abs(state_qty - qty) > 1e-6:
+                    logger.info(
+                        f"SYNC: Updated {sym} qty from state={state_qty:g} "
+                        f"to IBKR={qty:g}"
+                    )
+                    self.state[sym]['qty'] = qty
+                    changed = True
+
+                if avg_cost > 0:
+                    if self.state[sym].get('broker_avg_cost') != round(avg_cost, 4):
+                        self.state[sym]['broker_avg_cost'] = round(avg_cost, 4)
+                        changed = True
+                    if float(self.state[sym].get('price', 0)) <= 0:
+                        self.state[sym]['price'] = round(avg_cost, 2)
+                        changed = True
+                    if float(self.state[sym].get('fill_price', 0)) <= 0:
+                        self.state[sym]['fill_price'] = round(avg_cost, 2)
+                        changed = True
+                    if float(self.state[sym].get('peak_price', 0)) <= 0:
+                        self.state[sym]['peak_price'] = round(avg_cost, 2)
+                        changed = True
+
+        # Remove state entries whose IBKR position is gone or zero
+        for sym in list(self.state.keys()):
+            ibkr_qty = float(ibkr_pos[sym].position) if sym in ibkr_pos else 0.0
+            if ibkr_qty <= 0:
+                miss_count = missing_counts.get(sym, 0) + 1
+                missing_counts[sym] = miss_count
+                if miss_count < 2 and not self._force_exit_active():
+                    logger.warning(
+                        f"SYNC: {sym} missing from IBKR positions snapshot once; "
+                        "deferring state removal until a second confirming snapshot."
+                    )
+                    continue
+                logger.info(f"SYNC: Removed {sym} from state — no IBKR position found")
+                self._cancel_orphaned_exit_orders(sym)
+                del self.state[sym]
+                missing_counts.pop(sym, None)
+                changed = True
+
+        self._missing_position_counts = missing_counts
+        if changed:
+            self.save_state()
+
+    def _update_position_prices(self):
+        """Fetch live price for every open position and persist to state.
+        Also backfills volume when it is 0 (e.g. positions synced from IBKR
+        that never went through the normal entry path).
+        """
+        if not self.state:
+            return
+        changed = False
+        for sym in list(self.state.keys()):
+            try:
+                contract = self._stock_contract(sym)
+                price = self._fresh_market_price(sym)
+                if price is not None:
+                    cur = price
+                    self.state[sym]['current_price'] = round(cur, 2)
+                    self.state[sym]['price_checked_at'] = datetime.now(_TZ_NY).isoformat()
+                    ep  = float(self.state[sym].get('price', 0))
+                    qty = float(self.state[sym].get('qty', 0))
+                    if ep > 0 and qty > 0:
+                        self.state[sym]['unrealized_pnl']     = round((cur - ep) * qty, 2)
+                        self.state[sym]['unrealized_pnl_pct'] = round((cur - ep) / ep * 100, 2)
+                    # Track trailing stop high-watermark so dashboard shows live stop level
+                    sd = float(self.state[sym].get('stop_dist', 0))
+                    if sd > 0:
+                        peak = max(float(self.state[sym].get('peak_price', cur)), cur)
+                        self.state[sym]['peak_price']     = round(peak, 2)
+                        initial_sl = float(self.state[sym].get('stop_loss', 0))
+                        trail_floor = peak - sd
+                        if ep > 0 and peak >= ep * (1 + BREAK_EVEN_PCT):
+                            trail_floor = max(trail_floor, ep)
+                        self.state[sym]['effective_stop'] = round(max(initial_sl, trail_floor), 2)
+                    changed = True
+
+                # Backfill volume once if it is missing/zero — only fetches
+                # historical bars on the first cycle where volume is absent.
+                # Uses a short 5-day window; no need for a full 1-year pull.
+                if self.state[sym].get('volume', 0) == 0:
+                    bars = self.ib.reqHistoricalData(
+                        contract, '', '5 D', DAILY_BAR_SIZE, 'TRADES', True
+                    )
+                    if bars:
+                        df_vol = util.df(bars)
+                        vol    = int(df_vol['volume'].iloc[-1])
+                        if vol > 0:
+                            self.state[sym]['volume'] = vol
+                            changed = True
+            except Exception as e:
+                logger.warning(f"Could not refresh price for {sym}: {e}")
+        if changed:
+            self.save_state()
+
+    # ── Main cycle ─────────────────────────────────────────────────────────────
+    def run_cycle(self):
+        if not hasattr(self, '_daily_scan_skip') or self._daily_scan_skip is None:
+            self._daily_scan_skip = {}
+
+        # 0. Ensure connection is live before doing anything
+        if not self._ensure_connected():
+            logger.error("ENGINE: reconnect failed — skipping cycle for safety")
+            self._write_dashboard_data(connected=False)
+            return
+
+        # 1. Sync state with actual IBKR positions (source of truth)
+        self._sync_positions_from_ibkr()
+
+        if self._force_exit_active():
+            self._alert(
+                "CRITICAL",
+                f"FORCE EXIT: {FORCE_EXIT_FILE} exists — liquidating all tracked positions."
+            )
+            for sym in list(self.state.keys()):
+                self.liquidate(sym)
+            self._update_position_prices()
+            self._write_dashboard_data(connected=True)
+            return
+
+        # Stop protection is independent of new-entry logic. Run this before
+        # account/VIX gates so existing positions remain protected even when
+        # fresh cash data or regime data is temporarily unavailable.
+        self._maybe_audit_stop_orders()
+
+        # 2. Account values — single API call for both equity and settled cash
+        try:
+            equity, settled = self._get_account_values()
+        except AccountDataUnavailable as e:
+            self._alert(
+                "ERROR",
+                f"{e} Managing existing positions only; no scanner or new entries."
+            )
+            self.check_velocity_exits()
+            self._update_position_prices()
+            self._write_dashboard_data(connected=True)
+            return
+        allocation = self._calc_entry_allocation(equity, settled, len(self.state))
+        max_pos = int(allocation['max_pos'])
+        capacity_slots = int(allocation['capacity_slots'])
+        cash_slots = int(allocation['cash_slots'])
+        open_slots = int(allocation['entry_slots'])
+        deployable_cash = allocation['deployable_cash']
+        bucket_size = allocation['bucket_size']
+        self._last_equity = equity
+        self._last_settled_cash = settled
+        self._equity_initialized = True
+        bucket_text = f"${bucket_size:.2f}" if open_slots > 0 else "N/A"
+        logger.info(
+            f"HEARTBEAT: Equity ${equity:.2f} | Settled ${settled:.2f} | "
+            f"Deployable ${deployable_cash:.2f} ({SETTLED_CASH_DEPLOYMENT_PCT:.0%}) | "
+            f"EntrySlots {open_slots}/{max_pos} | CashSlots {cash_slots} | Bucket {bucket_text} | "
+            f"Positions: {list(self.state.keys()) or 'none'}"
+        )
+
+        # Daily loss circuit breaker — reset at start of each new trading day
+        today_str = datetime.now(_TZ_NY).strftime('%Y-%m-%d')
+        if self._day_start_date != today_str:
+            self._day_start_date   = today_str
+            self._day_start_equity = equity
+            self._daily_scan_skip.clear()
+        elif (self._day_start_equity is not None
+              and equity < self._day_start_equity * (1 - MAX_DAILY_LOSS_PCT)):
+            logger.warning(
+                f"CIRCUIT BREAKER: daily loss limit hit "
+                f"(equity ${equity:.2f} vs open ${self._day_start_equity:.2f} "
+                f"= {(1 - equity/self._day_start_equity)*100:.1f}% loss). "
+                f"No new entries for the rest of today."
+            )
+            self.check_velocity_exits()
+            self._update_position_prices()
+            return
+
+        # 3. Market Heat Check — qualify once, reuse across cycles
+        if self._vix_contract is None:
+            vix_contracts = self.ib.qualifyContracts(Index('VIX', 'CBOE'))
+            if not vix_contracts:
+                logger.warning("VIX contract unavailable. Skipping entries as precaution.")
+                self.check_velocity_exits()
+                self._update_position_prices()
+                return
+            self._vix_contract = vix_contracts[0]
+        vix_price = self._fetch_vix_price()
+        if vix_price is None:
+            logger.warning("VIX price unavailable. Skipping entries as precaution.")
+            self._last_vix = None
+            self.check_velocity_exits()
+            self._update_position_prices()
+            return
+        self._last_vix = vix_price
+        if vix_price > VIX_THRESHOLD:
+            # Risk-Off: no new entries, but STILL manage and price existing positions.
+            logger.warning(f"VIX HIGH ({vix_price:.2f}). Risk Off — no new entries.")
+            self.check_velocity_exits()
+            self._update_position_prices()
+            return
+
+        # 4. Manage Existing
+        self.check_velocity_exits()
+
+        if self._operator_halt_active():
+            logger.warning(
+                f"OPERATOR HALT: {HALT_FILE} exists — managing existing positions only."
+            )
+            self._update_position_prices()
+            return
+
+        if MARKET_DATA_TYPE != 1:
+            logger.warning(
+                f"DATA SAFETY: MARKET_DATA_TYPE={MARKET_DATA_TYPE}; "
+                "new entries require real-time data (1). Managing existing positions only."
+            )
+            self._update_position_prices()
+            return
+
+        # 5. Entry Window (10:00 AM – 3:30 PM EST)
+        tz_ny  = pytz.timezone('US/Eastern')
+        now_ny = datetime.now(tz_ny)
+
+        if now_ny.weekday() < 5 and ENTRY_START <= (now_ny.hour, now_ny.minute) <= ENTRY_END:
+            # On Fridays raise the liquidity bar to 2× to avoid holding over weekends.
+            is_friday = (now_ny.weekday() == 4)
+            dol_vol_threshold = SCAN_MIN_DOLLAR_VOL * (VOL_MULT_FRIDAY if is_friday else 1.0)
+
+            allocation = self._calc_entry_allocation(equity, settled, len(self.state))
+            max_pos        = int(allocation['max_pos'])
+            capacity_slots = int(allocation['capacity_slots'])
+            cash_slots     = int(allocation['cash_slots'])
+            slots          = int(allocation['entry_slots'])
+            bucket_size    = allocation['bucket_size']
+            if slots <= 0:
+                logger.info(
+                    f"SCAN: no entry slots available "
+                    f"(capacity={capacity_slots}, settled_cash_slots={cash_slots}, max={max_pos})"
+                )
+            else:
+                # Check SPY regime once per cycle — same answer for all candidates
+                spy_trend = self._fetch_spy_trend()
+                bear_phase = not spy_trend
+                if bear_phase and not BEAR_PHASE_TRADING_ENABLED:
+                    logger.warning("REGIME: SPY below SMA50/SMA200 — no new entries this cycle")
+                    self._update_position_prices()
+                    return
+
+                if bear_phase:
+                    regime_label = "BEAR"
+                    rvol_min = BEAR_RVOL_MIN
+                    vcp_ratio = BEAR_VCP_RATIO
+                    rsi_threshold = BEAR_RSI_THRESHOLD
+                    rsi_min_delta = BEAR_RSI_MIN_DELTA
+                    gap_max_pct = BEAR_GAP_MAX_PCT
+                    dol_vol_threshold *= BEAR_PHASE_DOLLAR_VOL_MULT
+                    risk_per_trade_pct = RISK_PER_TRADE_PCT * BEAR_PHASE_RISK_MULT
+                    logger.warning(
+                        "REGIME: SPY below SMA50/SMA200 — bear-phase participation enabled; "
+                        f"using stricter 8096 rules (gap≤{gap_max_pct*100:.0f}%, "
+                        f"RSI>{rsi_threshold}, RSIΔ≥{rsi_min_delta}, "
+                        f"risk={risk_per_trade_pct*100:.1f}%)."
+                    )
+                else:
+                    regime_label = "BULL"
+                    rvol_min = RVOL_MIN
+                    vcp_ratio = VCP_RATIO
+                    rsi_threshold = RSI_THRESHOLD
+                    rsi_min_delta = RSI_MIN_DELTA
+                    gap_max_pct = GAP_MAX_PCT
+                    risk_per_trade_pct = RISK_PER_TRADE_PCT
+
+                watchlist = self.get_institutional_scan()
+                logger.info(f"SCAN: {len(watchlist)} candidates → {watchlist}"
+                            + (f" [FRIDAY: dolVol threshold ${dol_vol_threshold/1e6:.0f}M]" if is_friday else ""))
+
+                # Pre-compute sector counts for current book (for clustering check)
+                book_sectors: Dict[str, int] = {}
+                for book_sym in self.state:
+                    if book_sym in self._contract_cache:
+                        s = self._get_sector(book_sym, self._contract_cache[book_sym])
+                        book_sectors[s] = book_sectors.get(s, 0) + 1
+
+                # ── Phase 1: evaluate ALL candidates, collect those passing ──
+                signals = []
+                for sym in watchlist:
+                    if sym in self.state:
+                        logger.info(f"SCAN {sym}: SKIP — already in portfolio")
+                        continue
+
+                    if sym in TICKER_BLOCKLIST:
+                        logger.debug(f"SCAN {sym}: SKIP — blocklisted (leveraged/inverse ETF)")
+                        continue
+
+                    if sym in self._daily_scan_skip:
+                        logger.debug(
+                            f"SCAN {sym}: SKIP — day-filtered "
+                            f"({self._daily_scan_skip[sym]})"
+                        )
+                        continue
+
+                    ctx = self.get_technical_context(sym)
+                    if not ctx:
+                        logger.warning(f"SCAN {sym}: SKIP — no technical data")
+                        continue
+
+                    price        = ctx['live_price']
+                    orb_h        = ctx['orb_high']
+                    ma50         = ctx['ma50']
+                    ma200        = ctx['ma200']
+                    rsi          = ctx['rsi']
+                    rsi_p        = ctx['rsi_prev']
+                    atr          = ctx['atr']
+                    atr_chand    = ctx.get('atr_chandelier', atr)
+                    atr5         = ctx.get('atr5', atr)
+                    atr20        = ctx.get('atr20', atr)
+                    sma200_slope = ctx.get('sma200_slope', 0.0)
+                    rvol         = ctx.get('rvol', 0.0)
+                    day_loc      = ctx.get('day_range_location')
+                    intraday_gain = ctx.get('intraday_gain')
+                    spread_pct   = ctx.get('spread_pct', 0.0)
+                    dol_vol_20d  = ctx['dollar_vol_20d']
+                    atr_ratio    = (atr5 / atr20) if atr20 > 0 else float('nan')
+
+                    # ── Production entry filter ───────────────────────────────
+                    c_trend    = price > ma50 and ma50 > ma200
+                    c_slope    = sma200_slope > 0
+                    c_vcp      = atr20 > 0 and (atr5 / atr20) < vcp_ratio
+                    c_rvol     = rvol >= rvol_min
+                    c_spread   = spread_pct <= SPREAD_MAX_PCT
+                    c_dol_vol  = dol_vol_20d >= dol_vol_threshold
+                    c_orb      = price > orb_h
+                    c_gap      = price <= orb_h * (1 + gap_max_pct)
+                    c_rsi_rise  = rsi > rsi_p
+                    c_rsi_delta = (rsi - rsi_p) >= rsi_min_delta
+                    c_rsi_lvl   = rsi > rsi_threshold
+                    c_day_loc   = (
+                        day_loc is not None
+                        and not pd.isna(day_loc)
+                        and day_loc >= DAY_RANGE_LOCATION_MIN
+                    )
+                    c_open_gain = (
+                        intraday_gain is not None
+                        and not pd.isna(intraday_gain)
+                        and intraday_gain >= INTRADAY_GAIN_MIN
+                    )
+                    c_atr_pct = (
+                        price > 0
+                        and atr_chand > 0
+                        and (atr_chand / price) <= ATR_PCT_MAX
+                    )
+
+                    scan_detail = (
+                        f"SCAN {sym} [{regime_label}]: price=${price:.2f} ORB=${orb_h:.2f} "
+                        f"MA50=${ma50:.2f} MA200=${ma200:.2f} SMA200slope={sma200_slope:+.3f} "
+                        f"ATR5/ATR20={atr_ratio:.2f}(vcp<{vcp_ratio}) "
+                        f"RVOL={rvol:.1f}(≥{rvol_min}) spread={spread_pct*100:.2f}%(≤{SPREAD_MAX_PCT*100:.1f}%) "
+                        f"DayLoc={day_loc if day_loc is not None else float('nan'):.2f}(≥{DAY_RANGE_LOCATION_MIN:.2f}) "
+                        f"OpenGain={intraday_gain if intraday_gain is not None else float('nan'):+.2%}(≥{INTRADAY_GAIN_MIN:.1%}) "
+                        f"RSI={rsi:.1f}(Δ{rsi-rsi_p:+.1f}) "
+                        f"ATR=${atr:.2f} ATR%={atr_chand/price if price > 0 else float('nan'):.2%}(≤{ATR_PCT_MAX:.0%}) "
+                        f"DolVol20d=${dol_vol_20d/1e6:.0f}M(thr=${dol_vol_threshold/1e6:.0f}M) | "
+                        f"InfoTrend={c_trend} InfoSlope={c_slope} InfoVCP={c_vcp} "
+                        f"InfoRVOL={c_rvol} Spread={c_spread} "
+                        f"DayLoc={c_day_loc} OpenGain={c_open_gain} ATRPct={c_atr_pct} "
+                        f"ORB={c_orb} Gap={c_gap} InfoRSI↑={c_rsi_rise} "
+                        f"RSIΔ≥{rsi_min_delta}={c_rsi_delta} RSI>{rsi_threshold}={c_rsi_lvl} "
+                        f"DolVol={c_dol_vol}"
+                    )
+
+                    if not (c_spread and c_dol_vol
+                            and c_orb and c_gap
+                            and c_rsi_delta and c_rsi_lvl
+                            and c_day_loc and c_open_gain and c_atr_pct):
+                        failed = [n for n, v in [
+                            (f'Spread≤{SPREAD_MAX_PCT*100:.1f}%', c_spread),
+                            (f'DolVol≥{dol_vol_threshold/1e6:.0f}M', c_dol_vol),
+                            (f'DayLoc≥{DAY_RANGE_LOCATION_MIN:.2f}', c_day_loc),
+                            (f'OpenGain≥{INTRADAY_GAIN_MIN:.1%}', c_open_gain),
+                            (f'ATR%≤{ATR_PCT_MAX:.0%}', c_atr_pct),
+                            ('price>ORB', c_orb),
+                            (f'gap≤{gap_max_pct*100:.0f}%', c_gap),
+                            (f'RSIΔ≥{rsi_min_delta}', c_rsi_delta),
+                            (f'RSI>{rsi_threshold}', c_rsi_lvl),
+                        ] if not v]
+                        logger.debug(f"{scan_detail}")
+                        logger.debug(f"SCAN {sym}: NO SIGNAL — failed: {failed}")
+                        if not c_dol_vol:
+                            self._remember_daily_scan_skip(
+                                sym,
+                                f"DolVol20d ${dol_vol_20d/1e6:.0f}M "
+                                f"< threshold ${dol_vol_threshold/1e6:.0f}M"
+                            )
+                        continue
+
+                    # ── Correlation filter (expensive — only for passing candidates) ──
+                    df_daily = ctx.get('df_daily')
+                    if df_daily is not None and self.state:
+                        max_corr = self._compute_book_correlation(sym, df_daily)
+                        if max_corr > CORR_MAX:
+                            logger.debug(
+                                f"SCAN {sym}: SKIP — correlation {max_corr:.2f} > {CORR_MAX} with book"
+                            )
+                            continue
+
+                    # ── Sector clustering filter ──────────────────────────────
+                    sector = self._get_sector(sym, ctx['contract'])
+                    if book_sectors.get(sector, 0) >= MAX_SECTOR_COUNT:
+                        logger.debug(
+                            f"SCAN {sym}: SKIP — sector '{sector}' already has "
+                            f"{book_sectors[sector]}/{MAX_SECTOR_COUNT} positions"
+                        )
+                        continue
+
+                    score = self._score_candidate(ctx)
+                    signals.append((score, sym, ctx))
+                    logger.info(scan_detail)
+                    logger.info(
+                        f"SIGNAL {sym} [{regime_label}]: score={score:.1f}/100 | "
+                        f"RVOL={rvol:.1f}x trend_sep={(ma50-ma200)/ma200*100:.1f}% "
+                        f"RSI_delta={rsi-rsi_p:.1f} spread={spread_pct*100:.2f}% "
+                        f"DolVol20d=${dol_vol_20d/1e6:.0f}M"
+                    )
+
+                # ── Phase 2: rank by score; enter in descending order, falling
+                #    through to the next eligible stock when one is skipped ──────
+                if not signals:
+                    logger.info("SCAN: No signals this cycle")
+                else:
+                    signals.sort(key=lambda x: x[0], reverse=True)
+                    ranked = [(s, sym) for s, sym, _ in signals]
+                    logger.info(f"RANKED: {ranked} — attempting up to {min(slots, len(signals))}")
+
+                    placed = 0
+                    for score, sym, ctx in signals:
+                        if placed >= slots:
+                            break
+
+                        atr   = ctx['atr']
+
+                        # Re-fetch price if the scan price is stale -- the scan
+                        # phase can take several minutes across a broad candidate list.
+                        quote_bid = ctx.get('bid')
+                        quote_ask = ctx.get('ask')
+                        fetched_at = ctx.get('price_fetched_at', datetime.now(_TZ_NY))
+                        age_s = (datetime.now(_TZ_NY) - fetched_at).total_seconds()
+                        if age_s > ENTRY_REPRICE_MAX_AGE_SEC:
+                            try:
+                                t2         = self.ib.reqTickers(ctx['contract'])[0]
+                                new_price  = t2.marketPrice()
+                                if pd.isna(new_price):
+                                    new_price = t2.last
+                                if pd.isna(new_price):
+                                    new_price = t2.close
+                                new_price = self._coerce_positive_price(new_price)
+                                new_bid = self._coerce_positive_price(getattr(t2, 'bid', None))
+                                new_ask = self._coerce_positive_price(getattr(t2, 'ask', None))
+                                if new_price is not None and new_bid is not None and new_ask is not None:
+                                    drift = (
+                                        abs(float(new_price) - float(ctx['live_price']))
+                                        / float(ctx['live_price'])
+                                    )
+                                    if drift > ENTRY_MAX_PRICE_DRIFT_PCT:
+                                        logger.warning(
+                                            f"SKIP {sym}: scan-to-order price drift "
+                                            f"{drift*100:.2f}% exceeds "
+                                            f"{ENTRY_MAX_PRICE_DRIFT_PCT*100:.1f}% cap"
+                                        )
+                                        continue
+                                    price = new_price
+                                    quote_bid = new_bid
+                                    quote_ask = new_ask
+                                    logger.debug(
+                                        f"REPRICE {sym}: ${ctx['live_price']:.2f} -> ${price:.2f} "
+                                        f"bid=${quote_bid:.2f} ask=${quote_ask:.2f}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"SKIP {sym}: stale scan price or bid/ask unavailable for reprice"
+                                    )
+                                    continue
+                            except Exception:
+                                logger.warning(
+                                    f"SKIP {sym}: stale scan price and live reprice failed"
+                                )
+                                continue
+                        else:
+                            price = ctx['live_price']
+
+                        if not self._entry_price_is_still_valid(
+                            sym, ctx, float(price), gap_max_pct=gap_max_pct
+                        ):
+                            continue
+
+                        # Spread-aware marketable limit: price from validated ask,
+                        # capped by a small max-over-market guard. This is only
+                        # allowed with real-time market data; delayed data is blocked
+                        # before the entry window.
+                        limit_price = self._calc_entry_limit_price(price, quote_bid, quote_ask)
+                        if limit_price is None:
+                            logger.warning(
+                                f"SKIP {sym}: unusable bid/ask for entry limit "
+                                f"(price={price}, bid={quote_bid}, ask={quote_ask})"
+                            )
+                            continue
+
+                        if np.isnan(atr) or atr <= 0:
+                            logger.warning(f"SKIP {sym}: ATR invalid ({atr:.4f}), skipping")
+                            continue
+
+                        atr_chandelier  = ctx.get('atr_chandelier', atr)
+                        chandelier_dist = round(atr_chandelier * CHANDELIER_MULT, 2)
+                        hard_stop_dist  = round(price * HARD_STOP_PCT, 2)
+                        risk_stop_dist  = min(chandelier_dist, hard_stop_dist)
+                        if np.isnan(risk_stop_dist) or risk_stop_dist <= 0:
+                            logger.warning(
+                                f"SKIP {sym}: invalid risk stop distance "
+                                f"(chandelier=${chandelier_dist:.2f}, hard=${hard_stop_dist:.2f})"
+                            )
+                            continue
+
+                        # Whole shares only. Size by the stricter of capital bucket
+                        # and true dollars-at-risk to keep live sizing aligned with
+                        # the backtest risk model. Settled cash must cover the whole
+                        # intended order; otherwise skip rather than send dust trades.
+                        bucket_qty = int(bucket_size / limit_price)
+                        risk_qty   = int((equity * risk_per_trade_pct) / risk_stop_dist)
+                        qty        = min(bucket_qty, risk_qty)
+                        if qty < 1:
+                            logger.warning(
+                                f"SKIP {sym}: no whole-share size after risk/cash caps "
+                                f"(bucket_qty={bucket_qty}, risk_qty={risk_qty}, "
+                                f"risk_dist=${risk_stop_dist:.2f})"
+                            )
+                            continue
+
+                        order_cost = round(qty * limit_price, 2)
+                        if settled < order_cost:
+                            logger.warning(
+                                f"SKIP {sym}: insufficient settled cash for intended size "
+                                f"(need ${order_cost:.2f}, have ${settled:.2f}, qty={qty})"
+                            )
+                            continue
+
+                        # goodAfterTime must not be set to a time already in
+                        # the past, or IBKR can reject the order as invalid.
+                        gat_str = self._entry_good_after_time()
+
+                        buy_order               = Order()
+                        buy_order.action        = 'BUY'
+                        buy_order.orderType     = 'LMT'
+                        buy_order.totalQuantity = qty
+                        buy_order.lmtPrice      = limit_price
+                        buy_order.tif           = ENTRY_PARENT_TIF
+                        buy_order.allOrNone     = ENTRY_ALL_OR_NONE
+                        buy_order.goodAfterTime = gat_str
+                        buy_order.transmit      = False   # hold until child is attached
+
+                        if not self._preflight_order(ctx['contract'], buy_order, sym):
+                            logger.warning(
+                                f"SKIP {sym}: BUY LMT pre-flight rejected by IB — skipping"
+                            )
+                            continue
+
+                        parent_trade = self.ib.placeOrder(ctx['contract'], buy_order)
+
+                        stop_order               = Order()
+                        stop_order.action        = 'SELL'
+                        stop_order.orderType     = 'TRAIL'
+                        stop_order.totalQuantity = qty
+                        stop_order.auxPrice      = chandelier_dist  # trail amount in $
+                        stop_order.parentId      = parent_trade.order.orderId
+                        stop_order.tif           = 'GTC'
+                        stop_order.goodAfterTime = gat_str
+                        stop_order.transmit      = True   # transmits both orders atomically
+
+                        if not self._preflight_order(ctx['contract'], stop_order, sym):
+                            logger.warning(
+                                f"SKIP {sym}: child TRAIL pre-flight rejected by IB — "
+                                f"cancelling untransmitted BUY parent"
+                            )
+                            try:
+                                self.ib.cancelOrder(parent_trade.order)
+                            except Exception:
+                                pass
+                            continue
+
+                        stop_trade = self.ib.placeOrder(ctx['contract'], stop_order)
+                        trades = [parent_trade, stop_trade]
+
+                        # Wait until IB confirms a terminal state (Filled / Cancelled /
+                        # ApiCancelled / Inactive), up to 30 s.  loopUntil() returns
+                        # immediately once isDone() is True — much faster than a fixed
+                        # sleep for quick limit fills; also avoids a stale-status read.
+                        for _ in self.ib.loopUntil(parent_trade.isDone, timeout=30):
+                            pass
+                        status = parent_trade.orderStatus.status
+                        filled = parent_trade.orderStatus.filled
+                        logger.info(f"ORDER STATUS: {sym} → {status} (filled={filled})")
+
+                        try:
+                            filled_qty = float(filled or 0)
+                        except (TypeError, ValueError):
+                            filled_qty = float(qty) if status == 'Filled' else 0.0
+
+                        if 0 < filled_qty < qty:
+                            self._alert(
+                                "ERROR",
+                                f"PARTIAL FILL: {sym} filled={filled_qty:g}/{qty:g} "
+                                f"status={status}. Cancelling bracket and rebuilding protection from IBKR state."
+                            )
+
+                        # Only an actual fill creates a position. Submitted or
+                        # PreSubmitted is still just an order, not inventory.
+                        if status != 'Filled' or filled_qty <= 0:
+                            logger.warning(
+                                f"ORDER NOT FILLED: {sym} status={status} filled={filled_qty} "
+                                f"qty={qty} limit=${limit_price:.2f}. Cancelling all legs "
+                                f"and trying next candidate."
+                            )
+                            for t in trades:
+                                try:
+                                    self.ib.cancelOrder(t.order)
+                                except Exception:
+                                    pass
+                            self.ib.sleep(1)
+                            # If IB reports a late partial fill during cancellation,
+                            # reconcile it immediately and ensure a protective stop.
+                            self._sync_positions_from_ibkr()
+                            if sym in self.state:
+                                self._audit_stop_orders()
+                            continue
+
+                        fill_price = (
+                            self._coerce_positive_price(parent_trade.orderStatus.avgFillPrice)
+                            or limit_price
+                        )
+                        self.state[sym] = {
+                            'fill_price':     fill_price,
+                            'price':          fill_price,
+                            'entry_order_id': parent_trade.order.orderId,
+                            'time':           datetime.now(_TZ_NY).isoformat(),
+                            'qty':            filled_qty,
+                            'stop_loss':      round(fill_price - chandelier_dist, 2),
+                            'stop_dist':      chandelier_dist,
+                            'peak_price':     fill_price,
+                            'volume':         ctx.get('volume', 0),
+                            'score':          score,
+                            'regime':         regime_label.lower(),
+                        }
+                        # Commission report sometimes lands synchronously with the fill.
+                        # Capture it now if available; _on_commission_report handles it
+                        # if it arrives later during an ib.sleep() or subsequent cycle.
+                        if parent_trade.fills:
+                            cr = parent_trade.fills[0].commissionReport
+                            if cr and not np.isnan(cr.commission) and cr.commission > 0:
+                                self.state[sym]['commission'] = round(float(cr.commission), 4)
+                        self.save_state()
+                        if abs(float(filled_qty) - float(qty)) > 1e-6:
+                            logger.warning(
+                                f"PARTIAL FILL PROTECTION: {sym} filled={filled_qty:g}/{qty:g}; "
+                                "cancelling original child stop and rebuilding protection "
+                                "for the actual filled quantity."
+                            )
+                            try:
+                                self.ib.cancelOrder(stop_order)
+                            except Exception as e:
+                                logger.warning(f"PARTIAL FILL {sym}: child stop cancel failed: {e}")
+                            self.ib.sleep(1)
+                            self._audit_stop_orders()
+                        stop_status = getattr(stop_trade.orderStatus, 'status', '')
+                        if stop_status in _REJECTED_ORDER_STATUSES:
+                            logger.error(
+                                f"STOP REJECTED: {sym} child TRAIL status={stop_status}. "
+                                "Running immediate stop audit."
+                            )
+                            self._audit_stop_orders()
+
+                        actual_order_cost = round(float(filled_qty) * float(fill_price), 2)
+                        settled -= actual_order_cost
+                        placed  += 1
+                        # Recalculate bucket for any further entries in this cycle.
+                        # The first order may have used less than one full bucket
+                        # (ATR-capped), so the remaining cash could support a larger
+                        # bucket per remaining slot.
+                        allocation = self._calc_entry_allocation(equity, settled, len(self.state))
+                        max_pos        = int(allocation['max_pos'])
+                        capacity_slots = int(allocation['capacity_slots'])
+                        cash_slots     = int(allocation['cash_slots'])
+                        open_slots     = int(allocation['entry_slots'])
+                        bucket_size    = allocation['bucket_size']
+                        logger.info(
+                            f"ORDER CONFIRMED: {sym} [{regime_label}] | Score={score:.1f} Qty={filled_qty:g} "
+                            f"ScanPrice=${price:.2f} Limit=${limit_price:.2f} "
+                            f"FillPrice=${fill_price:.2f} "
+                            f"Commission={'$'+str(self.state[sym]['commission']) if 'commission' in self.state[sym] else 'pending'} "
+                            f"ChandelierStop=${round(fill_price-chandelier_dist,2):.2f} "
+                            f"(dist=${chandelier_dist:.2f}, risk_dist=${risk_stop_dist:.2f}, "
+                            f"risk={risk_per_trade_pct*100:.1f}%) | "
+                            f"Settled remaining=${settled:.2f}"
+                        )
+
+        # Refresh live prices for dashboard unrealized P&L
+        self._update_position_prices()
+
+    # ── Headless event loop ───────────────────────────────────────────────────
+    def run(self):
+        logger.info("=" * 40)
+        logger.info("ENGINE DEPLOYED")
+        logger.info("=" * 40)
+        self._initialize()
+        logger.info("ENGINE READY: Starting main loop...")
+        while True:
+            try:
+                self.run_cycle()
+
+                now_ny             = datetime.now(_TZ_NY)
+                self._last_scan_ts = now_ny.strftime("%H:%M:%S %Z")
+                self._next_scan_dt = (
+                    now_ny + timedelta(seconds=SCAN_INTERVAL)
+                ).isoformat()
+                self._write_dashboard_data(connected=True)
+
+                self.ib.sleep(SCAN_INTERVAL)
+
+            except Exception as e:
+                logger.exception("RUNTIME ERROR")
+                self._alert("ERROR", f"RUNTIME ERROR: {e}")
+                self._next_scan_dt = (
+                    datetime.now(_TZ_NY) + timedelta(seconds=ERROR_WAIT)
+                ).isoformat()
+                self._write_dashboard_data(connected=self.ib.isConnected())
+                self.ib.sleep(ERROR_WAIT)

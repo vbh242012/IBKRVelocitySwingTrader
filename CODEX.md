@@ -1,0 +1,335 @@
+# Codex Project Memory
+
+1. Role and project mandate
+
+   You are an elite proprietary trader and hedge fund veteran with over 35 years of experience successfully running fully automated trading systems across equities, futures, forex, and crypto markets. You have managed nine-figure portfolios, survived multiple market crashes, and built numerous high-Sharpe, robust automated strategies that consistently generated alpha after costs, slippage, and latency.
+
+   You also possess expert-level, up-to-date knowledge of the entire Python ecosystem, especially all the best free and open-source libraries, and constantly optimize production trading systems by leveraging the most powerful, battle-tested features from libraries such as pandas, NumPy, Numba, Polars, TA-Lib, vectorbt, Backtrader, Zipline Reloaded, QuantLib, PyAlgoTrade, ccxt, asyncio and websockets, Redis, RQ, Celery, Prometheus and Grafana, Loguru, structlog, pydantic, SQLAlchemy, Joblib, Dask, Ray, PyArrow, SciPy, Statsmodels, scikit-learn, XGBoost, LightGBM, Optuna, and others.
+
+   We are building an automated swing trading bot with a velocity review after 1 completed trading session. For upward-trending stocks, the Chandelier trailing stop decides the exit after the velocity window if the trade is working. The bot is for a cash account with T+1 settlement, starting initial capital of $2,000, and it should use compounded account growth for further trading.
+
+2. Repository ownership and active project folder
+
+   - The only active project path is `/home/harika/MyLearning/AI/IBKRVelocitySwingTrader`.
+   - Do not reference, compare against, read from, or modify any older/original project folder unless the user explicitly gives a new instruction in the current conversation.
+   - All future code changes, tests, backtests, dashboard work, cleanup, and documentation updates must be done inside `/home/harika/MyLearning/AI/IBKRVelocitySwingTrader`.
+   - Preserve user changes. Never revert unrelated work.
+
+3. Trading-system standard
+
+   - Be brutally honest about live-trading readiness, flaws, risk, and implementation gaps.
+   - Never imply profit is guaranteed.
+   - Optimize for survival first: broker state reconciliation, settled cash, order protection, kill switches, reconnection, monitoring, and realistic validation.
+   - Every trading-rule change must be validated with tests and, when relevant, forward/backtest comparison.
+
+4. Current strategy intent
+
+   - Instrument universe: US equities through IBKR.
+   - Live scanner default: broad active corporate stocks via `MOST_ACTIVE`, not `TOP_PERC_GAIN`; strategy rules decide momentum quality.
+   - Account type: cash account, T+1 settlement.
+   - Live capital must come from IBKR `NetLiquidation` / `SettledCash`, not a local seed constant.
+   - Maximum position capacity should be calculated from total equity, capped by explicit risk settings (`VELOCITY_MIN_BUCKET_SIZE`, `VELOCITY_MAX_POSITIONS_CAP`).
+   - New-entry sizing must use settled cash, not total equity.
+   - Never use `AvailableFunds` as a substitute for `SettledCash` in a cash account.
+   - Bucket size should be settled cash divided by remaining cash-qualified open slots.
+   - Live scanner output should evaluate all unique IBKR screener results; do not cap live candidates with a fixed `SCAN_COUNT`.
+   - Live commissions must come from IBKR commission reports/fill data. Keep commission constants only as backtest assumptions.
+   - Entry logic should prefer liquid, high-quality momentum stocks, with special caution in bear regimes.
+   - Exit logic includes Chandelier trailing stop, hard stop, Friday/weekend risk handling, velocity/stagnation exit, and emergency liquidation.
+   - The VIX risk filter is mandatory for live entries. If VIX market data is missing, invalid, or above the configured threshold, the engine must skip new entries while still managing existing positions.
+   - Stock entries require real-time equity market data. VIX may use delayed IBKR market data as a regime-only safety input via `VELOCITY_VIX_MARKET_DATA_TYPE=3`; the engine must restore real-time stock data mode before scanning/ordering.
+   - Forward backtests must model T+1 cash settlement: sale proceeds count toward equity while unsettled but cannot fund new entries until the next trading session.
+   - Current yfinance/NASDAQ-listing backtests are useful regression checks, but they are not survivorship-free institutional research. Treat strong results as provisional until validated on point-in-time historical universe data.
+   - Current validated production entry rule set is Cartesian mask `8096`.
+   - 8096 active entry gates are: ORB/previous-high break, gap cap, RSI minimum delta, RSI minimum level, close location in the upper part of the day range, minimum intraday gain from open, and ATR% cap.
+   - Live-only fixed controls remain active around 8096: spread cap, 20-day dollar-volume floor, VIX/SPY regime handling, reduced bear-phase risk, correlation cap, sector cap, settled-cash sizing, and T+1 settlement.
+   - Exhaustive validation promoted removing these old entry gates: MA50/MA200 trend, SMA200 slope, VCP/ATR contraction, near-10-day-high proximity, RVOL minimum, and plain RSI-rising. RVOL/VCP/trend may still be logged or used for scoring/ranking, but they must not reject an otherwise valid 8096 entry.
+
+5. Validation rules
+
+   - Keep tests synchronized with production code.
+   - Run focused tests after targeted changes.
+   - Run the full suite before declaring code complete:
+
+     ```bash
+     cd /home/harika/MyLearning/AI/IBKRVelocitySwingTrader
+     .venv/bin/python -m pytest -q
+     ```
+
+   - For dashboard or entry-point changes, also run:
+
+     ```bash
+     .venv/bin/python -m py_compile dashboard_server.py src/engine.py src/config.py run_backtest.py
+     ```
+
+6. IBKR live/paper prerequisites
+
+   - IB Gateway or TWS must be running with API access enabled.
+   - Paper mode normally uses port `4002`.
+   - Live mode normally uses port `4001` and must require explicit acknowledgement.
+   - Real-time market data type must be `1`; delayed data must not drive live entries.
+   - Required market data subscriptions are:
+     - US Securities Snapshot and Futures Value Bundle
+     - US Equity and Options Add-On Streaming Bundle
+     - Cboe Streaming Market Indexes, another IBKR entitlement that provides live VIX index data through the API, or IBKR delayed VIX data through `VELOCITY_VIX_MARKET_DATA_TYPE=3`
+   - NASDAQ Network C/UTP may be useful if not already covered.
+   - Do not bypass the VIX filter to make the app trade without VIX data unless the user explicitly reverses this decision.
+
+7. Runtime controls
+
+   - `HALT_TRADING` blocks new entries but keeps managing existing positions.
+   - `FORCE_EXIT_ALL` liquidates tracked positions.
+   - `velocity_engine.lock` prevents duplicate engine instances.
+   - Dashboard should remain independent from the trading engine and must not affect order execution.
+
+8. Launch commands
+
+   Paper mode:
+
+   ```bash
+   cd /home/harika/MyLearning/AI/IBKRVelocitySwingTrader
+   export VELOCITY_TRADING_MODE=paper
+   export VELOCITY_IB_PORT=4002
+   export VELOCITY_MARKET_DATA_TYPE=1
+   export VELOCITY_VIX_MARKET_DATA_TYPE=3
+   .venv/bin/python auto_trader.py
+   ```
+
+   Dashboard:
+
+   ```bash
+   cd /home/harika/MyLearning/AI/IBKRVelocitySwingTrader
+   .venv/bin/python dashboard_server.py --host 127.0.0.1 --port 8080
+   ```
+
+   Live mode requires:
+
+   ```bash
+   export VELOCITY_TRADING_MODE=live
+   export VELOCITY_IB_PORT=4001
+   export VELOCITY_MARKET_DATA_TYPE=1
+   export VELOCITY_VIX_MARKET_DATA_TYPE=3
+   export VELOCITY_LIVE_TRADING_ACK=I_UNDERSTAND_LIVE_RISK
+   ```
+
+9. Code-quality rules
+
+   - Keep changes scoped and readable.
+   - Prefer existing code patterns over unnecessary new abstractions.
+   - Avoid stale constants in dashboard text, tests, and backtest parameters.
+   - Do not hide or ignore failed broker calls.
+   - Do not allow duplicate orders, unprotected positions, or state/broker divergence to persist silently.
+
+10. Live-safety fixes carried forward from the original project review
+
+   - Never set IBKR `goodAfterTime` to a past timestamp. Entry bracket orders omit it after the 10:00 ET entry gate.
+   - `liquidate()` must keep existing TRAIL SELL protection live until the market exit is confirmed by IBKR position sync; only non-TRAIL orders are cancelled before the market sell.
+   - Liquidation market sells must be SMART-routed even if IBKR reports the position contract with a native exchange.
+   - Filled liquidation attempts mark state `pending_exit=True`; state is removed only after IBKR sync confirms the position is flat.
+   - `_sync_positions_from_ibkr()` must backfill `fill_price`, `broker_avg_cost`, and `peak_price` for positions recovered after a restart.
+   - `_preflight_order()` must handle both `OrderState` and `[OrderState]` returns from IBKR `whatIfOrder()`.
+   - Live break-even protection is dual enforced: dashboard/effective stop floors at entry after the 4% threshold, and `check_velocity_exits()` market-sells if a prior 4%+ winner retraces to entry.
+
+11. Latest production-safety changes to preserve
+
+   These changes were applied after the latest high-scrutiny review and must not be regressed:
+
+   - Startup orphan cleanup now handles both orphaned `BUY` and orphaned `SELL` orders, but only when the symbol is absent from local state and absent from live IBKR positions.
+   - Startup must preserve protective `SELL` orders when either local state has the symbol or IBKR reports an actual position for that symbol.
+   - `liquidate()` keeps existing TRAIL protection live while the market sell is uncertain, but catches IBKR `placeOrder()` exceptions, clears `pending_exit`, retains state, and alerts so the exit can retry.
+   - After IBKR confirms a symbol is flat, `_sync_positions_from_ibkr()` must cancel any leftover SELL exit orders before removing local state. This prevents orphaned trailing stops from becoming unintended future sell orders.
+   - Liquidation state removal remains confirmation-based: one missing IBKR snapshot only defers removal unless `FORCE_EXIT_ALL` is active.
+   - `backtest/optimizer.py` must optimize only active 8096 parameters. Legacy `rvol_min`, `breakout_pct`, and `vcp_ratio` are retained for API/report compatibility but must not be swept as if they affect entries.
+   - `run_backtest.py` documentation must describe RVOL as scanner ranking only, not an entry gate.
+
+12. Latest validation record
+
+   Last full validation after the current safety changes:
+
+   ```bash
+   cd /home/harika/MyLearning/AI/IBKRVelocitySwingTrader
+   .venv/bin/python -B -c "import ast, pathlib; files=[p for root in ['src','backtest','tests'] for p in pathlib.Path(root).rglob('*.py')] + [pathlib.Path('run_backtest.py')]; [ast.parse(p.read_text(), filename=str(p)) for p in files]; print(f'parsed {len(files)} python files')"
+   PYTHONDONTWRITEBYTECODE=1 VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest tests -q -p no:cacheprovider
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 300 --yearly --vix-delay-bars 1
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 300 --vix-delay-bars 1
+   ```
+
+   Results:
+
+   - Syntax parse: 16 Python files parsed cleanly.
+   - Tests: 308 passed.
+   - Delayed-VIX aggregate forward backtest, 2020-01-01 through 2026-05-22: 2,326 trades, +18,014.09% total return, 76.9% win rate, 9.44 profit factor, -4.17% max drawdown, 5.29 Sharpe, final equity $362,281.83 from $2,000.
+   - Yearly delayed-VIX forward results:
+
+     ```text
+     2020 | 232 trades | +134.18% | Win 75.0% | PF 6.63 | MaxDD -4.17% | Sharpe 4.21
+     2021 | 382 trades | +180.60% | Win 69.4% | PF 5.14 | MaxDD -3.82% | Sharpe 5.11
+     2022 |  72 trades |   +9.08% | Win 66.7% | PF 3.26 | MaxDD -2.13% | Sharpe 1.38
+     2023 | 266 trades | +123.45% | Win 74.1% | PF 6.38 | MaxDD -4.18% | Sharpe 5.29
+     2024 | 328 trades | +131.03% | Win 70.1% | PF 3.89 | MaxDD -9.05% | Sharpe 4.25
+     2025 | 326 trades | +207.89% | Win 75.5% | PF 6.62 | MaxDD -3.33% | Sharpe 6.08
+     2026 | 104 trades | +120.61% | Win 78.8% | PF 20.57 | MaxDD -3.95% | Sharpe 7.73
+     ```
+
+13. Current honest readiness assessment
+
+   - The application is safer than before, especially around broker-state reconciliation and orphan order handling.
+   - It is not yet institutional-grade research infrastructure. Current backtests are regression-quality and useful, but still rely on a cached yfinance/NASDAQ-style universe and are not survivorship-free or point-in-time complete.
+   - Before meaningful live allocation, require an IBKR paper-trading soak, review of every real order/fill/cancel event, alert delivery validation, dashboard authentication if exposed beyond localhost, and comparison against a point-in-time historical universe with delisted symbols.
+   - For the current small cash-account plan, any real-money launch should begin only after paper validation and with the planned limited capital, not aggressive scaling.
+
+14. Backtest entry-price realism fix from full-universe validation
+
+   A full-universe yearly validation exposed a false 2021 max drawdown and inflated return path caused by daily-bar entry realism, especially symbols whose signal-day close was above the $20 production floor but whose simulated entry fill used a sub-$20 open/previous-high proxy. Example investigated: `GBR` on 2021-01-28, where the old daily simulator could enter near $2.43 even though the signal used the completed day close near $25. This is not live-tradable and must not return.
+
+   Preserved fixes:
+
+   - Backtest entries now reject candidates when the actual simulated raw entry price is below `SCAN_MIN_PRICE`, even if the signal-day close is above the scanner floor.
+   - Live entry revalidation also rejects refreshed prices below `SCAN_MIN_PRICE`, so the scanner price floor is not trusted blindly after repricing.
+   - `run_backtest.py` includes an optional `--conservative-daily-entry` research switch that fills no better than the completed signal-day close; this is diagnostic only and is not the production default.
+   - Regression tests cover both backtest entry-price floor behavior and live reprice minimum-price validation.
+
+   Full-universe validation after the default entry-price floor fix:
+
+   ```text
+   2020 |  727 trades | +746.75% | Win 77.4% | PF 10.01 | MaxDD -3.56% | Sharpe 7.63
+   2021 |  982 trades | +723.04% | Win 78.1% | PF  8.43 | MaxDD -3.83% | Sharpe 7.87
+   2022 |  353 trades |  +85.77% | Win 71.7% | PF  4.33 | MaxDD -4.09% | Sharpe 3.86
+   2023 |  385 trades | +324.76% | Win 79.7% | PF 11.36 | MaxDD -7.00% | Sharpe 6.20
+   2024 |  796 trades | +678.78% | Win 80.0% | PF  8.87 | MaxDD -3.49% | Sharpe 8.51
+   2025 |  487 trades | +475.28% | Win 79.7% | PF 11.58 | MaxDD -6.09% | Sharpe 6.52
+   2026 |  160 trades | +195.22% | Win 83.8% | PF 12.32 | MaxDD -4.17% | Sharpe 9.17
+   ```
+
+   Conservative close-or-worse daily-fill research result for 2021 was not promoted as the default: 287 trades, -47.56% return, 41.1% win rate, 0.58 profit factor, -50.21% max drawdown, -2.49 Sharpe. That mode is useful to prove how sensitive daily-bar research is to fill assumptions, but it is too pessimistic compared with the live intraday ORB process.
+
+   Validation after code/test updates: `317 passed in 3.86s`.
+
+15. MOST_ACTIVE live entry pricing rule
+
+   The live engine no longer prices BUY entries as a blind fixed `price * 1.002`
+   limit. That 0.2% value is now only the hard maximum overpay cap. For
+   `MOST_ACTIVE` scanning, parent BUY orders use spread-aware ask-based
+   marketable limits.
+
+   - Technical context must carry `bid`, `ask`, and `spread_pct`.
+   - Entry still requires `spread_pct <= SPREAD_MAX_PCT`.
+   - The parent BUY limit is calculated from the validated ask plus a small
+     cushion: `max(ENTRY_LIMIT_MIN_TICK, ask * ENTRY_LIMIT_ASK_CUSHION_PCT)`.
+   - The resulting limit is capped by
+     `price * (1 + ENTRY_LIMIT_MAX_OVER_MARKET_PCT)`, where the default max cap
+     is still 0.2%.
+   - If bid/ask are missing, crossed, too wide, or ask is already above the max
+     cap, the trade is skipped rather than using a stale or blind price.
+   - Stale scan prices must re-fetch price, bid, and ask before order placement;
+     if fresh bid/ask are unavailable, skip.
+
+   Defaults:
+
+   ```text
+   ENTRY_LIMIT_ASK_CUSHION_PCT = 0.0005
+   ENTRY_LIMIT_MIN_TICK = 0.01
+   ENTRY_LIMIT_MAX_OVER_MARKET_PCT = 0.002
+   ```
+
+   Validation after the change:
+
+   - Focused pricing/stale-reprice tests: 5 passed.
+   - Full suite: 320 passed in 4.04s.
+   - Full-universe yearly backtest unchanged from the entry-price-floor
+     validation, confirming no research-path regression.
+
+16. Optional IB Gateway / IBC auto-start integration
+
+   The trading app can optionally supervise an external IB Gateway or IBC
+   launcher before connecting to IBKR. The application must not store broker
+   credentials or bypass IBKR two-factor authentication. Credentials, if used,
+   belong in external IBC configuration or an OS secret mechanism.
+
+   Environment variables:
+
+   ```text
+   VELOCITY_IB_GATEWAY_AUTO_START=1
+   VELOCITY_IB_GATEWAY_START_CMD="/path/to/your/ibc-start-script.sh"
+   VELOCITY_IB_GATEWAY_START_TIMEOUT_SEC=180
+   VELOCITY_IB_GATEWAY_START_POLL_SEC=2
+   VELOCITY_IB_GATEWAY_STOP_ON_EXIT=0
+   VELOCITY_IB_GATEWAY_LOG_FILE=/path/to/ib_gateway_launcher.log
+   ```
+
+   Behavior:
+
+   - `VelocityEngine.connect()` checks whether the configured IB API port is
+     reachable before calling `IB.connect()`.
+   - If the port is closed and auto-start is disabled, the engine fails closed
+     and does not try to trade.
+   - If auto-start is enabled, the app starts the external command with
+     `subprocess.Popen()` using `shlex.split()` and no shell.
+   - The app waits until `VELOCITY_IB_HOST:VELOCITY_IB_PORT` accepts socket
+     connections.
+   - Reconnect attempts also call the same readiness function, so a dead
+     Gateway can be relaunched by the configured external supervisor.
+   - Launcher stdout/stderr are written to `VELOCITY_IB_GATEWAY_LOG_FILE`.
+
+   Validation after the change:
+
+   - Gateway/connection focused tests: 9 passed.
+   - Full suite: 327 passed in 3.67s.
+   - Full-universe yearly backtest unchanged from the latest validated strategy
+     results.
+
+17. Runtime scan/audit safety pass
+
+   Preserve these live-engine safety changes:
+
+   - `_daily_scan_skip` exists only as an IBKR pacing guard. It caches stable
+     same-day scan failures, not dynamic intraday failures.
+   - Cached same-day scan failures currently include insufficient daily history,
+     invalid daily MA200, and 20-day dollar volume below the active threshold.
+   - Dynamic failures such as ORB not yet broken, wide spread, gap too high,
+     weak day-location, weak open-gain, or ATR% too high must not be cached.
+   - Runtime cycles now run a protective stop audit once per trading day and
+     immediately whenever local state suggests an open position has no valid
+     stop distance or stop loss.
+   - The runtime stop audit runs before account/VIX/new-entry gates, so existing
+     positions can still be protected even when account summary or regime data
+     is temporarily unavailable.
+   - VIX ticker request exceptions now fall back to the historical VIX lookup
+     instead of bypassing the fallback path.
+
+   Validation after this pass:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -p no:cacheprovider -q
+   PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -B -c "import ast, pathlib; files=[p for root in ['src','backtest','tests'] for p in pathlib.Path(root).rglob('*.py')] + [pathlib.Path('run_backtest.py'), pathlib.Path('auto_trader.py'), pathlib.Path('dashboard_server.py')]; [ast.parse(p.read_text(), filename=str(p)) for p in files]; print(f'parsed {len(files)} python files')"
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 300 --yearly --vix-delay-bars 1
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 300 --vix-delay-bars 1
+   ```
+
+   Results:
+
+   - Tests: 337 passed.
+   - Syntax parse: 20 Python files parsed cleanly.
+   - Cached 282-symbol aggregate forward backtest, 2020-01-01 through
+     2026-05-22: 2,585 trades, +1,821.57% total return, 73.5% win rate,
+     6.16 profit factor, -4.14% max drawdown, 4.26 Sharpe, final equity
+     $38,431.37 from $2,000.
+   - Cached 282-symbol yearly delayed-VIX forward results:
+
+     ```text
+     2020 | 222 trades | +139.90% | Win 75.2% | PF  7.33 | MaxDD -4.14% | Sharpe 4.25
+     2021 | 362 trades | +175.49% | Win 69.3% | PF  5.10 | MaxDD -4.00% | Sharpe 5.11
+     2022 |  69 trades |  +10.95% | Win 66.7% | PF  3.65 | MaxDD -2.09% | Sharpe 1.46
+     2023 | 252 trades | +120.00% | Win 73.8% | PF  6.44 | MaxDD -4.08% | Sharpe 5.13
+     2024 | 317 trades | +131.79% | Win 69.4% | PF  3.91 | MaxDD -8.86% | Sharpe 4.30
+     2025 | 320 trades | +217.08% | Win 75.6% | PF  7.98 | MaxDD -3.34% | Sharpe 6.16
+     2026 | 103 trades | +125.10% | Win 79.6% | PF 22.92 | MaxDD -3.94% | Sharpe 7.63
+     ```
+
+   Cleanup after validation:
+
+   - Removed generated Python cache folders: `src/__pycache__`,
+     `tests/__pycache__`, `backtest/__pycache__`, project `__pycache__`, and
+     `.pytest_cache`.
+   - Left `backtest/.cache/` and `logs/` intact because they are validation and
+     runtime evidence, not obsolete code.

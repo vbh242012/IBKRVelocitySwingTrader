@@ -1,0 +1,28 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment
+.venv/
+venv/
+.env
+.env.*
+
+# Runtime state and broker/dashboard output
+logs/
+*.log
+engine_state.json
+engine_state.json.*
+dashboard_data.json
+equity_history.json
+HALT_TRADING
+FORCE_EXIT_ALL
+velocity_engine.lock
+
+# Backtest/download caches
+backtest/.cache/
+
+# Local assistant/tool scratch directories
+.agents/
+.codex/
