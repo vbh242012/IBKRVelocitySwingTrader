@@ -58,6 +58,7 @@ dmypy.json
 # Virtual environments and local env files
 .env
 .env.*
+!.env.*.example
 .envrc
 .venv/
 venv/

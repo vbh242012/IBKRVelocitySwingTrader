@@ -333,3 +333,76 @@
      `.pytest_cache`.
    - Left `backtest/.cache/` and `logs/` intact because they are validation and
      runtime evidence, not obsolete code.
+
+18. Paper trading soak / IBC launcher setup
+
+   Current active path remains:
+   `/home/harika/MyLearning/AI/IBKRVelocitySwingTrader`
+
+   The machine has IB Gateway installed at:
+   `/home/harika/Jts/ibgateway/1046/ibgateway`
+
+   IBC 3.23.0 was installed locally at:
+   `/home/harika/ibc`
+
+   The IBC startup/config files were adjusted for paper trading:
+
+   - `/home/harika/ibc/gatewaystart.sh`
+     - `TWS_MAJOR_VRSN=1046`
+     - `TRADING_MODE=paper`
+     - `TWOFA_TIMEOUT_ACTION=restart`
+     - `IBC_PATH=/home/harika/ibc`
+   - `/home/harika/ibc/config.ini`
+     - blanked sample demo credentials
+     - `TradingMode=paper`
+     - `AcceptNonBrokerageAccountWarning=yes`
+     - `ExistingSessionDetectedAction=primary`
+     - `OverrideTwsApiPort=4002`
+     - `ReadOnlyApi=no`
+     - `AutoRestartTime=17:00`
+     - `AcceptIncomingConnectionAction=accept`
+
+   The IBC folder was restricted to the local Linux user (`700`), and
+   `config.ini` was restricted to owner read/write (`600`). Add paper-account
+   credentials only in `/home/harika/ibc/config.ini` or an OS secret mechanism.
+   Do not put IBKR credentials in this repo.
+
+   Added local run helpers:
+
+   - `.env.paper.example`
+   - `.env.paper.local` (ignored by git, already created)
+   - `scripts/start_paper_trader.sh`
+   - `scripts/start_dashboard.sh`
+   - `scripts/check_paper_runtime.sh`
+
+   The intended paper configuration is:
+
+   ```text
+   VELOCITY_TRADING_MODE=paper
+   VELOCITY_IB_HOST=127.0.0.1
+   VELOCITY_IB_PORT=4002
+   VELOCITY_IB_CLIENT_ID=1
+   VELOCITY_MARKET_DATA_TYPE=1
+   VELOCITY_VIX_MARKET_DATA_TYPE=3
+   VELOCITY_IB_GATEWAY_AUTO_START=1
+   VELOCITY_IB_GATEWAY_START_CMD="/home/harika/ibc/gatewaystart.sh -inline"
+   VELOCITY_IB_GATEWAY_START_TIMEOUT_SEC=240
+   VELOCITY_IB_GATEWAY_START_POLL_SEC=2
+   VELOCITY_IB_GATEWAY_STOP_ON_EXIT=0
+   VELOCITY_IB_GATEWAY_LOG_FILE=logs/ib_gateway_launcher.log
+   ```
+
+   Run commands:
+
+   ```bash
+   cp .env.paper.example .env.paper.local
+   nohup ./scripts/start_paper_trader.sh > logs/autotrader_stdout.log 2> logs/autotrader_stderr.log &
+   nohup ./scripts/start_dashboard.sh > logs/dashboard_stdout.log 2> logs/dashboard_stderr.log &
+   ./scripts/check_paper_runtime.sh
+   ```
+
+   Operational warning: a 15-20 day unattended paper run is reasonable only
+   after the first few starts prove that IBC handles login, Gateway restart,
+   IBKR maintenance windows, market-data reconnection, and any two-factor prompt
+   behavior for this account. Until webhook alerts are configured and observed,
+   check the process/logs daily rather than waiting several days.
