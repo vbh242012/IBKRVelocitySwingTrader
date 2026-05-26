@@ -64,13 +64,6 @@ nohup ./scripts/start_dashboard.sh live > logs/live_dashboard_stdout.log 2> logs
 ./scripts/check_runtime.sh live
 ```
 
-Backward-compatible paper helpers still work:
-
-```bash
-./scripts/start_paper_trader.sh
-./scripts/check_paper_runtime.sh
-```
-
 Important: IBC can automate Gateway login dialogs, but IBKR may still require
 two-factor approval or manual recovery after maintenance, password changes,
 session conflicts, or account/security prompts. Do not assume a 15-20 day run is

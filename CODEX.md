@@ -368,13 +368,14 @@
    only in the profile-specific local IBC config files listed in section 19 or
    an OS secret mechanism. Do not put IBKR credentials in this repo.
 
-   Added local run helpers:
+   Added local run helpers. These were later simplified in section 20 so only
+   the profile-aware scripts remain active.
 
    - `.env.paper.example`
    - `.env.paper.local` (ignored by git, already created)
-   - `scripts/start_paper_trader.sh`
    - `scripts/start_dashboard.sh`
-   - `scripts/check_paper_runtime.sh`
+   - `scripts/start_trader.sh`
+   - `scripts/check_runtime.sh`
 
    The intended paper configuration is:
 
@@ -419,11 +420,8 @@
    - `.env.paper.local` (ignored by git)
    - `.env.live.local` (ignored by git; live ACK remains commented)
    - `scripts/start_trader.sh [paper|live]`
-   - `scripts/start_paper_trader.sh` wrapper
-   - `scripts/start_live_trader.sh` wrapper
    - `scripts/start_dashboard.sh [paper|live]`
    - `scripts/check_runtime.sh [paper|live]`
-   - `scripts/check_paper_runtime.sh` wrapper
 
    Runtime isolation:
 
@@ -468,3 +466,19 @@
    Do not uncomment the live ACK until paper trading has run cleanly and
    `/home/harika/ibc/config.live.ini` is confirmed to log into the live account
    on port `4001`.
+
+20. Operator script cleanup
+
+   Removed redundant compatibility wrappers for paper-only/live-only trader
+   startup and paper-only runtime checks.
+
+   Active operator scripts are now intentionally limited to:
+
+   - `scripts/start_trader.sh [paper|live]`
+   - `scripts/start_dashboard.sh [paper|live]`
+   - `scripts/check_runtime.sh [paper|live]`
+
+   The active shell scripts include comments explaining profile selection,
+   local env loading, runtime isolation, live-mode acknowledgement, and health
+   checks. This keeps the operating surface small and reduces the chance of
+   starting the wrong account mode.
