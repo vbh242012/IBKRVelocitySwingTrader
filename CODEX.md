@@ -345,7 +345,8 @@
    IBC 3.23.0 was installed locally at:
    `/home/harika/ibc`
 
-   The IBC startup/config files were adjusted for paper trading:
+   The initial IBC startup/config files were adjusted for paper trading, then
+   superseded by the profile-specific setup in section 19:
 
    - `/home/harika/ibc/gatewaystart.sh`
      - `TWS_MAJOR_VRSN=1046`
@@ -362,10 +363,10 @@
      - `AutoRestartTime=17:00`
      - `AcceptIncomingConnectionAction=accept`
 
-   The IBC folder was restricted to the local Linux user (`700`), and
-   `config.ini` was restricted to owner read/write (`600`). Add paper-account
-   credentials only in `/home/harika/ibc/config.ini` or an OS secret mechanism.
-   Do not put IBKR credentials in this repo.
+   The IBC folder was restricted to the local Linux user (`700`), and the IBC
+   config files were restricted to owner read/write (`600`). Add credentials
+   only in the profile-specific local IBC config files listed in section 19 or
+   an OS secret mechanism. Do not put IBKR credentials in this repo.
 
    Added local run helpers:
 
@@ -385,20 +386,20 @@
    VELOCITY_MARKET_DATA_TYPE=1
    VELOCITY_VIX_MARKET_DATA_TYPE=3
    VELOCITY_IB_GATEWAY_AUTO_START=1
-   VELOCITY_IB_GATEWAY_START_CMD="/home/harika/ibc/gatewaystart.sh -inline"
+   VELOCITY_BASE_DIR=/home/harika/MyLearning/AI/IBKRVelocitySwingTrader/runtime/paper
+   VELOCITY_IB_GATEWAY_START_CMD="/home/harika/ibc/start-paper-gateway.sh"
    VELOCITY_IB_GATEWAY_START_TIMEOUT_SEC=240
    VELOCITY_IB_GATEWAY_START_POLL_SEC=2
    VELOCITY_IB_GATEWAY_STOP_ON_EXIT=0
-   VELOCITY_IB_GATEWAY_LOG_FILE=logs/ib_gateway_launcher.log
+   VELOCITY_IB_GATEWAY_LOG_FILE=runtime/paper/logs/ib_gateway_launcher.log
    ```
 
    Run commands:
 
    ```bash
-   cp .env.paper.example .env.paper.local
-   nohup ./scripts/start_paper_trader.sh > logs/autotrader_stdout.log 2> logs/autotrader_stderr.log &
-   nohup ./scripts/start_dashboard.sh > logs/dashboard_stdout.log 2> logs/dashboard_stderr.log &
-   ./scripts/check_paper_runtime.sh
+   nohup ./scripts/start_trader.sh paper > logs/paper_autotrader_stdout.log 2> logs/paper_autotrader_stderr.log &
+   nohup ./scripts/start_dashboard.sh paper > logs/paper_dashboard_stdout.log 2> logs/paper_dashboard_stderr.log &
+   ./scripts/check_runtime.sh paper
    ```
 
    Operational warning: a 15-20 day unattended paper run is reasonable only
@@ -406,3 +407,64 @@
    IBKR maintenance windows, market-data reconnection, and any two-factor prompt
    behavior for this account. Until webhook alerts are configured and observed,
    check the process/logs daily rather than waiting several days.
+
+19. Paper/live profile switching
+
+   The app is now switchable by profile instead of source-code edits.
+
+   Repository-side files:
+
+   - `.env.paper.example`
+   - `.env.live.example`
+   - `.env.paper.local` (ignored by git)
+   - `.env.live.local` (ignored by git; live ACK remains commented)
+   - `scripts/start_trader.sh [paper|live]`
+   - `scripts/start_paper_trader.sh` wrapper
+   - `scripts/start_live_trader.sh` wrapper
+   - `scripts/start_dashboard.sh [paper|live]`
+   - `scripts/check_runtime.sh [paper|live]`
+   - `scripts/check_paper_runtime.sh` wrapper
+
+   Runtime isolation:
+
+   - paper: `runtime/paper`
+   - live: `runtime/live`
+
+   This prevents paper `engine_state.json`, `dashboard_data.json`,
+   `equity_history.json`, lock files, and logs from mixing with live mode.
+
+   IBC-side files:
+
+   - `/home/harika/ibc/config.paper.ini`
+   - `/home/harika/ibc/config.live.ini`
+   - `/home/harika/ibc/start-paper-gateway.sh`
+   - `/home/harika/ibc/start-live-gateway.sh`
+
+   IBC profile mapping:
+
+   ```text
+   paper app profile -> IB API port 4002 -> /home/harika/ibc/config.paper.ini
+   live app profile  -> IB API port 4001 -> /home/harika/ibc/config.live.ini
+   ```
+
+   Live trading is blocked by two gates:
+
+   - `.env.live.local` must set `VELOCITY_TRADING_MODE=live`.
+   - `.env.live.local` must explicitly set
+     `VELOCITY_LIVE_TRADING_ACK=I_UNDERSTAND_LIVE_RISK`.
+
+   Run commands:
+
+   ```bash
+   nohup ./scripts/start_trader.sh paper > logs/paper_autotrader_stdout.log 2> logs/paper_autotrader_stderr.log &
+   nohup ./scripts/start_dashboard.sh paper > logs/paper_dashboard_stdout.log 2> logs/paper_dashboard_stderr.log &
+   ./scripts/check_runtime.sh paper
+
+   nohup ./scripts/start_trader.sh live > logs/live_autotrader_stdout.log 2> logs/live_autotrader_stderr.log &
+   nohup ./scripts/start_dashboard.sh live > logs/live_dashboard_stdout.log 2> logs/live_dashboard_stderr.log &
+   ./scripts/check_runtime.sh live
+   ```
+
+   Do not uncomment the live ACK until paper trading has run cleanly and
+   `/home/harika/ibc/config.live.ini` is confirmed to log into the live account
+   on port `4001`.

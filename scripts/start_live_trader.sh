@@ -2,4 +2,4 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec "${PROJECT_DIR}/scripts/check_runtime.sh" paper
+exec "${PROJECT_DIR}/scripts/start_trader.sh" live

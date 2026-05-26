@@ -80,6 +80,7 @@ tempCodeRunnerFile.py
 
 # Local app/runtime state
 logs/
+runtime/
 *.log
 engine_state.json
 engine_state.json.*

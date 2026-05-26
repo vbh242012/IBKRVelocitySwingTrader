@@ -3,44 +3,73 @@ Automated Swing Trading For Small Cash Account With T+1 Settlement Days Using In
 
 ## Paper Trading Soak Run
 
-This project is configured to run against the IBKR paper gateway by default.
-Use IBC as the external login/startup supervisor and let the trading app connect
-only after the IB API socket is reachable.
+This project is profile-based:
+
+- `paper` uses IB Gateway paper port `4002` and runtime folder `runtime/paper`.
+- `live` uses IB Gateway live port `4001` and runtime folder `runtime/live`.
+
+The separate runtime folders keep paper state, live state, logs, lock files, and
+dashboard data isolated.
 
 1. Install and configure IB Gateway.
    The current machine already has IB Gateway at:
    `/home/harika/Jts/ibgateway/1046/ibgateway`
 
 2. IBC is installed locally at `/home/harika/ibc`.
-   Configure `/home/harika/ibc/config.ini` with your IBKR paper login.
+   Configure the local IBC profile files with your IBKR login:
+
+   - paper: `/home/harika/ibc/config.paper.ini`
+   - live: `/home/harika/ibc/config.live.ini`
+
    Keep broker username/password in IBC or an OS secret store, not in this
    repository.
 
-3. The local paper environment file has been created at `.env.paper.local`.
-   It points the app to `/home/harika/ibc/gatewaystart.sh -inline`.
-   To recreate it later, copy the template:
+3. Local environment files:
 
    ```bash
    cp .env.paper.example .env.paper.local
+   cp .env.live.example .env.live.local
    ```
 
-4. Start the paper trader in `nohup` mode:
+   `.env.paper.local` is ready for paper mode. `.env.live.local` is present but
+   live trading remains blocked until you deliberately set:
+
+   ```text
+   VELOCITY_LIVE_TRADING_ACK=I_UNDERSTAND_LIVE_RISK
+   ```
+
+4. Start paper trading in `nohup` mode:
 
    ```bash
-   nohup ./scripts/start_paper_trader.sh > logs/autotrader_stdout.log 2> logs/autotrader_stderr.log &
+   nohup ./scripts/start_trader.sh paper > logs/paper_autotrader_stdout.log 2> logs/paper_autotrader_stderr.log &
    ```
 
-5. Start the dashboard:
+5. Start the paper dashboard:
 
    ```bash
-   nohup ./scripts/start_dashboard.sh > logs/dashboard_stdout.log 2> logs/dashboard_stderr.log &
+   nohup ./scripts/start_dashboard.sh paper > logs/paper_dashboard_stdout.log 2> logs/paper_dashboard_stderr.log &
    ```
 
-6. Check status every few days:
+6. Check paper status:
 
    ```bash
-   ./scripts/check_paper_runtime.sh
+   ./scripts/check_runtime.sh paper
    ```
+
+Live commands, after paper validation and explicit acknowledgement:
+
+```bash
+nohup ./scripts/start_trader.sh live > logs/live_autotrader_stdout.log 2> logs/live_autotrader_stderr.log &
+nohup ./scripts/start_dashboard.sh live > logs/live_dashboard_stdout.log 2> logs/live_dashboard_stderr.log &
+./scripts/check_runtime.sh live
+```
+
+Backward-compatible paper helpers still work:
+
+```bash
+./scripts/start_paper_trader.sh
+./scripts/check_paper_runtime.sh
+```
 
 Important: IBC can automate Gateway login dialogs, but IBKR may still require
 two-factor approval or manual recovery after maintenance, password changes,
