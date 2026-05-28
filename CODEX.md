@@ -540,3 +540,60 @@
 
    - Focused startup/audit tests: 70 passed.
    - Full suite: 344 passed.
+
+22. Pre-10 ET protective TRAIL activation gate, 2026-05-28
+
+   Requirement: protective TRAIL sell orders must not activate before the 10:00
+   ET entry gate. This is deliberate for this personal swing-trading workflow,
+   even though it means positions are not stop-protected during the 09:30-10:00
+   ET opening volatility window.
+
+   Implementation details to preserve:
+
+   - New pre-10 ET audit-created TRAIL orders set
+     `goodAfterTime=YYYYMMDD 10:00:00 US/Eastern`.
+   - New entry bracket parent BUY and child TRAIL orders share the same
+     `goodAfterTime` value when submitted before 10:00 ET; after 10:00 ET the
+     field is omitted because IBKR rejects past activation timestamps.
+   - Existing GTC TRAIL orders recovered from IBKR are checked during stop
+     audit. If they lack the current day's 10:00 ET `goodAfterTime`, the engine
+     cancels and replaces them with equivalent TRAIL orders carrying the gate.
+   - The engine must use the same IB API `clientId` that owns the existing
+     orders. Orders from a different `clientId` are visible through
+     `reqAllOpenOrders()` but may not be cancellable/modifiable. In that case
+     the engine alerts and does not attempt blind control.
+
+   Live finding:
+
+   - Existing SBUX/OXY/CSCO protective stops were owned by IB API `clientId=1`,
+     while `.env.live.local` had been set to `VELOCITY_IB_CLIENT_ID=11`.
+   - This mismatch caused earlier modification/cancel attempts to fail with
+     duplicate/not-found behavior while `reqAllOpenOrders()` still displayed
+     the orders.
+   - `.env.live.local` and `.env.live.example` were aligned to
+     `VELOCITY_IB_CLIENT_ID=1`.
+
+   Live order result after applying the fix:
+
+   ```text
+   SBUX | order 7256 | clientId 1 | qty 4  | goodAfterTime 20260528 10:00:00 US/Eastern | stop 98.92  | trail 4.807%
+   OXY  | order 7257 | clientId 1 | qty 10 | goodAfterTime 20260528 10:00:00 US/Eastern | stop 55.22  | trail 6.5614%
+   CSCO | order 7258 | clientId 1 | qty 4  | goodAfterTime 20260528 10:00:00 US/Eastern | stop 114.05 | trail 5.5749%
+   ```
+
+   Live autotrader was restarted with `clientId=1` and reached the normal
+   pre-entry wait state.
+
+   Validation after the change:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest tests/test_startup_init.py -q -p no:cacheprovider
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -q -p no:cacheprovider
+   .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/config.py src/ib_gateway.py
+   ```
+
+   Results:
+
+   - Focused startup/audit tests: 72 passed.
+   - Full suite: 346 passed.
+   - `py_compile`: passed.

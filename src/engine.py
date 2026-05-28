@@ -838,6 +838,132 @@ class VelocityEngine:
             f"{ENTRY_START[0]:02d}:{ENTRY_START[1]:02d}:00 US/Eastern"
         )
 
+    def _make_trail_replacement_order(self, source_order, qty: float, gate_str: str) -> Optional[Order]:
+        """Build an equivalent TRAIL SELL order, optionally delayed to the entry gate."""
+        replacement = Order()
+        replacement.action        = 'SELL'
+        replacement.orderType     = 'TRAIL'
+        replacement.totalQuantity = qty
+        replacement.tif           = 'GTC'
+        replacement.goodAfterTime = gate_str
+        replacement.transmit      = True
+
+        aux_dist = self._coerce_order_number(getattr(source_order, 'auxPrice', None))
+        trail_stop = self._coerce_order_number(getattr(source_order, 'trailStopPrice', None))
+        trail_pct = self._coerce_order_number(getattr(source_order, 'trailingPercent', None))
+        if aux_dist is not None:
+            replacement.auxPrice = aux_dist
+            return replacement
+        if trail_stop is not None and trail_pct is not None:
+            replacement.trailStopPrice = trail_stop
+            replacement.trailingPercent = trail_pct
+            return replacement
+        return None
+
+    def _replace_trail_with_entry_activation_gate(self, trade, sym: str, qty: float, gate_str: str) -> Tuple[object, bool]:
+        """Replace an existing TRAIL order so it cannot activate before 10:00 ET.
+
+        New pre-market/audit TRAIL orders already set goodAfterTime. Existing
+        GTC orders recovered from IBKR may not have it. Orders obtained through
+        reqAllOpenOrders() are not always modifiable in place by a fresh API
+        session, so use cancel-and-replace before the regular session opens.
+        """
+        if not gate_str:
+            return trade, True
+        order = trade.order
+        current_gat = str(getattr(order, 'goodAfterTime', '') or '').strip()
+        if current_gat == gate_str:
+            return trade, True
+
+        try:
+            order_client_id = int(getattr(order, 'clientId', IB_CLIENT_ID) or IB_CLIENT_ID)
+        except (TypeError, ValueError):
+            order_client_id = IB_CLIENT_ID
+        if order_client_id != IB_CLIENT_ID:
+            self._alert(
+                "CRITICAL",
+                f"AUDIT: {sym} — existing TRAIL order belongs to IB clientId={order_client_id}, "
+                f"but this engine is clientId={IB_CLIENT_ID}; configure the engine with the "
+                "same clientId before it can modify/cancel that protective order.",
+            )
+            return trade, False
+
+        replacement = self._make_trail_replacement_order(order, qty, gate_str)
+        if replacement is None:
+            self._alert(
+                "CRITICAL",
+                f"AUDIT: {sym} — existing TRAIL stop lacks a usable trail amount; "
+                "cannot rebuild it with the 10:00 ET activation gate.",
+            )
+            return trade, False
+
+        logger.warning(
+            f"AUDIT: {sym} — existing TRAIL SELL lacks 10:00 ET activation gate; "
+            f"cancelling and replacing with goodAfterTime={gate_str}"
+        )
+        try:
+            self.ib.cancelOrder(order)
+            self.ib.sleep(2)
+        except Exception as e:
+            self._alert(
+                "CRITICAL",
+                f"AUDIT: {sym} — failed to cancel pre-10 TRAIL stop before replacement: {e}. "
+                "Existing broker order may activate before 10:00 ET.",
+            )
+            return trade, False
+
+        try:
+            replacement_trade = self.ib.placeOrder(trade.contract, replacement)
+            self.ib.sleep(2)
+            status = getattr(replacement_trade.orderStatus, 'status', '')
+            if status in _REJECTED_ORDER_STATUSES:
+                self._alert(
+                    "CRITICAL",
+                    f"AUDIT: {sym} — replacement TRAIL stop with 10:00 ET gate rejected "
+                    f"(status={status}); attempting to restore original protection.",
+                )
+                restored = self._restore_trail_without_entry_gate(trade, sym, qty)
+                return restored, False
+            logger.info(
+                f"AUDIT: {sym} — TRAIL SELL replaced with 10:00 ET activation gate "
+                f"(new_id={replacement_trade.order.orderId})"
+            )
+            return replacement_trade, True
+        except Exception as e:
+            self._alert(
+                "CRITICAL",
+                f"AUDIT: {sym} — failed to place replacement TRAIL stop with 10:00 ET gate: {e}; "
+                "attempting to restore original protection.",
+            )
+            restored = self._restore_trail_without_entry_gate(trade, sym, qty)
+            return restored, False
+
+    def _restore_trail_without_entry_gate(self, trade, sym: str, qty: float):
+        """Best-effort restoration if a gated replacement fails after cancellation."""
+        restore = self._make_trail_replacement_order(trade.order, qty, '')
+        if restore is None:
+            self._alert("CRITICAL", f"AUDIT: {sym} — cannot restore original TRAIL stop; position may be unprotected.")
+            return trade
+        try:
+            restored_trade = self.ib.placeOrder(trade.contract, restore)
+            self.ib.sleep(2)
+            status = getattr(restored_trade.orderStatus, 'status', '')
+            if status in _REJECTED_ORDER_STATUSES:
+                self._alert(
+                    "CRITICAL",
+                    f"AUDIT: {sym} — original TRAIL stop restore rejected (status={status}); "
+                    "position may be unprotected.",
+                )
+                return trade
+            logger.warning(
+                f"AUDIT: {sym} — restored original TRAIL protection without 10:00 ET gate "
+                f"(id={restored_trade.order.orderId})"
+            )
+            return restored_trade
+        except Exception as e:
+            self._alert("CRITICAL", f"AUDIT: {sym} — original TRAIL stop restore failed: {e}; position may be unprotected.")
+            return trade
+
     def _preflight_order(
         self,
         contract,
@@ -896,11 +1022,11 @@ class VelocityEngine:
            and place a new chandelier TRAIL SELL (GTC, transmit=True).
 
         The entry trading window (10:00–15:30 ET) applies only to new BUY entries.
-        Stop orders for existing positions are placed immediately regardless of time —
-        including pre-market startup — because GTC orders are accepted by IBKR 24/7
-        and become active at the next market open.  After placeOrder() we wait 2 s and
-        verify the order status so any unexpected rejection is caught and logged; state
-        is only updated once IB confirms the order is live (PreSubmitted / Submitted).
+        Stop orders for existing positions are placed immediately regardless of time,
+        but when the audit runs before the 10:00 ET entry gate their activation is
+        delayed with goodAfterTime. After placeOrder() we wait 2 s and verify the
+        order status so any unexpected rejection is caught and logged; state is only
+        updated once IB confirms the order is live (PreSubmitted / Submitted).
         """
         if not self.state:
             return
@@ -915,7 +1041,7 @@ class VelocityEngine:
         if not in_market:
             logger.info(
                 "AUDIT: market is currently closed — TRAIL stops will be submitted "
-                "as GTC orders and will activate at the next regular-hours open."
+                "as GTC orders and delayed until the 10:00 ET entry gate when applicable."
             )
 
         open_trades = self._open_trades_for_audit()
@@ -1005,6 +1131,12 @@ class VelocityEngine:
             if trail_orders:
                 primary_trail = trail_orders[0]
                 meta = trail_meta.get(id(primary_trail), {})
+                primary_trail, gate_ok = self._replace_trail_with_entry_activation_gate(
+                    primary_trail,
+                    sym,
+                    qty,
+                    self._entry_good_after_time(),
+                )
                 stop_dist = float(meta.get('stop_dist') or 0.0)
                 stop_loss = float(meta.get('stop_loss') or 0.0)
                 if stop_dist > 0:
@@ -1024,7 +1156,8 @@ class VelocityEngine:
                 logger.info(
                     f"AUDIT: {sym} — TRAIL SELL confirmed "
                     f"(id={primary_trail.order.orderId} "
-                    f"{meta.get('desc', 'protection fields unavailable')})"
+                    f"{meta.get('desc', 'protection fields unavailable')} "
+                    f"entry_gate={'ok' if gate_ok else 'failed'})"
                 )
                 continue
 
