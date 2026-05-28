@@ -692,9 +692,18 @@
    Operational note:
 
    - In this execution environment, plain `nohup ./scripts/start_trader.sh live
-     ... &` returned but did not keep the trader process alive. `setsid -f
-     ./scripts/start_trader.sh live > logs/live_autotrader_stdout.log 2>
-     logs/live_autotrader_stderr.log < /dev/null` did keep it alive.
+     ... &` returned but did not keep the trader process alive reliably.
+     `setsid -f ./scripts/start_trader.sh live >
+     logs/live_autotrader_stdout.log 2> logs/live_autotrader_stderr.log <
+     /dev/null` did keep it alive.
+   - `scripts/start_trader.sh` now includes a lightweight supervisor loop when
+     `VELOCITY_TRADER_AUTO_RESTART=1` (default). It restarts `auto_trader.py`
+     after unexpected process exit and can be disabled by creating
+     `${VELOCITY_BASE_DIR}/DISABLE_AUTO_RESTART`.
+   - Live supervisor validation: killed child PID 1999277; parent
+     `start_trader.sh live` stayed alive, logged exit status 143, waited 30
+     seconds, and restarted child PID 2000214. The restarted child reconnected
+     to IBKR and re-confirmed RIOT protective TRAIL order 7546.
    - IB Gateway was already running, so app-side `ensure_ib_gateway_ready()`
      returned `True` without launching IBC. The live IBC launcher file exists
      and is executable, but a full auto-login test would require deliberately
@@ -712,5 +721,6 @@
    Results:
 
    - Focused preflight/liquidation tests: 23 passed.
-   - Full suite: 348 passed.
+   - Full suite: 348 passed after Python fixes and again after supervisor
+     script changes.
    - `py_compile`: passed.

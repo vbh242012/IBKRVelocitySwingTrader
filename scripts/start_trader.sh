@@ -64,6 +64,61 @@ export VELOCITY_BASE_DIR="${VELOCITY_BASE_DIR:-${PROJECT_DIR}/runtime/${PROFILE}
 cd "${PROJECT_DIR}"
 mkdir -p logs "${VELOCITY_BASE_DIR}/logs"
 
-# Replace the shell with Python so process managers and nohup see the real
-# trading process PID.
-exec .venv/bin/python auto_trader.py
+# Optional process supervision.  The Python engine already handles IB API
+# reconnects and can auto-start IBC/Gateway when the API port is down.  This
+# shell loop covers the different failure class: the Python process itself exits
+# because of an unhandled runtime/environment failure.  Keep it enabled for
+# unattended paper/live runs; disable only when debugging in the foreground.
+AUTO_RESTART="${VELOCITY_TRADER_AUTO_RESTART:-1}"
+RESTART_DELAY_SEC="${VELOCITY_TRADER_RESTART_DELAY_SEC:-30}"
+DISABLE_RESTART_FILE="${VELOCITY_BASE_DIR}/DISABLE_AUTO_RESTART"
+
+case "${AUTO_RESTART}" in
+  1|true|TRUE|yes|YES|on|ON) AUTO_RESTART=1 ;;
+  *) AUTO_RESTART=0 ;;
+esac
+
+if [[ "${AUTO_RESTART}" == "0" ]]; then
+  # Debug mode: replace the shell with Python so the terminal/process manager
+  # observes the real trading process directly.
+  exec .venv/bin/python auto_trader.py
+fi
+
+child_pid=""
+
+stop_child() {
+  # Graceful shutdown path.  If the supervisor receives SIGTERM/SIGINT, forward
+  # it to the engine and wait so auto_trader.py can release its instance lock.
+  if [[ -n "${child_pid}" ]] && kill -0 "${child_pid}" 2>/dev/null; then
+    kill "${child_pid}" 2>/dev/null || true
+    wait "${child_pid}" 2>/dev/null || true
+  fi
+  exit 0
+}
+
+trap stop_child INT TERM
+
+while true; do
+  if [[ -f "${DISABLE_RESTART_FILE}" ]]; then
+    echo "$(date -Is) auto-restart disabled by ${DISABLE_RESTART_FILE}; exiting." >&2
+    exit 0
+  fi
+
+  .venv/bin/python auto_trader.py &
+  child_pid="$!"
+  # `wait` returns the child's exit status.  With `set -e`, a non-zero child
+  # status would otherwise terminate this supervisor before it can restart.
+  set +e
+  wait "${child_pid}"
+  status="$?"
+  set -e
+  child_pid=""
+
+  if [[ -f "${DISABLE_RESTART_FILE}" ]]; then
+    echo "$(date -Is) trader exited with status ${status}; restart disabled." >&2
+    exit "${status}"
+  fi
+
+  echo "$(date -Is) trader exited with status ${status}; restarting in ${RESTART_DELAY_SEC}s." >&2
+  sleep "${RESTART_DELAY_SEC}"
+done
