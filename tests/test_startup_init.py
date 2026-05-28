@@ -352,6 +352,7 @@ class TestInitialize:
         ib.positions.return_value = []
         engine = _make_engine(ib, state={'AAPL': {
             'price': 150.0, 'qty': 10, 'stop_loss': 140.0,
+            'stop_dist': 10.0,
             'volume': 5000000, 'score': 70.0, 'time': '2026-01-01T10:00:00',
         }})
         with patch.object(engine, '_sync_positions_from_ibkr'),    \
@@ -367,6 +368,7 @@ class TestInitialize:
         ib.positions.return_value = []
         engine = _make_engine(ib, state={'AAPL': {
             'price': 150.0, 'qty': 10, 'stop_loss': 140.0,
+            'stop_dist': 10.0,
             'volume': 5000000, 'score': 70.0, 'time': '2026-01-01T10:00:00',
         }})
         with patch.object(engine, '_sync_positions_from_ibkr'),       \
@@ -375,6 +377,23 @@ class TestInitialize:
              patch.object(engine, '_write_dashboard_data'):
             engine._initialize()
         mock_audit.assert_called_once()
+
+    def test_immediate_audit_when_unprotected_positions_exist(self):
+        ib = MagicMock()
+        ib.accountSummary.return_value = [_nl_item('5000.0')]
+        ib.positions.return_value = []
+        engine = _make_engine(ib, state={'AAPL': {
+            'price': 150.0, 'qty': 10, 'stop_loss': 0.0,
+            'volume': 5000000, 'score': 70.0, 'time': '2026-01-01T10:00:00',
+        }})
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit,       \
+             patch.object(engine, '_update_position_prices'),                \
+             patch.object(engine, '_write_dashboard_data'):
+            engine._initialize()
+
+        assert mock_sync.call_count == 3
+        assert mock_audit.call_count == 2
 
     def test_skips_audit_when_no_positions(self):
         ib = MagicMock()
@@ -511,6 +530,17 @@ class TestUnrealizedPnl:
 
         assert engine.state['TSLA']['effective_stop'] == pytest.approx(100.0)
 
+    def test_percent_trail_keeps_broker_stop_as_effective_stop(self):
+        engine = self._engine_with_pos(entry=100.0, qty=10, cur_price=110.0)
+        engine.state['TSLA']['stop_mode'] = 'percent'
+        engine.state['TSLA']['stop_loss'] = 94.0
+        engine.state['TSLA']['stop_dist'] = 5.0
+
+        engine._update_position_prices()
+
+        assert engine.state['TSLA']['peak_price'] == pytest.approx(110.0)
+        assert engine.state['TSLA']['effective_stop'] == pytest.approx(94.0)
+
     def test_pnl_rounded_to_two_decimals(self):
         engine = self._engine_with_pos(entry=33.33, qty=3, cur_price=34.00)
         engine._update_position_prices()
@@ -534,6 +564,23 @@ class TestUnrealizedPnl:
         engine = _make_engine(ib, state=state)
         engine._update_position_prices()
         assert 'unrealized_pnl' not in engine.state['MSFT']
+
+    def test_missing_once_position_skips_market_data_refresh(self):
+        ib = MagicMock()
+        state = {'DELL': {
+            'price': 295.29, 'qty': 2,
+            'stop_loss': 0.0,
+            'volume': 0, 'score': None,
+            'time': '2026-05-26T03:51:33-04:00',
+        }}
+        engine = _make_engine(ib, state=state)
+        engine._missing_position_counts = {'DELL': 1}
+
+        engine._update_position_prices()
+
+        ib.reqTickers.assert_not_called()
+        ib.reqHistoricalData.assert_not_called()
+        assert 'current_price' not in engine.state['DELL']
 
 
 # ── _log_startup_summary ───────────────────────────────────────────────────────
@@ -576,7 +623,10 @@ class TestLogStartupSummary:
 
 # ── _audit_stop_orders ────────────────────────────────────────────────────────
 
-def _make_trade(symbol, action, order_type, order_id=1, aux_price=6.0, total_quantity=10):
+def _make_trade(
+    symbol, action, order_type, order_id=1, aux_price=6.0, total_quantity=10,
+    trail_stop_price=None, trailing_percent=None,
+):
     """Return a minimal Trade mock with .contract, .order attributes."""
     t               = MagicMock()
     t.contract      = MagicMock()
@@ -587,6 +637,12 @@ def _make_trade(symbol, action, order_type, order_id=1, aux_price=6.0, total_qua
     t.order.orderId = order_id
     t.order.auxPrice = aux_price
     t.order.totalQuantity = total_quantity
+    t.order.trailStopPrice = (
+        eng_mod.util.UNSET_DOUBLE if trail_stop_price is None else trail_stop_price
+    )
+    t.order.trailingPercent = (
+        eng_mod.util.UNSET_DOUBLE if trailing_percent is None else trailing_percent
+    )
     return t
 
 
@@ -603,6 +659,63 @@ class TestAuditStopOrders:
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
         engine._audit_stop_orders()
         ib.cancelOrder.assert_not_called()
+        ib.placeOrder.assert_not_called()
+
+    def test_accepts_ib_percent_trail_when_aux_is_unset(self):
+        """IBKR can return percent TRAIL orders with auxPrice left as UNSET_DOUBLE."""
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_trade(
+                'AAPL', 'SELL', 'TRAIL',
+                aux_price=eng_mod.util.UNSET_DOUBLE,
+                trail_stop_price=95.0,
+                trailing_percent=5.0,
+            )
+        ]
+        state = {'AAPL': dict(self._POS)}
+        state['AAPL'].pop('stop_dist', None)
+        state['AAPL']['stop_loss'] = 0.0
+        engine = _make_engine(ib, state=state)
+
+        engine._audit_stop_orders()
+
+        ib.cancelOrder.assert_not_called()
+        ib.placeOrder.assert_not_called()
+        assert engine.state['AAPL']['stop_loss'] == pytest.approx(95.0)
+        assert engine.state['AAPL']['effective_stop'] == pytest.approx(95.0)
+        assert engine.state['AAPL']['stop_dist'] == pytest.approx(5.0)
+        assert engine.state['AAPL']['stop_mode'] == 'percent'
+        assert engine.state['AAPL']['trailing_percent'] == pytest.approx(5.0)
+
+    def test_audit_uses_all_open_orders_feed_before_rebuilding_stop(self):
+        """Existing GTC stops may be visible through reqAllOpenOrders before openTrades."""
+        ib = MagicMock()
+        ib.reqAllOpenOrders.return_value = [
+            _make_trade(
+                'AAPL', 'SELL', 'TRAIL',
+                aux_price=eng_mod.util.UNSET_DOUBLE,
+                trail_stop_price=95.0,
+                trailing_percent=5.0,
+            )
+        ]
+        ib.openTrades.return_value = []
+        engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
+
+        engine._audit_stop_orders()
+
+        ib.reqAllOpenOrders.assert_called_once()
+        ib.cancelOrder.assert_not_called()
+        ib.placeOrder.assert_not_called()
+
+    def test_missing_once_position_is_not_audited(self):
+        """Avoid placing orphan protection when IBKR has not confirmed the position."""
+        ib, _ = self._make_ib_with_history()
+        engine = _make_engine(ib, state={'DELL': dict(self._POS)})
+        engine._missing_position_counts = {'DELL': 1}
+
+        engine._audit_stop_orders()
+
+        ib.reqHistoricalData.assert_not_called()
         ib.placeOrder.assert_not_called()
 
     def test_cancels_non_trail_sell_order(self):
@@ -777,6 +890,28 @@ class TestAuditStopOrders:
         ib, _ = self._make_ib_with_history()
         bad_trail = _make_trade(
             'AAPL', 'SELL', 'TRAIL', order_id=8, aux_price=0.0,
+            total_quantity=self._POS['qty'],
+        )
+        ib.openTrades.return_value = [bad_trail]
+
+        placed_orders = []
+        stop_trade = MagicMock()
+        stop_trade.orderStatus.status = 'PreSubmitted'
+        ib.placeOrder.side_effect = lambda c, o: (placed_orders.append(o), stop_trade)[1]
+
+        engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
+        engine._audit_stop_orders()
+
+        ib.cancelOrder.assert_called_once_with(bad_trail.order)
+        assert len(placed_orders) == 1
+        assert placed_orders[0].auxPrice > 0
+
+    def test_cancels_and_rebuilds_trail_when_ib_unset_fields_have_no_stop(self):
+        """UNSET_DOUBLE without trailStopPrice/trailingPercent is not protection."""
+        ib, _ = self._make_ib_with_history()
+        bad_trail = _make_trade(
+            'AAPL', 'SELL', 'TRAIL', order_id=9,
+            aux_price=eng_mod.util.UNSET_DOUBLE,
             total_quantity=self._POS['qty'],
         )
         ib.openTrades.return_value = [bad_trail]

@@ -382,6 +382,54 @@ class VelocityEngine:
         return None
 
     @staticmethod
+    def _coerce_order_number(value) -> Optional[float]:
+        """Return a usable broker order number, ignoring IB's UNSET_DOUBLE sentinel."""
+        number = VelocityEngine._coerce_positive_price(value)
+        if number is None:
+            return None
+        if number >= util.UNSET_DOUBLE * 0.5:
+            return None
+        return number
+
+    @staticmethod
+    def _trail_order_protection(order, pos_data: dict) -> Tuple[bool, str, float, float]:
+        """Interpret IB TRAIL SELL fields as (valid, display, stop_dist, stop_loss).
+
+        IB can return a TRAIL order either as a dollar trail in auxPrice or as a
+        percent trail with auxPrice left at UNSET_DOUBLE. Treating that sentinel
+        as a dollar amount makes the dashboard/audit logic think the stop is
+        absurdly wide even when the real trailStopPrice/trailingPercent is valid.
+        """
+        ref_price = (
+            VelocityEngine._coerce_positive_price(pos_data.get('current_price'))
+            or VelocityEngine._coerce_positive_price(pos_data.get('peak_price'))
+            or VelocityEngine._coerce_positive_price(pos_data.get('price'))
+            or VelocityEngine._coerce_positive_price(pos_data.get('entry_price'))
+        )
+        aux_dist = VelocityEngine._coerce_order_number(getattr(order, 'auxPrice', None))
+        trail_stop = VelocityEngine._coerce_order_number(getattr(order, 'trailStopPrice', None))
+        trail_pct = VelocityEngine._coerce_order_number(getattr(order, 'trailingPercent', None))
+
+        if aux_dist is not None:
+            if ref_price is not None and aux_dist >= ref_price:
+                return False, f"dollar trail ${aux_dist:.2f} >= reference price ${ref_price:.2f}", 0.0, 0.0
+            stop_loss = trail_stop or (ref_price - aux_dist if ref_price is not None else 0.0)
+            return True, f"dist=${aux_dist:.2f}", aux_dist, max(stop_loss, 0.0)
+
+        if trail_pct is not None and trail_stop is not None:
+            if trail_pct >= 99.0:
+                return False, f"trailing percent {trail_pct:.4g}% is unusable", 0.0, 0.0
+            if ref_price is not None:
+                if trail_stop >= ref_price:
+                    return False, f"trail stop ${trail_stop:.2f} >= reference price ${ref_price:.2f}", 0.0, 0.0
+                stop_dist = ref_price - trail_stop
+            else:
+                stop_dist = trail_stop * (trail_pct / max(100.0 - trail_pct, 1e-9))
+            return True, f"stop=${trail_stop:.2f} trail={trail_pct:.4g}%", stop_dist, trail_stop
+
+        return False, "missing dollar trail or percent trail fields", 0.0, 0.0
+
+    @staticmethod
     def _round_up_to_cent(value: float) -> float:
         """Round up to the nearest US equity penny tick."""
         return round(float(np.ceil(float(value) * 100.0 - 1e-9) / 100.0), 2)
@@ -722,6 +770,17 @@ class VelocityEngine:
             self._update_position_prices()
         self._write_dashboard_data(connected=True)
 
+        if self._position_needs_stop_audit():
+            logger.warning(
+                "INIT: Unprotected position state detected before pre-entry sync; "
+                "running immediate confirmation sync and stop audit."
+            )
+            self._sync_positions_from_ibkr()
+            if self.state:
+                self._audit_stop_orders()
+                self._update_position_prices()
+                self._write_dashboard_data(connected=True)
+
         # ── Phase 2: pre-entry definitive sync + stop audit ──────────────────
         self._wait_for_pre_entry_sync()
 
@@ -859,7 +918,7 @@ class VelocityEngine:
                 "as GTC orders and will activate at the next regular-hours open."
             )
 
-        open_trades = self.ib.openTrades()
+        open_trades = self._open_trades_for_audit()
 
         sell_by_sym: Dict[str, list] = {}
         for t in open_trades:
@@ -867,6 +926,13 @@ class VelocityEngine:
                 sell_by_sym.setdefault(t.contract.symbol, []).append(t)
 
         for sym, pos_data in list(self.state.items()):
+            if getattr(self, '_missing_position_counts', {}).get(sym, 0) > 0:
+                logger.warning(
+                    f"AUDIT: {sym} skipped — IBKR position was missing in the latest "
+                    "snapshot; avoiding orphan protective order until confirmed."
+                )
+                continue
+
             qty = float(pos_data.get('qty', 0))
             if qty <= 0:
                 logger.warning(f"AUDIT: {sym} — qty={qty}, cannot place stop")
@@ -880,19 +946,26 @@ class VelocityEngine:
             ]
             non_trail    = [t for t in sell_orders if t.order.orderType != 'TRAIL']
             trail_orders = []
+            trail_meta = {}
             mismatched_trail = []
             for t in raw_trail_orders:
                 try:
                     order_qty = float(getattr(t.order, 'totalQuantity', 0) or 0)
                 except (TypeError, ValueError):
                     order_qty = 0.0
-                try:
-                    trail_dist = float(getattr(t.order, 'auxPrice', 0) or 0)
-                except (TypeError, ValueError):
-                    trail_dist = 0.0
-                if abs(order_qty - qty) <= 1e-6 and trail_dist > 0:
+                trail_ok, trail_desc, trail_dist, trail_stop = self._trail_order_protection(t.order, pos_data)
+                if abs(order_qty - qty) <= 1e-6 and trail_ok:
+                    aux_dist = self._coerce_order_number(getattr(t.order, 'auxPrice', None))
+                    trail_pct = self._coerce_order_number(getattr(t.order, 'trailingPercent', None))
+                    trail_meta[id(t)] = {
+                        'desc': trail_desc,
+                        'stop_dist': trail_dist,
+                        'stop_loss': trail_stop,
+                        'trail_pct': trail_pct if aux_dist is None else None,
+                    }
                     trail_orders.append(t)
                 else:
+                    trail_meta[id(t)] = {'desc': trail_desc}
                     mismatched_trail.append(t)
 
             for t in non_trail:
@@ -908,7 +981,7 @@ class VelocityEngine:
                 logger.warning(
                     f"AUDIT: {sym} — TRAIL SELL invalid "
                     f"(order_qty={getattr(t.order, 'totalQuantity', None)} "
-                    f"state_qty={qty:g}, aux={getattr(t.order, 'auxPrice', None)}); "
+                    f"state_qty={qty:g}, {trail_meta.get(id(t), {}).get('desc', 'unknown reason')}); "
                     f"cancelling and rebuilding"
                 )
                 try:
@@ -930,10 +1003,28 @@ class VelocityEngine:
                         logger.warning(f"AUDIT: {sym} — duplicate cancel failed: {e}")
 
             if trail_orders:
+                primary_trail = trail_orders[0]
+                meta = trail_meta.get(id(primary_trail), {})
+                stop_dist = float(meta.get('stop_dist') or 0.0)
+                stop_loss = float(meta.get('stop_loss') or 0.0)
+                if stop_dist > 0:
+                    self.state[sym]['stop_dist'] = round(stop_dist, 2)
+                if stop_loss > 0:
+                    self.state[sym]['stop_loss'] = round(stop_loss, 2)
+                    self.state[sym]['effective_stop'] = round(stop_loss, 2)
+                trail_pct = meta.get('trail_pct')
+                if trail_pct:
+                    self.state[sym]['stop_mode'] = 'percent'
+                    self.state[sym]['trailing_percent'] = round(float(trail_pct), 4)
+                else:
+                    self.state[sym]['stop_mode'] = 'dollar'
+                    self.state[sym].pop('trailing_percent', None)
+                if stop_dist > 0 or stop_loss > 0:
+                    self.save_state()
                 logger.info(
                     f"AUDIT: {sym} — TRAIL SELL confirmed "
-                    f"(id={trail_orders[0].order.orderId} "
-                    f"dist=${trail_orders[0].order.auxPrice:.2f})"
+                    f"(id={primary_trail.order.orderId} "
+                    f"{meta.get('desc', 'protection fields unavailable')})"
                 )
                 continue
 
@@ -1016,6 +1107,46 @@ class VelocityEngine:
                 )
             except Exception as e:
                 self._alert("CRITICAL", f"AUDIT: {sym} — failed to place TRAIL stop: {e}")
+
+    def _open_trades_for_audit(self) -> list:
+        """Return all visible open trades before deciding protection is missing.
+
+        ib.openTrades() can be empty for still-live GTC orders until the API
+        client has requested the broker's all-open-orders feed. A stop audit
+        must never conclude "no stop exists" from a partial local cache.
+        """
+        trades = []
+        seen = set()
+        try:
+            all_open = self.ib.reqAllOpenOrders()
+            if isinstance(all_open, list):
+                trades.extend(all_open)
+            self.ib.sleep(1)
+        except Exception as e:
+            logger.warning(f"AUDIT: reqAllOpenOrders failed; falling back to openTrades cache ({e})")
+
+        try:
+            cached = self.ib.openTrades()
+            if isinstance(cached, list):
+                trades.extend(cached)
+        except Exception as e:
+            logger.warning(f"AUDIT: openTrades cache unavailable ({e})")
+
+        unique = []
+        for trade in trades:
+            order = getattr(trade, 'order', None)
+            contract = getattr(trade, 'contract', None)
+            key = (
+                getattr(order, 'permId', None),
+                getattr(order, 'orderId', None),
+                getattr(contract, 'conId', None),
+                getattr(contract, 'symbol', None),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(trade)
+        return unique
 
     def _position_needs_stop_audit(self) -> bool:
         """True when local state suggests a position may lack protection."""
@@ -1745,6 +1876,12 @@ class VelocityEngine:
             return
         changed = False
         for sym in list(self.state.keys()):
+            if getattr(self, '_missing_position_counts', {}).get(sym, 0) > 0:
+                logger.info(
+                    f"PRICE: {sym} skipped — IBKR position was missing in the latest "
+                    "snapshot; waiting for confirmation before refreshing market data."
+                )
+                continue
             try:
                 contract = self._stock_contract(sym)
                 price = self._fresh_market_price(sym)
@@ -1763,10 +1900,17 @@ class VelocityEngine:
                         peak = max(float(self.state[sym].get('peak_price', cur)), cur)
                         self.state[sym]['peak_price']     = round(peak, 2)
                         initial_sl = float(self.state[sym].get('stop_loss', 0))
-                        trail_floor = peak - sd
-                        if ep > 0 and peak >= ep * (1 + BREAK_EVEN_PCT):
-                            trail_floor = max(trail_floor, ep)
-                        self.state[sym]['effective_stop'] = round(max(initial_sl, trail_floor), 2)
+                        if str(self.state[sym].get('stop_mode', '')).lower() == 'percent':
+                            # IBKR owns the moving stop for percent TRAIL orders.
+                            # Do not invent a fixed-dollar trail from a snapshot;
+                            # that can overstate protection on the dashboard.
+                            if initial_sl > 0:
+                                self.state[sym]['effective_stop'] = round(initial_sl, 2)
+                        else:
+                            trail_floor = peak - sd
+                            if ep > 0 and peak >= ep * (1 + BREAK_EVEN_PCT):
+                                trail_floor = max(trail_floor, ep)
+                            self.state[sym]['effective_stop'] = round(max(initial_sl, trail_floor), 2)
                     changed = True
 
                 # Backfill volume once if it is missing/zero — only fetches

@@ -482,3 +482,61 @@
    local env loading, runtime isolation, live-mode acknowledgement, and health
    checks. This keeps the operating surface small and reduces the chance of
    starting the wrong account mode.
+
+21. Live connectivity pre-market fixes, 2026-05-28
+
+   A live pre-market startup test against IB Gateway on port `4001` found and
+   fixed three broker-state edge cases:
+
+   - Stale local positions that are missing from one IBKR position snapshot are
+     no longer refreshed with historical/market-data calls while awaiting the
+     second confirming snapshot. This prevented stale `DELL` state from causing
+     historical data timeouts.
+   - Startup now runs an immediate confirmation sync and protective-stop audit
+     when local state contains positions with missing/zero stop fields instead
+     of waiting until the 09:58 ET pre-entry sync.
+   - Stop audits now request broker-wide open orders via `reqAllOpenOrders()`
+     before using `openTrades()`. This prevents the engine from missing
+     already-live GTC protective orders and trying to create duplicate sell
+     stops in a cash account.
+
+   IBKR can represent an existing TRAIL sell as a percentage trail where
+   `auxPrice` is `UNSET_DOUBLE`, while the real protection is carried in
+   `trailStopPrice` and `trailingPercent`. The audit logic now recognizes both:
+
+   - Dollar TRAIL: finite positive `auxPrice`.
+   - Percent TRAIL: finite positive `trailStopPrice` plus `trailingPercent`.
+
+   Runtime state now records percent-trail stops as:
+
+   ```text
+   stop_mode = "percent"
+   trailing_percent = <IBKR trailingPercent>
+   stop_loss/effective_stop = <IBKR trailStopPrice snapshot>
+   ```
+
+   The dashboard no longer invents a fixed-dollar effective stop for percent
+   trailing orders.
+
+   Live validation result:
+
+   - IB Gateway live API port `127.0.0.1:4001` connected successfully.
+   - Dashboard live API on `127.0.0.1:8081` served connected live runtime state.
+   - Existing protective GTC TRAIL sells confirmed:
+     - `SBUX`: qty 4, stop `$98.92`, trail `4.807%`
+     - `OXY`: qty 10, stop `$55.22`, trail `6.5614%`
+     - `CSCO`: qty 4, stop `$114.05`, trail `5.5749%`
+   - Live autotrader reached the expected pre-entry wait state:
+     `Waiting until 09:58 ET for pre-entry position sync & stop audit`.
+
+   Validation after the code changes:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest tests/test_startup_init.py -q -p no:cacheprovider
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -q -p no:cacheprovider
+   ```
+
+   Results:
+
+   - Focused startup/audit tests: 70 passed.
+   - Full suite: 344 passed.
