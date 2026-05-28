@@ -24,7 +24,7 @@ from src.config import (
     ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
     VIX_THRESHOLD, HOLD_TRADING_BARS, PROFIT_MIN_THRESHOLD, BREAK_EVEN_PCT,
-    ENTRY_START, ENTRY_END, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
+    ENTRY_START, ENTRY_END, STOP_ACTIVATION_TIME, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
     ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
     RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW, RSI_THRESHOLD,
     ORB_LOOKBACK, ORB_BAR_SIZE, DAILY_LOOKBACK, DAILY_BAR_SIZE,
@@ -838,8 +838,24 @@ class VelocityEngine:
             f"{ENTRY_START[0]:02d}:{ENTRY_START[1]:02d}:00 US/Eastern"
         )
 
+    def _stop_good_after_time(self) -> str:
+        """Return the protective-stop activation time while it is still future."""
+        now_ny = datetime.now(_TZ_NY)
+        stop_gate = now_ny.replace(
+            hour=STOP_ACTIVATION_TIME[0],
+            minute=STOP_ACTIVATION_TIME[1],
+            second=0,
+            microsecond=0,
+        )
+        if now_ny >= stop_gate:
+            return ""
+        return (
+            f"{now_ny.strftime('%Y%m%d')} "
+            f"{STOP_ACTIVATION_TIME[0]:02d}:{STOP_ACTIVATION_TIME[1]:02d}:00 US/Eastern"
+        )
+
     def _make_trail_replacement_order(self, source_order, qty: float, gate_str: str) -> Optional[Order]:
-        """Build an equivalent TRAIL SELL order, optionally delayed to the entry gate."""
+        """Build an equivalent TRAIL SELL order, optionally delayed to the stop gate."""
         replacement = Order()
         replacement.action        = 'SELL'
         replacement.orderType     = 'TRAIL'
@@ -860,18 +876,18 @@ class VelocityEngine:
             return replacement
         return None
 
-    def _replace_trail_with_entry_activation_gate(self, trade, sym: str, qty: float, gate_str: str) -> Tuple[object, bool]:
-        """Replace an existing TRAIL order so it cannot activate before 10:00 ET.
+    def _replace_trail_with_stop_activation_gate(self, trade, sym: str, qty: float, gate_str: str) -> Tuple[object, bool]:
+        """Replace an existing TRAIL order so it cannot activate before the stop gate.
 
         New pre-market/audit TRAIL orders already set goodAfterTime. Existing
         GTC orders recovered from IBKR may not have it. Orders obtained through
         reqAllOpenOrders() are not always modifiable in place by a fresh API
         session, so use cancel-and-replace before the regular session opens.
         """
-        if not gate_str:
-            return trade, True
         order = trade.order
         current_gat = str(getattr(order, 'goodAfterTime', '') or '').strip()
+        if not gate_str and not current_gat:
+            return trade, True
         if current_gat == gate_str:
             return trade, True
 
@@ -893,13 +909,13 @@ class VelocityEngine:
             self._alert(
                 "CRITICAL",
                 f"AUDIT: {sym} — existing TRAIL stop lacks a usable trail amount; "
-                "cannot rebuild it with the 10:00 ET activation gate.",
+                "cannot rebuild it with the stop activation gate.",
             )
             return trade, False
 
         logger.warning(
-            f"AUDIT: {sym} — existing TRAIL SELL lacks 10:00 ET activation gate; "
-            f"cancelling and replacing with goodAfterTime={gate_str}"
+            f"AUDIT: {sym} — existing TRAIL SELL has stale/missing stop activation gate; "
+            f"cancelling and replacing with goodAfterTime={gate_str or '<active now>'}"
         )
         try:
             self.ib.cancelOrder(order)
@@ -907,8 +923,8 @@ class VelocityEngine:
         except Exception as e:
             self._alert(
                 "CRITICAL",
-                f"AUDIT: {sym} — failed to cancel pre-10 TRAIL stop before replacement: {e}. "
-                "Existing broker order may activate before 10:00 ET.",
+                f"AUDIT: {sym} — failed to cancel pre-gate TRAIL stop before replacement: {e}. "
+                "Existing broker order may activate before the configured stop gate.",
             )
             return trade, False
 
@@ -919,20 +935,20 @@ class VelocityEngine:
             if status in _REJECTED_ORDER_STATUSES:
                 self._alert(
                     "CRITICAL",
-                    f"AUDIT: {sym} — replacement TRAIL stop with 10:00 ET gate rejected "
+                    f"AUDIT: {sym} — replacement TRAIL stop with stop gate rejected "
                     f"(status={status}); attempting to restore original protection.",
                 )
                 restored = self._restore_trail_without_entry_gate(trade, sym, qty)
                 return restored, False
             logger.info(
-                f"AUDIT: {sym} — TRAIL SELL replaced with 10:00 ET activation gate "
+                f"AUDIT: {sym} — TRAIL SELL replaced with stop activation gate "
                 f"(new_id={replacement_trade.order.orderId})"
             )
             return replacement_trade, True
         except Exception as e:
             self._alert(
                 "CRITICAL",
-                f"AUDIT: {sym} — failed to place replacement TRAIL stop with 10:00 ET gate: {e}; "
+                f"AUDIT: {sym} — failed to place replacement TRAIL stop with stop gate: {e}; "
                 "attempting to restore original protection.",
             )
             restored = self._restore_trail_without_entry_gate(trade, sym, qty)
@@ -956,7 +972,7 @@ class VelocityEngine:
                 )
                 return trade
             logger.warning(
-                f"AUDIT: {sym} — restored original TRAIL protection without 10:00 ET gate "
+                f"AUDIT: {sym} — restored original TRAIL protection without stop activation gate "
                 f"(id={restored_trade.order.orderId})"
             )
             return restored_trade
@@ -1023,7 +1039,7 @@ class VelocityEngine:
 
         The entry trading window (10:00–15:30 ET) applies only to new BUY entries.
         Stop orders for existing positions are placed immediately regardless of time,
-        but when the audit runs before the 10:00 ET entry gate their activation is
+        but when the audit runs before the configured stop gate their activation is
         delayed with goodAfterTime. After placeOrder() we wait 2 s and verify the
         order status so any unexpected rejection is caught and logged; state is only
         updated once IB confirms the order is live (PreSubmitted / Submitted).
@@ -1041,7 +1057,7 @@ class VelocityEngine:
         if not in_market:
             logger.info(
                 "AUDIT: market is currently closed — TRAIL stops will be submitted "
-                "as GTC orders and delayed until the 10:00 ET entry gate when applicable."
+                "as GTC orders and delayed until the configured stop gate when applicable."
             )
 
         open_trades = self._open_trades_for_audit()
@@ -1131,11 +1147,11 @@ class VelocityEngine:
             if trail_orders:
                 primary_trail = trail_orders[0]
                 meta = trail_meta.get(id(primary_trail), {})
-                primary_trail, gate_ok = self._replace_trail_with_entry_activation_gate(
+                primary_trail, gate_ok = self._replace_trail_with_stop_activation_gate(
                     primary_trail,
                     sym,
                     qty,
-                    self._entry_good_after_time(),
+                    self._stop_good_after_time(),
                 )
                 stop_dist = float(meta.get('stop_dist') or 0.0)
                 stop_loss = float(meta.get('stop_loss') or 0.0)
@@ -1196,7 +1212,7 @@ class VelocityEngine:
                 stop_order.totalQuantity = qty
                 stop_order.auxPrice      = chandelier_dist
                 stop_order.tif           = 'GTC'
-                stop_order.goodAfterTime = self._entry_good_after_time()
+                stop_order.goodAfterTime = self._stop_good_after_time()
                 # outsideRth = False (default): stop only triggers during regular
                 # trading hours, preventing premature exits on thin pre/post-market moves.
                 stop_order.transmit      = True
@@ -1749,6 +1765,8 @@ class VelocityEngine:
                     self.state[symbol]['pending_exit'] = True
                     self.save_state()
                 sell_order = MarketOrder('SELL', qty)
+                sell_order.tif = 'DAY'
+                sell_order.goodAfterTime = ''
                 sell_contract = copy.copy(p.contract)
                 sell_contract.exchange = 'SMART'
                 try:

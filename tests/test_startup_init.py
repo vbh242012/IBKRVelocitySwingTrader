@@ -660,14 +660,14 @@ class TestAuditStopOrders:
         ib = MagicMock()
         ib.openTrades.return_value = [_make_trade('AAPL', 'SELL', 'TRAIL')]
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
-        with patch.object(engine, '_entry_good_after_time', return_value=''):
+        with patch.object(engine, '_stop_good_after_time', return_value=''):
             engine._audit_stop_orders()
         ib.cancelOrder.assert_not_called()
         ib.placeOrder.assert_not_called()
 
-    def test_existing_trail_before_entry_gate_is_delayed_to_10_et(self):
-        """Existing GTC TRAIL orders must not activate before the entry gate."""
-        gate = '20260605 10:00:00 US/Eastern'
+    def test_existing_trail_before_stop_gate_is_delayed_to_932_et(self):
+        """Existing GTC TRAIL orders must not activate before the stop gate."""
+        gate = '20260605 09:32:00 US/Eastern'
         ib = MagicMock()
         trail = _make_trade('AAPL', 'SELL', 'TRAIL', good_after_time='')
         modified = MagicMock()
@@ -677,7 +677,7 @@ class TestAuditStopOrders:
         ib.placeOrder.return_value = modified
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
 
-        with patch.object(engine, '_entry_good_after_time', return_value=gate):
+        with patch.object(engine, '_stop_good_after_time', return_value=gate):
             engine._audit_stop_orders()
 
         ib.cancelOrder.assert_called_once_with(trail.order)
@@ -691,18 +691,39 @@ class TestAuditStopOrders:
 
     def test_existing_trail_from_different_client_is_not_modified(self):
         """Do not try to control protective orders owned by another IB client id."""
-        gate = '20260605 10:00:00 US/Eastern'
+        gate = '20260605 09:32:00 US/Eastern'
         ib = MagicMock()
         trail = _make_trade('AAPL', 'SELL', 'TRAIL', good_after_time='', client_id=99)
         ib.reqAllOpenOrders.return_value = [trail]
         ib.openTrades.return_value = []
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
 
-        with patch.object(engine, '_entry_good_after_time', return_value=gate):
+        with patch.object(engine, '_stop_good_after_time', return_value=gate):
             engine._audit_stop_orders()
 
         ib.cancelOrder.assert_not_called()
         ib.placeOrder.assert_not_called()
+
+    def test_existing_later_gate_is_removed_after_stop_gate_has_passed(self):
+        """A stale future GAT must be removed once the configured stop gate has passed."""
+        ib = MagicMock()
+        trail = _make_trade(
+            'AAPL', 'SELL', 'TRAIL',
+            good_after_time='20260605 10:00:00 US/Eastern',
+        )
+        replacement_trade = MagicMock()
+        replacement_trade.orderStatus.status = 'Submitted'
+        ib.reqAllOpenOrders.return_value = [trail]
+        ib.openTrades.return_value = []
+        ib.placeOrder.return_value = replacement_trade
+        engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
+
+        with patch.object(engine, '_stop_good_after_time', return_value=''):
+            engine._audit_stop_orders()
+
+        ib.cancelOrder.assert_called_once_with(trail.order)
+        placed_order = ib.placeOrder.call_args[0][1]
+        assert placed_order.goodAfterTime == ''
 
     def test_accepts_ib_percent_trail_when_aux_is_unset(self):
         """IBKR can return percent TRAIL orders with auxPrice left as UNSET_DOUBLE."""
@@ -720,7 +741,7 @@ class TestAuditStopOrders:
         state['AAPL']['stop_loss'] = 0.0
         engine = _make_engine(ib, state=state)
 
-        with patch.object(engine, '_entry_good_after_time', return_value=''):
+        with patch.object(engine, '_stop_good_after_time', return_value=''):
             engine._audit_stop_orders()
 
         ib.cancelOrder.assert_not_called()
@@ -745,7 +766,7 @@ class TestAuditStopOrders:
         ib.openTrades.return_value = []
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
 
-        with patch.object(engine, '_entry_good_after_time', return_value=''):
+        with patch.object(engine, '_stop_good_after_time', return_value=''):
             engine._audit_stop_orders()
 
         ib.reqAllOpenOrders.assert_called_once()
@@ -817,8 +838,8 @@ class TestAuditStopOrders:
         assert 'stop_dist' in engine.state['AAPL']
         assert 'stop_loss' in engine.state['AAPL']
 
-    def test_audit_trail_good_after_time_set_only_before_entry_gate(self):
-        """Pre-market audit can defer TRAIL activation; after 10:00 it must omit past GAT."""
+    def test_audit_trail_good_after_time_set_only_before_stop_gate(self):
+        """Pre-market audit can defer TRAIL activation; after 09:32 it must omit past GAT."""
         tz_ny = pytz.timezone('US/Eastern')
 
         ib, _ = self._make_ib_with_history()
@@ -828,13 +849,13 @@ class TestAuditStopOrders:
         ib.placeOrder.side_effect = lambda c, o: (placed_orders.append(o), stop_trade)[1]
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
 
-        before_gate = tz_ny.localize(datetime(2024, 6, 5, 9, 58))
+        before_gate = tz_ny.localize(datetime(2024, 6, 5, 9, 31))
         with patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = before_gate
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._audit_stop_orders()
 
-        assert '10:00:00 US/Eastern' in placed_orders[0].goodAfterTime
+        assert '09:32:00 US/Eastern' in placed_orders[0].goodAfterTime
 
         ib, _ = self._make_ib_with_history()
         placed_orders = []
@@ -843,7 +864,7 @@ class TestAuditStopOrders:
         ib.placeOrder.side_effect = lambda c, o: (placed_orders.append(o), stop_trade)[1]
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
 
-        after_gate = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
+        after_gate = tz_ny.localize(datetime(2024, 6, 5, 9, 33))
         with patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = after_gate
             mock_dt.fromisoformat = datetime.fromisoformat
@@ -905,7 +926,7 @@ class TestAuditStopOrders:
         lmt_trade   = _make_trade('TSLA', 'SELL', 'LMT',   order_id=11)
         ib.openTrades.return_value = [trail_trade, lmt_trade]
         engine = _make_engine(ib, state={'TSLA': dict(self._POS)})
-        with patch.object(engine, '_entry_good_after_time', return_value=''):
+        with patch.object(engine, '_stop_good_after_time', return_value=''):
             engine._audit_stop_orders()
         # LMT cancelled; TRAIL kept; no new order placed
         ib.cancelOrder.assert_called_once_with(lmt_trade.order)

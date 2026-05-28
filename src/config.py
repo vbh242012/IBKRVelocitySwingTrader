@@ -119,6 +119,7 @@ BEAR_GAP_MAX_PCT           = 0.04   # less chasing when broad liquidity is poor
 # ── Session timing ────────────────────────────────────────────────────────────
 ENTRY_START          = (10, 0)   # first valid entry time — 30 min after market open
 ENTRY_END            = (15, 30)
+STOP_ACTIVATION_TIME = (9, 32)   # protective TRAIL stops activate after the first 2 opening minutes
 VOL_MULT_FRIDAY      = 2.0   # Friday liquidity gate: 2× normal dollar-volume threshold
 PRE_ENTRY_SYNC_TIME  = (9, 58)  # ET — position re-sync + stop audit 2 min before entry window
 ENTRY_PARENT_TIF     = 'DAY'   # Entry BUYs must not survive overnight if cancellation fails

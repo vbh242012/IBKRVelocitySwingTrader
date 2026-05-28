@@ -541,22 +541,24 @@
    - Focused startup/audit tests: 70 passed.
    - Full suite: 344 passed.
 
-22. Pre-10 ET protective TRAIL activation gate, 2026-05-28
+22. Protective TRAIL activation gate, 2026-05-28
 
-   Requirement: protective TRAIL sell orders must not activate before the 10:00
-   ET entry gate. This is deliberate for this personal swing-trading workflow,
-   even though it means positions are not stop-protected during the 09:30-10:00
-   ET opening volatility window.
+   Requirement: protective TRAIL sell orders must not activate before 09:32 ET.
+   This is deliberately separate from the 10:00 ET new-entry gate: existing
+   positions get protection after the first 2 opening minutes, while new BUY
+   entries still wait until 10:00 ET.
 
    Implementation details to preserve:
 
-   - New pre-10 ET audit-created TRAIL orders set
-     `goodAfterTime=YYYYMMDD 10:00:00 US/Eastern`.
+   - `STOP_ACTIVATION_TIME = (9, 32)` controls protective TRAIL stop
+     activation.
+   - New pre-09:32 audit-created TRAIL orders set
+     `goodAfterTime=YYYYMMDD 09:32:00 US/Eastern`.
    - New entry bracket parent BUY and child TRAIL orders share the same
      `goodAfterTime` value when submitted before 10:00 ET; after 10:00 ET the
      field is omitted because IBKR rejects past activation timestamps.
    - Existing GTC TRAIL orders recovered from IBKR are checked during stop
-     audit. If they lack the current day's 10:00 ET `goodAfterTime`, the engine
+     audit. If they lack the current day's 09:32 ET `goodAfterTime`, the engine
      cancels and replaces them with equivalent TRAIL orders carrying the gate.
    - The engine must use the same IB API `clientId` that owns the existing
      orders. Orders from a different `clientId` are visible through
@@ -596,4 +598,52 @@
 
    - Focused startup/audit tests: 72 passed.
    - Full suite: 346 passed.
+   - `py_compile`: passed.
+
+   Updated stop activation request:
+
+   - User changed the desired protective stop activation from 10:00 ET to
+     09:32 ET.
+   - Code now uses `_stop_good_after_time()` for protective stop audits and
+     keeps `_entry_good_after_time()` for new entry brackets.
+   - Existing live TRAIL orders were re-audited/replaced. Because the change was
+     applied at 11:42 ET, after the 09:32 ET stop gate had already passed, the
+     broker-side orders were replaced with blank `goodAfterTime`, meaning active
+     immediately. Future pre-09:32 audits will use `09:32:00 US/Eastern`.
+   - If an old order still has a later future `goodAfterTime` after the stop
+     gate has already passed, the audit cancels/replaces it with an immediately
+     active equivalent TRAIL order.
+
+   Live order result after the 09:32 update:
+
+   ```text
+   SBUX | order 7261 | clientId 1 | qty 4  | goodAfterTime '' | stop 98.92  | trail 4.807%
+   OXY  | order 7262 | clientId 1 | qty 10 | goodAfterTime '' | stop 55.22  | trail 6.5614%
+   CSCO | order 7263 | clientId 1 | qty 4  | goodAfterTime '' | stop 114.05 | trail 5.5749%
+   ```
+
+   Restart validation exposed a separate live exit-order issue:
+
+   - Velocity exits attempted to liquidate SBUX/OXY/CSCO after the hold window.
+   - IBKR rejected the market sells because presets changed the market order TIF
+     to GTC, producing `Invalid effective time`.
+   - Liquidation market sells now explicitly set `tif='DAY'` and
+     `goodAfterTime=''` so IBKR presets should not convert them to invalid GTC
+     market orders.
+   - The live autotrader was stopped after the rejection and should not be
+     restarted without understanding that it may immediately retry those
+     velocity exits and sell the positions.
+
+   Latest validation:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest tests/test_startup_init.py tests/test_trailing_stop_scoring_screener.py -q -p no:cacheprovider
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -q -p no:cacheprovider
+   .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/config.py src/ib_gateway.py
+   ```
+
+   Results:
+
+   - Focused startup/trailing-stop tests: 236 passed.
+   - Full suite: 347 passed.
    - `py_compile`: passed.

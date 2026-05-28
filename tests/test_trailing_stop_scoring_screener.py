@@ -1591,7 +1591,7 @@ class TestExitOrders:
     - MarketOrder('SELL', position) placed with exact qty reported by IBKR
     - Non-TRAIL orders cancelled before the market sell
     - TRAIL stop kept live until IBKR confirms the position is flat via sync
-    - MarketOrder TIF is empty — immune to 10349 preset error
+    - MarketOrder TIF is explicit DAY so IBKR presets cannot override it to GTC
     - Exit fires only when stagnant; profitable positions are kept
     """
 
@@ -1802,7 +1802,7 @@ class TestExitOrders:
 
         order = ib.placeOrder.call_args[0][1]
         assert order.orderType == 'MKT'
-        assert order.tif == ''
+        assert order.tif == 'DAY'
         assert order.goodAfterTime == ''
 
     # ── check_velocity_exits() ───────────────────────────────────────────────
