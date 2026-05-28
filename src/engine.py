@@ -991,11 +991,13 @@ class VelocityEngine:
         """
         Call IBKR's whatIf API to verify an order won't be rejected before placing it.
 
-        ib.whatIfOrder() makes an internal copy (order is not mutated), sets
-        whatIf=True on the copy, and returns an OrderState.  The canonical
-        rejection signal is OrderState.warningText being non-empty — IBKR sets
-        this for every detectable problem: insufficient buying power, invalid
-        parameters, unsupported order type, market-hours violations, etc.
+        The live order is not mutated.  IBKR requires what-if orders to be
+        transmitted, so bracket parents that are deliberately created with
+        transmit=False are preflighted through a copied order with transmit=True.
+        The canonical rejection signal is OrderState.warningText being non-empty
+        — IBKR sets this for every detectable problem: insufficient buying
+        power, invalid parameters, unsupported order type, market-hours
+        violations, etc.
 
         Returns True  → order appears acceptable; caller may call placeOrder().
         Returns False → IBKR flagged a problem; caller should skip this order.
@@ -1005,7 +1007,10 @@ class VelocityEngine:
         SELL can leave inventory completely unprotected.
         """
         try:
-            state   = self.ib.whatIfOrder(contract, order)
+            preflight_order = copy.copy(order)
+            preflight_order.whatIf = True
+            preflight_order.transmit = True
+            state = self.ib.whatIfOrder(contract, preflight_order)
             if isinstance(state, list):
                 state = state[0] if state else None
             if state is None:
@@ -1738,21 +1743,67 @@ class VelocityEngine:
         if changed:
             self.save_state()
 
-    def liquidate(self, symbol):
-        # Cancel only non-protective orders before placing the market sell.
-        # Keep TRAIL SELL live as last-resort protection until IBKR confirms the
-        # market exit; if the market sell is rejected, the position is still
-        # protected by the existing broker-side stop.
-        open_trades = [t for t in self.ib.openTrades()
-                       if t.contract.symbol == symbol]
-        cancellable = [
-            trade for trade in open_trades
-            if str(getattr(trade.order, 'orderType', '')).upper() != 'TRAIL'
+    def _active_open_trades_for_symbol(self, symbol: str) -> list:
+        """Return non-terminal open trades for one symbol."""
+        try:
+            open_trades = self.ib.openTrades()
+        except Exception as e:
+            logger.warning(f"LIQUIDATE {symbol}: could not query open trades: {e}")
+            return []
+        active = []
+        for trade in open_trades:
+            trade_symbol = getattr(getattr(trade, 'contract', None), 'symbol', None)
+            if trade_symbol != symbol:
+                continue
+            status = str(getattr(getattr(trade, 'orderStatus', None), 'status', '') or '')
+            if status in _REJECTED_ORDER_STATUSES or status == 'Filled':
+                continue
+            active.append(trade)
+        return active
+
+    def _active_sell_trades_for_symbol(self, symbol: str) -> list:
+        """Return active SELL orders that can block a cash-account market exit."""
+        return [
+            trade for trade in self._active_open_trades_for_symbol(symbol)
+            if str(getattr(getattr(trade, 'order', None), 'action', '')).upper() == 'SELL'
         ]
-        for trade in cancellable:
-            self.ib.cancelOrder(trade.order)
-        if cancellable:
-            self.ib.sleep(1)   # allow cancellations to propagate
+
+    def _cancel_open_orders_before_market_exit(self, symbol: str) -> bool:
+        """Cancel open symbol orders, then wait until active SELLs are gone.
+
+        IBKR cash accounts reject a market SELL if a full-quantity protective
+        SELL is already live, because both orders together could oversell the
+        position.  The unavoidable live-trading sequence is therefore:
+        cancel protection, wait for cancellation, submit the market exit, and
+        rebuild protection immediately if the exit is not accepted.
+        """
+        open_trades = self._active_open_trades_for_symbol(symbol)
+        if not open_trades:
+            return True
+
+        logger.warning(
+            f"LIQUIDATE {symbol}: cancelling {len(open_trades)} existing open order(s) "
+            "before cash-account market exit"
+        )
+        for trade in open_trades:
+            try:
+                self.ib.cancelOrder(trade.order)
+            except Exception as e:
+                logger.warning(f"LIQUIDATE {symbol}: cancel failed before market exit: {e}")
+
+        for _ in range(20):
+            self.ib.sleep(0.25)
+            if not self._active_sell_trades_for_symbol(symbol):
+                return True
+
+        self._alert(
+            "ERROR",
+            f"LIQUIDATE {symbol}: active SELL orders remained after cancellation wait; "
+            "market exit deferred to avoid IBKR cash-account oversell rejection."
+        )
+        return False
+
+    def liquidate(self, symbol):
 
         found_position = False
         for p in self.ib.positions():
@@ -1761,6 +1812,12 @@ class VelocityEngine:
                 if qty <= 0:
                     continue
                 found_position = True
+                if not self._cancel_open_orders_before_market_exit(symbol):
+                    if symbol in self.state:
+                        self.state[symbol].pop('pending_exit', None)
+                        self.save_state()
+                    continue
+
                 if symbol in self.state:
                     self.state[symbol]['pending_exit'] = True
                     self.save_state()
@@ -1780,6 +1837,7 @@ class VelocityEngine:
                         f"LIQUIDATE {symbol}: market SELL placement failed; "
                         f"state retained for retry ({e})"
                     )
+                    self._audit_stop_orders()
                     continue
                 try:
                     for _ in self.ib.loopUntil(trade.isDone, timeout=30):
@@ -1802,6 +1860,7 @@ class VelocityEngine:
                         f"LIQUIDATE {symbol}: market SELL rejected "
                         f"(status={status}); state retained for retry"
                     )
+                    self._audit_stop_orders()
                     continue
 
                 if status == 'Filled' or filled_qty >= qty:

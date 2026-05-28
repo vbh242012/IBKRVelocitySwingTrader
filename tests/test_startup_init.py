@@ -1027,6 +1027,26 @@ class TestPreflightOrder:
         order    = MagicMock()
         assert engine._preflight_order(contract, order, 'AAPL') is True
 
+    def test_preflight_uses_transmitted_copy_without_mutating_live_order(self):
+        """IBKR what-if requires transmit=True, but live bracket parent stays held."""
+        engine = self._engine()
+        engine.ib.whatIfOrder.return_value.warningText = ''
+        contract = MagicMock()
+        order = MagicMock()
+        order.action = 'BUY'
+        order.orderType = 'LMT'
+        order.transmit = False
+        order.whatIf = False
+
+        assert engine._preflight_order(contract, order, 'AAPL') is True
+
+        sent_order = engine.ib.whatIfOrder.call_args[0][1]
+        assert sent_order is not order
+        assert sent_order.transmit is True
+        assert sent_order.whatIf is True
+        assert order.transmit is False
+        assert order.whatIf is False
+
     def test_unwraps_list_return_from_whatif_order(self):
         """Some IBKR API versions return [OrderState] instead of OrderState."""
         engine = self._engine()

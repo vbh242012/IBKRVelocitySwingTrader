@@ -647,3 +647,70 @@
    - Focused startup/trailing-stop tests: 236 passed.
    - Full suite: 347 passed.
    - `py_compile`: passed.
+
+23. Live cash-account exit and entry preflight findings, 2026-05-28
+
+   Live restart was intentionally allowed to execute strategy rules. It exposed
+   two real IBKR cash-account behaviors that mocks/backtests did not catch:
+
+   - A full-quantity protective SELL order and a full-quantity market SELL exit
+     cannot coexist in a cash account. IBKR rejects the market exit as a
+     potential short sale.
+   - IBKR what-if validation requires `transmit=True`, even when the real
+     bracket parent BUY must remain `transmit=False` until the child stop is
+     attached.
+
+   Fixes applied:
+
+   - `liquidate()` now cancels all active open orders for the symbol, waits for
+     active SELL orders to clear, then submits the `DAY` market SELL. If the
+     market SELL placement/rejection path fails after protection was cancelled,
+     the engine immediately runs the stop audit to rebuild protection.
+   - `_preflight_order()` now validates a copied order with `whatIf=True` and
+     `transmit=True`; the live order object is not mutated.
+
+   Live validation:
+
+   - SBUX/OXY/CSCO velocity exits first failed with cash-account short-sale
+     rejection while stops were live.
+   - After the cash-account exit fix, the engine cancelled each protective stop
+     and sold all three positions successfully:
+     - SBUX: market SELL filled, qty 4.
+     - OXY: market SELL filled, qty 10.
+     - CSCO: market SELL filled, qty 4.
+   - Broker verification after exits showed no stock positions and no open
+     orders.
+   - Local state reconciled to `{}` after the two-snapshot missing-position
+     guard.
+   - After the preflight fix, the engine entered RIOT:
+     - RIOT BUY filled, qty 21, fill about $28.30.
+     - Commission report captured: about $1.0001.
+     - Broker verification showed RIOT position qty 21 and live TRAIL SELL
+       protection order 7546, qty 21, trail distance $2.86.
+     - The next stop audit confirmed RIOT TRAIL SELL live.
+
+   Operational note:
+
+   - In this execution environment, plain `nohup ./scripts/start_trader.sh live
+     ... &` returned but did not keep the trader process alive. `setsid -f
+     ./scripts/start_trader.sh live > logs/live_autotrader_stdout.log 2>
+     logs/live_autotrader_stderr.log < /dev/null` did keep it alive.
+   - IB Gateway was already running, so app-side `ensure_ib_gateway_ready()`
+     returned `True` without launching IBC. The live IBC launcher file exists
+     and is executable, but a full auto-login test would require deliberately
+     stopping Gateway and should not be done casually while live trading is
+     active.
+
+   Latest validation:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest tests/test_startup_init.py::TestPreflightOrder tests/test_trailing_stop_scoring_screener.py::TestExitOrders -q -p no:cacheprovider
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -q -p no:cacheprovider
+   .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/config.py src/ib_gateway.py
+   ```
+
+   Results:
+
+   - Focused preflight/liquidation tests: 23 passed.
+   - Full suite: 348 passed.
+   - `py_compile`: passed.

@@ -1589,8 +1589,8 @@ class TestExitOrders:
     """
     Verify velocity exit (check_velocity_exits → liquidate) behaviour:
     - MarketOrder('SELL', position) placed with exact qty reported by IBKR
-    - Non-TRAIL orders cancelled before the market sell
-    - TRAIL stop kept live until IBKR confirms the position is flat via sync
+    - Open symbol orders are cancelled before the market sell
+    - Cash-account exits cancel protective SELLs first to avoid oversell rejection
     - MarketOrder TIF is explicit DAY so IBKR presets cannot override it to GTC
     - Exit fires only when stagnant; profitable positions are kept
     """
@@ -1683,20 +1683,21 @@ class TestExitOrders:
         assert ib.cancelOrder.called, "cancelOrder must be called for open bracket order"
         assert cancel_count_at_place[0] >= 1, "cancelOrder must be called BEFORE placeOrder"
 
-    def test_liquidate_keeps_trail_stop_live_until_sell_confirmed_by_sync(self):
-        """Protective TRAIL must remain live while market exit confirmation is uncertain."""
+    def test_liquidate_cancels_trail_stop_before_cash_account_market_sell(self):
+        """Cash accounts require protective SELL cancellation before market exit."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
         trail  = MagicMock()
         trail.contract.symbol = 'SYM'
+        trail.order.action = 'SELL'
         trail.order.orderType = 'TRAIL'
-        ib.openTrades.return_value = [trail]
+        ib.openTrades.side_effect = [[trail], []]
         ib.positions.return_value  = [self._make_position('SYM', 1.0)]
         engine.state = {'SYM': self._make_state_entry()}
 
         engine.liquidate('SYM')
 
-        ib.cancelOrder.assert_not_called()
+        ib.cancelOrder.assert_called_once_with(trail.order)
         assert engine.state['SYM']['pending_exit'] is True
 
     def test_liquidate_marks_symbol_pending_until_sync_confirms_flat(self):
@@ -1753,10 +1754,12 @@ class TestExitOrders:
         ib.placeOrder.return_value = rejected
 
         engine.state = {'SYM': self._make_state_entry()}
-        engine.liquidate('SYM')
+        with patch.object(engine, '_audit_stop_orders') as mock_audit:
+            engine.liquidate('SYM')
 
         assert 'SYM' in engine.state
         assert 'pending_exit' not in engine.state['SYM']
+        mock_audit.assert_called_once()
 
     def test_liquidate_retains_state_when_market_sell_placement_raises(self):
         """IB API placement exceptions must clear pending_exit so exits can retry."""
@@ -1768,12 +1771,14 @@ class TestExitOrders:
 
         engine.state = {'SYM': self._make_state_entry()}
 
-        with patch.object(engine, '_alert') as mock_alert:
+        with patch.object(engine, '_alert') as mock_alert, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit:
             engine.liquidate('SYM')
 
         assert 'SYM' in engine.state
         assert 'pending_exit' not in engine.state['SYM']
         mock_alert.assert_called_once()
+        mock_audit.assert_called_once()
 
     def test_liquidate_uses_smart_routed_sell_contract(self):
         """Direct-routed native contracts can be blocked by IBKR; exits must force SMART."""
