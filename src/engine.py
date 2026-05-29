@@ -4,9 +4,10 @@ import os
 import copy
 import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, time as datetime_time, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from typing import Dict, Optional, Tuple
 
@@ -16,7 +17,8 @@ import pytz
 from ib_async import IB, Index, Stock, MarketOrder, Order, util
 
 from src.config import (
-    BASE_DIR, STATE_FILE, DASHBOARD_FILE, EQUITY_HIST_FILE, HALT_FILE, FORCE_EXIT_FILE,
+    BASE_DIR, STATE_FILE, DASHBOARD_FILE, EQUITY_HIST_FILE, READINESS_FILE,
+    HALT_FILE, FORCE_EXIT_FILE,
     LOG_DIR, LOG_FILE,
     IB_HOST, IB_PORT, IB_CLIENT_ID, MARKET_DATA_TYPE, VIX_MARKET_DATA_TYPE,
     ACCOUNT_CURRENCY,
@@ -25,7 +27,8 @@ from src.config import (
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
     VIX_THRESHOLD, HOLD_TRADING_BARS, PROFIT_MIN_THRESHOLD, BREAK_EVEN_PCT,
     ENTRY_START, ENTRY_END, STOP_ACTIVATION_TIME, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
-    ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
+    POST_OPEN_AUDIT_TIME, PREMARKET_READINESS_TIME, POST_CLOSE_MAINTENANCE_TIME,
+    MARKET_CLOSE_TIME, ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
     RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW, RSI_THRESHOLD,
     ORB_LOOKBACK, ORB_BAR_SIZE, DAILY_LOOKBACK, DAILY_BAR_SIZE,
     SCAN_MIN_DOLLAR_VOL,
@@ -60,7 +63,7 @@ from src.config import (
 )
 from src.ib_gateway import ensure_ib_gateway_ready
 from src.indicators import apply_all
-from src.scanner import build_momentum_scanner
+from src.scanner import build_momentum_scanners
 
 os.makedirs(BASE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR,  exist_ok=True)
@@ -95,6 +98,46 @@ class _EasternFormatter(logging.Formatter):
         return dt.strftime('%Y-%m-%d %H:%M:%S %Z')
 
 
+class _EasternTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """Rotate daily logs at US/Eastern midnight, independent of host timezone."""
+
+    def computeRollover(self, currentTime):
+        now_et = datetime.fromtimestamp(currentTime, _TZ_NY)
+        next_midnight_naive = datetime.combine(
+            now_et.date() + timedelta(days=1),
+            datetime_time.min,
+        )
+        next_midnight_et = _TZ_NY.localize(next_midnight_naive)
+        return int(next_midnight_et.timestamp())
+
+    def doRollover(self):
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        suffix_date = datetime.fromtimestamp(
+            self.rolloverAt - 1,
+            _TZ_NY,
+        ).strftime(self.suffix)
+        dfn = self.rotation_filename(f"{self.baseFilename}.{suffix_date}")
+        if os.path.exists(dfn):
+            os.remove(dfn)
+        self.rotate(self.baseFilename, dfn)
+
+        if self.backupCount > 0:
+            for old_file in self.getFilesToDelete():
+                os.remove(old_file)
+
+        if not self.delay:
+            self.stream = self._open()
+
+        current_time = int(time.time())
+        new_rollover_at = self.computeRollover(current_time)
+        while new_rollover_at <= current_time:
+            new_rollover_at = self.computeRollover(new_rollover_at)
+        self.rolloverAt = new_rollover_at
+
+
 def _log_namer(default_name: str) -> str:
     # TimedRotatingFileHandler default suffix: logs/trading_engine.log.2026-05-12
     # We produce the cleaner form:             logs/trading_engine_2026-05-12.log
@@ -108,7 +151,7 @@ logger = logging.getLogger('VelocityEngine')
 logger.setLevel(logging.INFO)
 # Guard against duplicate handlers when the module is re-imported (tests, restarts).
 if not logger.handlers:
-    _handler = TimedRotatingFileHandler(
+    _handler = _EasternTimedRotatingFileHandler(
         LOG_FILE, when='midnight', backupCount=LOG_BACKUP_COUNT
     )
     _handler.namer = _log_namer
@@ -152,6 +195,12 @@ class VelocityEngine:
         self._daily_scan_skip: Dict[str, str] = {}
         # Last trading date a full protective stop-order audit was run.
         self._last_audit_date: Optional[str] = None
+        self._last_audit_at: Optional[datetime] = None
+        # Last trading date the post-open protective audit was run.
+        self._last_post_open_audit_date: Optional[str] = None
+        # Last trading dates for non-trading operational jobs.
+        self._last_premarket_readiness_date: Optional[str] = None
+        self._last_post_close_maintenance_date: Optional[str] = None
         # Avoid deleting state on one transient/partial IBKR positions snapshot.
         self._missing_position_counts: Dict[str, int] = {}
 
@@ -593,6 +642,16 @@ class VelocityEngine:
             except OSError as e:
                 logger.warning(f"Could not write equity history: {e}")
 
+    def _write_readiness_snapshot(self, snapshot: dict):
+        """Atomically write non-trading operational readiness data."""
+        tmp = READINESS_FILE + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(snapshot, f, indent=4, default=str)
+            os.replace(tmp, READINESS_FILE)
+        except OSError as e:
+            logger.warning(f"Could not write readiness snapshot: {e}")
+
     # ── Account ────────────────────────────────────────────────────────────────
     def _get_account_values(self) -> Tuple[float, float]:
         """Return (net_liquidation, settled_cash) using fresh IBKR data only.
@@ -708,16 +767,20 @@ class VelocityEngine:
 
     def _initialize(self):
         """
-        Two-phase startup gate.
+        Startup safety gate.
 
-        Phase 1 (immediate): fetch equity, cancel orphaned orders, snapshot
-        positions and prices → write dashboard so the UI is live straight away.
+        Phase 1 (immediate): fetch equity, cancel orphaned orders, sync
+        positions, audit protective stops, refresh prices, and write dashboard
+        so the UI is live straight away.
 
-        Phase 2 (timed): sleep until PRE_ENTRY_SYNC_TIME (09:58 ET) so the
+        Phase 2 (timed): sleep until PRE_ENTRY_SYNC_TIME (09:15 ET) so the
         definitive position re-sync and chandelier stop audit happen with the
-        freshest IBKR data, right before the 10:00 AM entry window opens.
+        morning IBKR position/order snapshot before the 10:00 AM entry window opens.
         If the engine starts after the sync time (intraday restart, evening),
         Phase 2 runs immediately with no sleep.
+
+        The run loop performs a separate post-open audit at POST_OPEN_AUDIT_TIME
+        after TRAIL orders are active and opening-auction broker state has settled.
         """
         # ── Phase 1: immediate startup snapshot ──────────────────────────────
         logger.info("INIT: Waiting for account equity from IBKR...")
@@ -764,22 +827,17 @@ class VelocityEngine:
                     )
             self.ib.sleep(2)
 
-        logger.info("INIT: Phase 1 — syncing positions for dashboard snapshot...")
+        logger.info("INIT: Phase 1 — immediate position sync and stop-order audit...")
         self._sync_positions_from_ibkr()
         if self.state:
+            logger.info("INIT: Auditing stop orders for open positions immediately...")
+            self._audit_stop_orders()
+            now_ny = datetime.now(_TZ_NY)
+            self._last_audit_date = now_ny.strftime('%Y-%m-%d')
+            self._last_audit_at = now_ny
+            logger.info("INIT: Fetching live prices for open positions...")
             self._update_position_prices()
         self._write_dashboard_data(connected=True)
-
-        if self._position_needs_stop_audit():
-            logger.warning(
-                "INIT: Unprotected position state detected before pre-entry sync; "
-                "running immediate confirmation sync and stop audit."
-            )
-            self._sync_positions_from_ibkr()
-            if self.state:
-                self._audit_stop_orders()
-                self._update_position_prices()
-                self._write_dashboard_data(connected=True)
 
         # ── Phase 2: pre-entry definitive sync + stop audit ──────────────────
         self._wait_for_pre_entry_sync()
@@ -789,6 +847,9 @@ class VelocityEngine:
         if self.state:
             logger.info("INIT: Auditing stop orders for open positions...")
             self._audit_stop_orders()
+            now_ny = datetime.now(_TZ_NY)
+            self._last_audit_date = now_ny.strftime('%Y-%m-%d')
+            self._last_audit_at = now_ny
             logger.info("INIT: Fetching live prices for open positions...")
             self._update_position_prices()
 
@@ -797,8 +858,8 @@ class VelocityEngine:
 
     def _wait_for_pre_entry_sync(self):
         """
-        Sleep until PRE_ENTRY_SYNC_TIME (default 09:58 ET) so the definitive
-        position re-sync and stop audit run just before the 10:00 AM entry window.
+        Sleep until PRE_ENTRY_SYNC_TIME (default 09:15 ET) so the definitive
+        position re-sync and stop audit run before the 10:00 AM entry window.
 
         If the engine starts after the sync time (intraday restart, evening run),
         the method returns immediately without sleeping.
@@ -1322,7 +1383,8 @@ class VelocityEngine:
         if not self.state:
             return
 
-        today = datetime.now(_TZ_NY).strftime('%Y-%m-%d')
+        now_ny = datetime.now(_TZ_NY)
+        today = now_ny.strftime('%Y-%m-%d')
         needs_audit = self._position_needs_stop_audit()
         if getattr(self, '_last_audit_date', None) == today and not needs_audit:
             return
@@ -1332,6 +1394,7 @@ class VelocityEngine:
         try:
             self._audit_stop_orders()
             self._last_audit_date = today
+            self._last_audit_at = now_ny
         except Exception as e:
             self._alert(
                 "CRITICAL",
@@ -1339,9 +1402,234 @@ class VelocityEngine:
                 f"positions may be unprotected ({e})",
             )
 
+    def _maybe_post_open_stop_audit(self):
+        """
+        Run one extra position sync and stop audit after the market opens.
+
+        The 09:15 ET startup audit catches stale state early, but TRAIL orders
+        and broker order status can change after the 09:30 opening auction. This
+        audit is intentionally separate from the daily audit so it cannot be
+        skipped just because the early audit already ran.
+        """
+        today_dt = datetime.now(_TZ_NY)
+        if today_dt.weekday() >= 5:
+            return
+
+        today = today_dt.strftime('%Y-%m-%d')
+        if getattr(self, '_last_post_open_audit_date', None) == today:
+            return
+
+        h, m = POST_OPEN_AUDIT_TIME
+        audit_time = today_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+        if today_dt < audit_time:
+            return
+
+        last_audit_at = getattr(self, '_last_audit_at', None)
+        if last_audit_at is not None and last_audit_at >= audit_time:
+            self._last_post_open_audit_date = today
+            logger.info(
+                "AUDIT: post-open checkpoint already covered by a protective "
+                f"stop audit at {last_audit_at.strftime('%H:%M:%S %Z')}"
+            )
+            return
+
+        logger.info(
+            f"AUDIT: running post-open position sync and stop audit "
+            f"({h:02d}:{m:02d} ET checkpoint)"
+        )
+        try:
+            self._sync_positions_from_ibkr()
+            if self.state:
+                self._audit_stop_orders()
+                self._update_position_prices()
+            else:
+                logger.info("AUDIT: post-open checkpoint found no open positions")
+            self._last_post_open_audit_date = today
+            self._last_audit_date = today
+            self._last_audit_at = today_dt
+            self._write_dashboard_data(connected=True)
+        except Exception as e:
+            self._alert(
+                "CRITICAL",
+                f"AUDIT: post-open protective stop audit failed unexpectedly; "
+                f"positions may be unprotected ({e})",
+            )
+
+    def _regular_management_active(self, now_ny: Optional[datetime] = None) -> bool:
+        """True only during the regular-session window where software exits may run."""
+        now_ny = now_ny or datetime.now(_TZ_NY)
+        if now_ny.weekday() >= 5:
+            return False
+        hhmm = (now_ny.hour, now_ny.minute)
+        return STOP_ACTIVATION_TIME <= hhmm < MARKET_CLOSE_TIME
+
+    def _ensure_vix_contract(self) -> bool:
+        """Qualify and cache the VIX contract; fail closed for entry logic."""
+        if self._vix_contract is not None:
+            return True
+        try:
+            vix_contracts = self.ib.qualifyContracts(Index('VIX', 'CBOE'))
+            if not vix_contracts:
+                logger.warning("VIX contract unavailable.")
+                return False
+            self._vix_contract = vix_contracts[0]
+            return True
+        except Exception as e:
+            logger.warning(f"VIX contract qualification failed: {e}")
+            return False
+
+    def _build_readiness_snapshot(self, checkpoint: str) -> dict:
+        """
+        Collect non-trading data that helps the next trading session.
+
+        This deliberately avoids scanner/entry calls. It may reconcile account
+        values, VIX/SPY regime, open orders, and current local/broker position
+        state, but it must not create new BUY orders.
+        """
+        now_ny = datetime.now(_TZ_NY)
+        account_error = None
+        try:
+            equity, settled = self._get_account_values()
+            self._last_equity = equity
+            self._last_settled_cash = settled
+            self._equity_initialized = True
+        except AccountDataUnavailable as e:
+            account_error = str(e)
+            equity = self._last_equity
+            settled = self._last_settled_cash
+
+        allocation = self._calc_entry_allocation(equity, settled, len(self.state)) if equity > 0 else {
+            'max_pos': 0,
+            'capacity_slots': 0,
+            'cash_slots': 0,
+            'entry_slots': 0,
+            'deployable_cash': 0.0,
+            'bucket_size': 0.0,
+        }
+
+        vix_price = None
+        if self._ensure_vix_contract():
+            vix_price = self._fetch_vix_price()
+        self._last_vix = vix_price
+
+        try:
+            spy_trend = self._fetch_spy_trend()
+        except Exception as e:
+            logger.warning(f"READINESS: SPY regime snapshot failed: {e}")
+            spy_trend = False
+
+        open_order_count = 0
+        open_sell_count = 0
+        try:
+            open_orders = self.ib.reqAllOpenOrders()
+            open_order_count = len(open_orders or [])
+            open_sell_count = sum(
+                1 for trade in (open_orders or [])
+                if str(getattr(trade.order, 'action', '')).upper() == 'SELL'
+            )
+        except Exception as e:
+            logger.warning(f"READINESS: open-order snapshot failed: {e}")
+
+        positions = []
+        for sym, data in sorted(self.state.items()):
+            positions.append({
+                'symbol': sym,
+                'qty': float(data.get('qty', 0) or 0),
+                'entry_price': float(data.get('fill_price', data.get('price', 0)) or 0),
+                'current_price': float(data.get('current_price', data.get('price', 0)) or 0),
+                'stop_loss': float(data.get('stop_loss', 0) or 0),
+                'effective_stop': float(data.get('effective_stop', data.get('stop_loss', 0)) or 0),
+                'pending_exit': bool(data.get('pending_exit', False)),
+            })
+
+        snapshot = {
+            'checkpoint': checkpoint,
+            'timestamp': now_ny.isoformat(),
+            'trading_mode': TRADING_MODE,
+            'active_management_window': self._regular_management_active(now_ny),
+            'account': {
+                'equity': round(float(equity or 0), 2),
+                'settled_cash': round(float(settled or 0), 2),
+                'deployable_cash': round(float(allocation['deployable_cash']), 2),
+                'bucket_size': round(float(allocation['bucket_size']), 2),
+                'max_positions': int(allocation['max_pos']),
+                'entry_slots': int(allocation['entry_slots']),
+                'error': account_error,
+            },
+            'regime': {
+                'vix': round(float(vix_price), 2) if vix_price is not None else None,
+                'vix_threshold': VIX_THRESHOLD,
+                'spy_trend': bool(spy_trend),
+            },
+            'orders': {
+                'open_order_count': open_order_count,
+                'open_sell_order_count': open_sell_count,
+            },
+            'positions': positions,
+        }
+        self._write_readiness_snapshot(snapshot)
+        return snapshot
+
+    def _run_operational_maintenance(self, checkpoint: str):
+        """Run a non-entry broker reconciliation/readiness checkpoint."""
+        logger.info(f"OFFHOURS: running {checkpoint} maintenance checkpoint")
+        self._sync_positions_from_ibkr()
+        if self.state:
+            self._audit_stop_orders()
+            now_ny = datetime.now(_TZ_NY)
+            self._last_audit_date = now_ny.strftime('%Y-%m-%d')
+            self._last_audit_at = now_ny
+            self._update_position_prices()
+
+        snapshot = self._build_readiness_snapshot(checkpoint)
+        logger.info(
+            f"OFFHOURS: {checkpoint} snapshot | "
+            f"equity=${snapshot['account']['equity']:.2f} "
+            f"settled=${snapshot['account']['settled_cash']:.2f} "
+            f"positions={len(snapshot['positions'])} "
+            f"orders={snapshot['orders']['open_order_count']}"
+        )
+        self._write_dashboard_data(connected=True)
+
+    def _maybe_run_off_hours_jobs(self) -> bool:
+        """Run scheduled non-trading jobs once per trading date."""
+        now_ny = datetime.now(_TZ_NY)
+        if now_ny.weekday() >= 5:
+            return False
+
+        today = now_ny.strftime('%Y-%m-%d')
+        hhmm = (now_ny.hour, now_ny.minute)
+        ran = False
+
+        if (PREMARKET_READINESS_TIME <= hhmm < ENTRY_START
+                and getattr(self, '_last_premarket_readiness_date', None) != today):
+            try:
+                self._run_operational_maintenance('premarket_readiness')
+                self._last_premarket_readiness_date = today
+                ran = True
+            except Exception as e:
+                self._alert(
+                    "ERROR",
+                    f"OFFHOURS: premarket readiness checkpoint failed: {e}",
+                )
+
+        if (hhmm >= POST_CLOSE_MAINTENANCE_TIME
+                and getattr(self, '_last_post_close_maintenance_date', None) != today):
+            try:
+                self._run_operational_maintenance('post_close_reconciliation')
+                self._last_post_close_maintenance_date = today
+                ran = True
+            except Exception as e:
+                self._alert(
+                    "ERROR",
+                    f"OFFHOURS: post-close maintenance checkpoint failed: {e}",
+                )
+
+        return ran
+
     # ── Regime / sector / correlation helpers ──────────────────────────────────
     def _fetch_spy_trend(self) -> bool:
-        """True when SPY price > SMA50 > SMA200. Cached per trading day; fails closed."""
+        """True when SPY price > SMA50 > SMA200 and SMA200 is rising."""
         tz_ny  = pytz.timezone('US/Eastern')
         today  = datetime.now(tz_ny).strftime('%Y-%m-%d')
         if self._spy_cache.get('date') == today:
@@ -1352,15 +1640,20 @@ class VelocityEngine:
             bars = self.ib.reqHistoricalData(
                 self._contract_cache['SPY'], '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
             )
-            if not isinstance(bars, list) or len(bars) < MA_SLOW:
+            if not isinstance(bars, list) or len(bars) < MA_SLOW + SMA200_SLOPE_LOOKBACK:
                 logger.warning("SPY regime check has insufficient history — blocking new entries")
                 self._spy_cache = {'date': today, 'trend': False}
                 return False
             df = util.df(bars)
             df['MA50']  = df['close'].rolling(50).mean()
             df['MA200'] = df['close'].rolling(200).mean()
+            df['SMA200_SLOPE'] = df['MA200'] - df['MA200'].shift(SMA200_SLOPE_LOOKBACK)
             last  = df.iloc[-1]
-            trend = bool(last['close'] > last['MA50'] and last['MA50'] > last['MA200'])
+            trend = bool(
+                last['close'] > last['MA50']
+                and last['MA50'] > last['MA200']
+                and last['SMA200_SLOPE'] > 0
+            )
             self._spy_cache = {'date': today, 'trend': trend}
             return trend
         except Exception as e:
@@ -1482,20 +1775,23 @@ class VelocityEngine:
     # ── Scanner ────────────────────────────────────────────────────────────────
     def get_institutional_scan(self):
         """Dynamic discovery of institutional momentum from every unique IBKR scanner hit."""
-        try:
-            sub  = build_momentum_scanner()
-            scan = self.ib.reqScannerData(sub)
-            seen = set()
-            symbols = []
-            for item in scan:
-                sym = item.contractDetails.contract.symbol
-                if sym not in seen:
-                    seen.add(sym)
-                    symbols.append(sym)
-            return symbols
-        except Exception as e:
-            logger.warning(f"SCAN: IB scanner failed ({e}); no new candidates this cycle")
-            return []
+        seen: set = set()
+        symbols: list = []
+        for sub in build_momentum_scanners():
+            try:
+                scan = self.ib.reqScannerData(sub)
+                for item in scan:
+                    sym = item.contractDetails.contract.symbol
+                    if sym not in seen:
+                        seen.add(sym)
+                        symbols.append(sym)
+            except Exception as e:
+                logger.warning(
+                    f"SCAN: IB scanner ({sub.scanCode}) failed ({e}); skipping"
+                )
+        if not symbols:
+            logger.warning("SCAN: all scanner queries failed or returned no candidates")
+        return symbols
 
     # ── Technical context ──────────────────────────────────────────────────────
     def _remember_daily_scan_skip(self, symbol: str, reason: str):
@@ -2166,10 +2462,36 @@ class VelocityEngine:
             self._write_dashboard_data(connected=True)
             return
 
+        off_hours_ran = self._maybe_run_off_hours_jobs()
+
         # Stop protection is independent of new-entry logic. Run this before
         # account/VIX gates so existing positions remain protected even when
-        # fresh cash data or regime data is temporarily unavailable.
+        # fresh cash data or regime data is temporarily unavailable.  Scheduled
+        # off-hours jobs also audit stops and set _last_audit_date, so this call
+        # naturally skips duplicate same-day audits.
         self._maybe_audit_stop_orders()
+        self._maybe_post_open_stop_audit()
+
+        now_ny = datetime.now(_TZ_NY)
+        if not self._regular_management_active(now_ny):
+            # During closed/premarket hours the engine may reconcile, audit
+            # protective stops, and write readiness data, but it must not run
+            # software exits, scanners, or new-entry logic.
+            if not off_hours_ran:
+                try:
+                    equity, settled = self._get_account_values()
+                    self._last_equity = equity
+                    self._last_settled_cash = settled
+                    self._equity_initialized = True
+                except AccountDataUnavailable as e:
+                    self._alert(
+                        "ERROR",
+                        f"{e} Off-hours dashboard account refresh skipped."
+                    )
+                if self.state:
+                    self._update_position_prices()
+                self._write_dashboard_data(connected=True)
+            return
 
         # 2. Account values — single API call for both equity and settled cash
         try:
@@ -2207,6 +2529,7 @@ class VelocityEngine:
             self._day_start_date   = today_str
             self._day_start_equity = equity
             self._daily_scan_skip.clear()
+            self._bar_cache.clear()
         elif (self._day_start_equity is not None
               and equity < self._day_start_equity * (1 - MAX_DAILY_LOSS_PCT)):
             logger.warning(
@@ -2220,14 +2543,11 @@ class VelocityEngine:
             return
 
         # 3. Market Heat Check — qualify once, reuse across cycles
-        if self._vix_contract is None:
-            vix_contracts = self.ib.qualifyContracts(Index('VIX', 'CBOE'))
-            if not vix_contracts:
-                logger.warning("VIX contract unavailable. Skipping entries as precaution.")
-                self.check_velocity_exits()
-                self._update_position_prices()
-                return
-            self._vix_contract = vix_contracts[0]
+        if not self._ensure_vix_contract():
+            logger.warning("VIX contract unavailable. Skipping entries as precaution.")
+            self.check_velocity_exits()
+            self._update_position_prices()
+            return
         vix_price = self._fetch_vix_price()
         if vix_price is None:
             logger.warning("VIX price unavailable. Skipping entries as precaution.")
@@ -2286,7 +2606,7 @@ class VelocityEngine:
                 spy_trend = self._fetch_spy_trend()
                 bear_phase = not spy_trend
                 if bear_phase and not BEAR_PHASE_TRADING_ENABLED:
-                    logger.warning("REGIME: SPY below SMA50/SMA200 — no new entries this cycle")
+                    logger.warning("REGIME: SPY trend weak/falling — no new entries this cycle")
                     self._update_position_prices()
                     return
 
@@ -2300,7 +2620,7 @@ class VelocityEngine:
                     dol_vol_threshold *= BEAR_PHASE_DOLLAR_VOL_MULT
                     risk_per_trade_pct = RISK_PER_TRADE_PCT * BEAR_PHASE_RISK_MULT
                     logger.warning(
-                        "REGIME: SPY below SMA50/SMA200 — bear-phase participation enabled; "
+                        "REGIME: SPY trend weak/falling — bear-phase participation enabled; "
                         f"using stricter 8096 rules (gap≤{gap_max_pct*100:.0f}%, "
                         f"RSI>{rsi_threshold}, RSIΔ≥{rsi_min_delta}, "
                         f"risk={risk_per_trade_pct*100:.1f}%)."
@@ -2479,6 +2799,8 @@ class VelocityEngine:
                     for score, sym, ctx in signals:
                         if placed >= slots:
                             break
+                        if placed > 0:
+                            self.check_velocity_exits()
 
                         atr   = ctx['atr']
 

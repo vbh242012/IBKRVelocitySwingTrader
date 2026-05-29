@@ -123,7 +123,7 @@
 10. Live-safety fixes carried forward from the original project review
 
    - Never set IBKR `goodAfterTime` to a past timestamp. Entry bracket orders omit it after the 10:00 ET entry gate.
-   - `liquidate()` must keep existing TRAIL SELL protection live until the market exit is confirmed by IBKR position sync; only non-TRAIL orders are cancelled before the market sell.
+   - In an IBKR cash account, `liquidate()` cancels active SELL orders, including protective TRAIL orders, before submitting the market exit. IBKR can otherwise reject the exit as a potential oversell because another full-size SELL is already live. If the market exit is rejected or placement fails, state is retained, `pending_exit` is cleared, an alert is emitted, and `_audit_stop_orders()` rebuilds protection immediately.
    - Liquidation market sells must be SMART-routed even if IBKR reports the position contract with a native exchange.
    - Filled liquidation attempts mark state `pending_exit=True`; state is removed only after IBKR sync confirms the position is flat.
    - `_sync_positions_from_ibkr()` must backfill `fill_price`, `broker_avg_cost`, and `peak_price` for positions recovered after a restart.
@@ -136,7 +136,7 @@
 
    - Startup orphan cleanup now handles both orphaned `BUY` and orphaned `SELL` orders, but only when the symbol is absent from local state and absent from live IBKR positions.
    - Startup must preserve protective `SELL` orders when either local state has the symbol or IBKR reports an actual position for that symbol.
-   - `liquidate()` keeps existing TRAIL protection live while the market sell is uncertain, but catches IBKR `placeOrder()` exceptions, clears `pending_exit`, retains state, and alerts so the exit can retry.
+   - `liquidate()` cancels active SELL protection before a cash-account market exit, then catches IBKR `placeOrder()` exceptions, clears `pending_exit`, retains state, alerts, and runs `_audit_stop_orders()` so protection is rebuilt if the exit cannot be placed or is rejected.
    - After IBKR confirms a symbol is flat, `_sync_positions_from_ibkr()` must cancel any leftover SELL exit orders before removing local state. This prevents orphaned trailing stops from becoming unintended future sell orders.
    - Liquidation state removal remains confirmation-based: one missing IBKR snapshot only defers removal unless `FORCE_EXIT_ALL` is active.
    - `backtest/optimizer.py` must optimize only active 8096 parameters. Legacy `rvol_min`, `breakout_pct`, and `vcp_ratio` are retained for API/report compatibility but must not be swept as if they affect entries.
@@ -493,8 +493,7 @@
      second confirming snapshot. This prevented stale `DELL` state from causing
      historical data timeouts.
    - Startup now runs an immediate confirmation sync and protective-stop audit
-     when local state contains positions with missing/zero stop fields instead
-     of waiting until the 09:58 ET pre-entry sync.
+     for any open position instead of waiting until the 09:15 ET pre-entry sync.
    - Stop audits now request broker-wide open orders via `reqAllOpenOrders()`
      before using `openTrades()`. This prevents the engine from missing
      already-live GTC protective orders and trying to create duplicate sell
@@ -527,7 +526,7 @@
      - `OXY`: qty 10, stop `$55.22`, trail `6.5614%`
      - `CSCO`: qty 4, stop `$114.05`, trail `5.5749%`
    - Live autotrader reached the expected pre-entry wait state:
-     `Waiting until 09:58 ET for pre-entry position sync & stop audit`.
+     `Waiting until 09:15 ET for pre-entry position sync & stop audit`.
 
    Validation after the code changes:
 
@@ -724,3 +723,19 @@
    - Full suite: 348 passed after Python fixes and again after supervisor
      script changes.
    - `py_compile`: passed.
+
+24. Startup and post-open broker-state audits, 2026-05-29
+
+   - `PRE_ENTRY_SYNC_TIME` is `09:15 ET`. This is the early morning account,
+     position, and stop-order health check.
+   - Startup also runs one immediate position sync and protective-stop audit
+     before the 09:15 wait. This makes restarts safer when the engine comes up
+     long before the scheduled pre-entry sync.
+   - `POST_OPEN_AUDIT_TIME` is `09:35 ET`. This is a separate mandatory
+     post-open position sync and protective-stop audit after the 09:30 opening
+     auction and after TRAIL orders become active at 09:32 ET.
+   - The 09:35 audit is independent from the early audit; it is not skipped
+     simply because the 09:15 audit already ran.
+   - If a normal protective stop audit already ran after 09:35 ET in the same
+     trading day, that audit counts as satisfying the post-open checkpoint so
+     the engine does not duplicate broker calls in the same cycle.

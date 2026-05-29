@@ -578,3 +578,81 @@ class TestLoggerHandlerGuard:
         assert handler_count_after == handler_count_before, (
             f"Re-import added handlers: {handler_count_before} → {handler_count_after}"
         )
+
+    def test_log_rollover_uses_eastern_midnight(self, tmp_path):
+        import src.engine as eng_mod
+
+        handler = eng_mod._EasternTimedRotatingFileHandler(
+            str(tmp_path / "trading_engine.log"),
+            when='midnight',
+            backupCount=1,
+        )
+        try:
+            current = eng_mod._TZ_NY.localize(
+                datetime(2026, 5, 28, 23, 59, 59)
+            ).timestamp()
+
+            rollover = handler.computeRollover(current)
+            rollover_et = datetime.fromtimestamp(rollover, eng_mod._TZ_NY)
+
+            assert rollover_et == eng_mod._TZ_NY.localize(
+                datetime(2026, 5, 29, 0, 0, 0)
+            )
+        finally:
+            handler.close()
+
+
+# ── SPY Regime ────────────────────────────────────────────────────────────────
+class TestSpyRegime:
+    @staticmethod
+    def _spy_df(first5: float) -> pd.DataFrame:
+        closes = [first5] * 5 + [80.0] * 150 + [110.0] * 49 + [112.0]
+        return pd.DataFrame({"close": closes})
+
+    def _run_spy_trend(self, ib, df: pd.DataFrame) -> bool:
+        import src.engine as eng_mod
+
+        engine = _make_engine_patched(ib)
+        engine._spy_cache = {}
+        engine._contract_cache = {'SPY': MagicMock()}
+        ib.reqHistoricalData.return_value = [object()] * len(df)
+
+        with patch.object(eng_mod.util, 'df', return_value=df):
+            return engine._fetch_spy_trend()
+
+    def test_spy_uptrend_requires_rising_sma200(self):
+        ib = _mock_ib()
+
+        # Last close is above MA50 > MA200, but the 200-day average is falling
+        # because very high prices are rolling out of the 200-day window.
+        assert self._run_spy_trend(ib, self._spy_df(first5=200.0)) is False
+
+    def test_spy_uptrend_allows_rising_sma200(self):
+        ib = _mock_ib()
+
+        assert self._run_spy_trend(ib, self._spy_df(first5=70.0)) is True
+
+    def test_log_rollover_filename_uses_eastern_date(self, tmp_path):
+        import src.engine as eng_mod
+
+        log_file = tmp_path / "trading_engine.log"
+        handler = eng_mod._EasternTimedRotatingFileHandler(
+            str(log_file),
+            when='midnight',
+            backupCount=3,
+        )
+        handler.namer = eng_mod._log_namer
+        try:
+            handler.stream.write("old eastern-day log\n")
+            handler.stream.flush()
+            handler.rolloverAt = int(
+                eng_mod._TZ_NY.localize(datetime(2026, 5, 29, 0, 0, 0)).timestamp()
+            )
+
+            with patch.object(eng_mod.time, 'time', return_value=handler.rolloverAt + 1):
+                handler.doRollover()
+
+            assert (tmp_path / "trading_engine_2026-05-28.log").exists()
+            assert not (tmp_path / "trading_engine_2026-05-29.log").exists()
+        finally:
+            handler.close()

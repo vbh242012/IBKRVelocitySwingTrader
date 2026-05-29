@@ -8,6 +8,7 @@ BASE_DIR         = os.getenv(
 STATE_FILE       = os.path.join(BASE_DIR, "engine_state.json")
 DASHBOARD_FILE   = os.path.join(BASE_DIR, "dashboard_data.json")
 EQUITY_HIST_FILE = os.path.join(BASE_DIR, "equity_history.json")
+READINESS_FILE   = os.path.join(BASE_DIR, "readiness_snapshot.json")
 HALT_FILE        = os.path.join(BASE_DIR, "HALT_TRADING")
 FORCE_EXIT_FILE  = os.path.join(BASE_DIR, "FORCE_EXIT_ALL")
 INSTANCE_LOCK_FILE = os.path.join(BASE_DIR, "velocity_engine.lock")
@@ -121,7 +122,11 @@ ENTRY_START          = (10, 0)   # first valid entry time — 30 min after marke
 ENTRY_END            = (15, 30)
 STOP_ACTIVATION_TIME = (9, 32)   # protective TRAIL stops activate after the first 2 opening minutes
 VOL_MULT_FRIDAY      = 2.0   # Friday liquidity gate: 2× normal dollar-volume threshold
-PRE_ENTRY_SYNC_TIME  = (9, 58)  # ET — position re-sync + stop audit 2 min before entry window
+PRE_ENTRY_SYNC_TIME  = (9, 15)  # ET — position re-sync + stop audit before the entry window
+POST_OPEN_AUDIT_TIME = (9, 35)  # ET — re-check protective stops shortly after open
+PREMARKET_READINESS_TIME = (8, 45)  # ET — account/regime readiness snapshot before open
+POST_CLOSE_MAINTENANCE_TIME = (17, 0)  # ET — post-close reconciliation and readiness snapshot
+MARKET_CLOSE_TIME    = (16, 0)  # ET — stop software-managed market exits after regular session
 ENTRY_PARENT_TIF     = 'DAY'   # Entry BUYs must not survive overnight if cancellation fails
 ENTRY_ALL_OR_NONE    = True    # Avoid partial parent fills with full-size attached stop legs
 
@@ -146,6 +151,14 @@ IB_SCANNER_SCAN_CODE = (
     os.getenv("VELOCITY_IB_SCANNER_SCAN_CODE", "MOST_ACTIVE").strip()
     or "MOST_ACTIVE"
 )
+IB_SCANNER_SCAN_CODES: list = [
+    c.strip()
+    for c in os.getenv(
+        "VELOCITY_IB_SCANNER_SCAN_CODES",
+        "MOST_ACTIVE,TOP_PERC_GAIN,HOT_BY_VOLUME",
+    ).split(",")
+    if c.strip()
+] or ["MOST_ACTIVE"]
 IB_SCANNER_LOCATION_CODE = (
     os.getenv("VELOCITY_IB_SCANNER_LOCATION_CODE", "STK.US.MAJOR").strip()
     or "STK.US.MAJOR"

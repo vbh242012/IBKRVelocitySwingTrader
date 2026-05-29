@@ -72,6 +72,10 @@ def _make_engine(ib_mock=None, state=None):
     engine._sector_cache       = {}
     engine._daily_scan_skip    = {}
     engine._last_audit_date    = None
+    engine._last_audit_at      = None
+    engine._last_post_open_audit_date = None
+    engine._last_premarket_readiness_date = None
+    engine._last_post_close_maintenance_date = None
     engine._missing_position_counts = {}
     return engine
 
@@ -346,7 +350,7 @@ class TestInitialize:
         assert mock_sync.call_count == 2
 
     def test_updates_prices_when_positions_exist(self):
-        """Prices are updated in both Phase 1 (snapshot) and Phase 2 (final)."""
+        """Prices are updated in both Phase 1 (immediate) and Phase 2 (final)."""
         ib = MagicMock()
         ib.accountSummary.return_value = [_nl_item('5000.0')]
         ib.positions.return_value = []
@@ -376,9 +380,10 @@ class TestInitialize:
              patch.object(engine, '_update_position_prices'),          \
              patch.object(engine, '_write_dashboard_data'):
             engine._initialize()
-        mock_audit.assert_called_once()
+        assert mock_audit.call_count == 2
 
     def test_immediate_audit_when_unprotected_positions_exist(self):
+        """Unprotected positions receive the immediate startup audit without waiting."""
         ib = MagicMock()
         ib.accountSummary.return_value = [_nl_item('5000.0')]
         ib.positions.return_value = []
@@ -392,7 +397,7 @@ class TestInitialize:
              patch.object(engine, '_write_dashboard_data'):
             engine._initialize()
 
-        assert mock_sync.call_count == 3
+        assert mock_sync.call_count == 2
         assert mock_audit.call_count == 2
 
     def test_skips_audit_when_no_positions(self):
@@ -1127,7 +1132,7 @@ class TestPreEntrySyncWait:
     _TZ_NY = pytz.timezone('US/Eastern')
 
     def test_sleeps_when_before_pre_entry_time(self):
-        """Engine started before 09:58 ET → ib.sleep called with correct duration."""
+        """Engine started before pre-entry sync time → ib.sleep called with correct duration."""
         from src.config import PRE_ENTRY_SYNC_TIME
         ib = MagicMock()
         engine = _make_engine(ib)
@@ -1142,11 +1147,11 @@ class TestPreEntrySyncWait:
 
         ib.sleep.assert_called_once()
         slept = ib.sleep.call_args[0][0]
-        expected = (h * 60 + m - 8 * 60) * 60   # (9h58m - 8h00m) in seconds
+        expected = (h * 60 + m - 8 * 60) * 60
         assert abs(slept - expected) < 2          # within 2 s of expected
 
     def test_no_sleep_when_at_or_past_pre_entry_time(self):
-        """Engine started at or after 09:58 ET → ib.sleep NOT called."""
+        """Engine started at or after pre-entry sync time → ib.sleep NOT called."""
         ib = MagicMock()
         engine = _make_engine(ib)
 
@@ -1160,7 +1165,7 @@ class TestPreEntrySyncWait:
         ib.sleep.assert_not_called()
 
     def test_no_sleep_on_intraday_restart(self):
-        """Intraday restart at 14:30 ET — already past 09:58, no sleep."""
+        """Intraday restart at 14:30 ET — already past pre-entry sync, no sleep."""
         ib = MagicMock()
         engine = _make_engine(ib)
 
@@ -1173,9 +1178,11 @@ class TestPreEntrySyncWait:
         ib.sleep.assert_not_called()
 
     def test_sleep_duration_covers_gap_to_pre_entry_time(self):
-        """Sleep duration from 09:00 ET to 09:58 ET should be exactly 58 min."""
+        """Sleep duration from 09:00 ET to PRE_ENTRY_SYNC_TIME should be exact."""
+        from src.config import PRE_ENTRY_SYNC_TIME
         ib = MagicMock()
         engine = _make_engine(ib)
+        h, m = PRE_ENTRY_SYNC_TIME
 
         fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, 9, 0, 0))
         with patch('src.engine.datetime') as mock_dt:
@@ -1184,4 +1191,5 @@ class TestPreEntrySyncWait:
             engine._wait_for_pre_entry_sync()
 
         slept = ib.sleep.call_args[0][0]
-        assert abs(slept - 58 * 60) < 2   # 58 minutes ± 2 s
+        expected = (h * 60 + m - 9 * 60) * 60
+        assert abs(slept - expected) < 2

@@ -33,6 +33,7 @@ from src.config import (
     LOG_FILE,
     MAX_POSITIONS_CAP,
     MIN_BUCKET_SIZE,
+    SETTLED_CASH_DEPLOYMENT_PCT,
     VIX_THRESHOLD,
     HOLD_TRADING_BARS,
     PROFIT_MIN_THRESHOLD,
@@ -201,14 +202,19 @@ def get_state():
         if equity >= MIN_BUCKET_SIZE else 0
     )
     capacity_slots = max(0, max_positions - len(positions))
-    cash_slots = int(settled_cash / MIN_BUCKET_SIZE) if settled_cash >= MIN_BUCKET_SIZE else 0
+    deployable_cash = settled_cash * min(max(float(SETTLED_CASH_DEPLOYMENT_PCT), 0.0), 1.0)
+    cash_slots = (
+        int(deployable_cash / MIN_BUCKET_SIZE)
+        if deployable_cash >= MIN_BUCKET_SIZE else 0
+    )
     entry_slots = min(capacity_slots, cash_slots)
-    bucket_size = round(settled_cash / entry_slots, 2) if entry_slots > 0 else 0.0
+    bucket_size = round(deployable_cash / entry_slots, 2) if entry_slots > 0 else 0.0
 
     return JSONResponse({
         "equity":            equity,
         "mkt_value":         round(position_value, 2),
         "cash":              settled_cash,
+        "deployable_cash":   round(deployable_cash, 2),
         "allocation_pct":    round((position_value / equity * 100) if equity else 0, 1),
         "bucket_size":       bucket_size,
         "position_count":    len(positions),
@@ -560,7 +566,7 @@ footer a{color:var(--dim);text-decoration:none;}
 
 <!-- EQUITY CURVE -->
 <div class="panel">
-  <div class="ptitle chart-title"><span class="icon">📉</span> EQUITY CURVE &nbsp;—&nbsp; 60-DAY ROLLING</div>
+  <div class="ptitle chart-title"><span class="icon">📉</span> EQUITY CURVE &nbsp;—&nbsp; <span id="eq-window">60-DAY ROLLING</span></div>
   <div class="chart-wrap"><canvas id="eqChart"></canvas></div>
 </div>
 
@@ -784,9 +790,16 @@ async function refreshChart() {
     if (!r.ok) return;
     const hist = await r.json();
     if (!hist || hist.length === 0) return;
+    const dates = hist.map(e => new Date(e.ts));
+    const etDay = d => d.toLocaleDateString('en-CA', {timeZone:'America/New_York'});
+    const intraday = new Set(dates.map(etDay)).size <= 1;
+    const windowLabel = document.getElementById('eq-window');
+    if (windowLabel) windowLabel.textContent = intraday ? 'INTRADAY TODAY' : '60-DAY ROLLING';
     const labels = hist.map(e => {
       const d = new Date(e.ts);
-      return d.toLocaleDateString('en-US', {month:'short', day:'numeric', timeZone:'America/New_York'});
+      return intraday
+        ? d.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'America/New_York'})
+        : d.toLocaleDateString('en-US', {month:'short', day:'numeric', timeZone:'America/New_York'});
     });
     const data = hist.map(e => e.eq);
     const baseline = data[0];
@@ -816,7 +829,16 @@ async function refreshChart() {
         responsive: true,
         maintainAspectRatio: false,
         plugins: { legend: { display: false }, tooltip: {
-          callbacks: { label: c => ' $' + c.parsed.y.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) }
+          callbacks: {
+            title: items => {
+              const e = hist[items[0].dataIndex];
+              return new Date(e.ts).toLocaleString('en-US', {
+                month:'short', day:'numeric', hour:'2-digit', minute:'2-digit',
+                timeZone:'America/New_York'
+              }) + ' ET';
+            },
+            label: c => ' $' + c.parsed.y.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+          }
         }},
         scales: {
           x: { ticks: { color:'#4e6070', font:{size:10}, maxTicksLimit:10 }, grid:{ color:'#1c2d45' } },

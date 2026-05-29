@@ -81,3 +81,11 @@ def test_enabled_autostart_raises_when_launcher_exits(monkeypatch):
 
     with pytest.raises(IBGatewayStartupError, match="launcher exited"):
         ensure_ib_gateway_ready(_cfg(enabled=True, command="/bin/echo gateway"))
+
+
+def test_gateway_launcher_timestamp_is_eastern():
+    import src.ib_gateway as gw
+
+    stamp = gw._et_timestamp()
+
+    assert stamp.endswith((" EST", " EDT"))

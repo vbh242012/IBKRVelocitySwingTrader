@@ -78,6 +78,11 @@ case "${AUTO_RESTART}" in
   *) AUTO_RESTART=0 ;;
 esac
 
+et_now() {
+  # Keep supervisor stderr timestamps aligned with the trading engine logs.
+  TZ=America/New_York date '+%Y-%m-%dT%H:%M:%S%z %Z'
+}
+
 if [[ "${AUTO_RESTART}" == "0" ]]; then
   # Debug mode: replace the shell with Python so the terminal/process manager
   # observes the real trading process directly.
@@ -100,7 +105,7 @@ trap stop_child INT TERM
 
 while true; do
   if [[ -f "${DISABLE_RESTART_FILE}" ]]; then
-    echo "$(date -Is) auto-restart disabled by ${DISABLE_RESTART_FILE}; exiting." >&2
+    echo "$(et_now) auto-restart disabled by ${DISABLE_RESTART_FILE}; exiting." >&2
     exit 0
   fi
 
@@ -115,10 +120,10 @@ while true; do
   child_pid=""
 
   if [[ -f "${DISABLE_RESTART_FILE}" ]]; then
-    echo "$(date -Is) trader exited with status ${status}; restart disabled." >&2
+    echo "$(et_now) trader exited with status ${status}; restart disabled." >&2
     exit "${status}"
   fi
 
-  echo "$(date -Is) trader exited with status ${status}; restarting in ${RESTART_DELAY_SEC}s." >&2
+  echo "$(et_now) trader exited with status ${status}; restarting in ${RESTART_DELAY_SEC}s." >&2
   sleep "${RESTART_DELAY_SEC}"
 done

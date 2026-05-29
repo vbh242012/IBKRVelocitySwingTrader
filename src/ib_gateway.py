@@ -14,7 +14,10 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
+
+import pytz
 
 from src.config import (
     IB_GATEWAY_AUTO_START,
@@ -27,6 +30,9 @@ from src.config import (
     IB_PORT,
     LOG_DIR,
 )
+
+
+_TZ_NY = pytz.timezone("US/Eastern")
 
 
 class IBGatewayStartupError(RuntimeError):
@@ -47,6 +53,10 @@ class IBGatewayAutoStartConfig:
 
 _gateway_process: Optional[subprocess.Popen] = None
 _atexit_registered = False
+
+
+def _et_timestamp() -> str:
+    return datetime.now(_TZ_NY).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -97,7 +107,7 @@ def _start_gateway_process(config: IBGatewayAutoStartConfig) -> subprocess.Popen
     os.makedirs(os.path.dirname(config.log_file) or ".", exist_ok=True)
     log_handle = open(config.log_file, "a", buffering=1)
     log_handle.write(
-        f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] starting IB Gateway launcher: "
+        f"\n[{_et_timestamp()}] starting IB Gateway launcher: "
         f"{_launcher_label(config.command)}\n"
     )
 

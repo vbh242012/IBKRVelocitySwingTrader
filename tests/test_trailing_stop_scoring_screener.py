@@ -114,6 +114,10 @@ def _make_engine(ib_mock):
     engine._sector_cache       = {}
     engine._daily_scan_skip    = {}
     engine._last_audit_date    = None
+    engine._last_audit_at      = None
+    engine._last_post_open_audit_date = None
+    engine._last_premarket_readiness_date = None
+    engine._last_post_close_maintenance_date = None
     engine._missing_position_counts = {}
     return engine
 
@@ -648,8 +652,8 @@ class TestGetInstitutionalScan:
         assert result == []
 
     def test_scanner_subscription_passed_to_ib(self):
-        """reqScannerData must be called with an object built by build_momentum_scanner."""
-        from src.scanner import build_momentum_scanner
+        """reqScannerData must be called once per configured scan code."""
+        from src.config import IB_SCANNER_SCAN_CODES
         from ib_async import ScannerSubscription
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -657,10 +661,45 @@ class TestGetInstitutionalScan:
 
         engine.get_institutional_scan()
 
-        assert ib.reqScannerData.called
-        arg = ib.reqScannerData.call_args[0][0]
-        assert isinstance(arg, ScannerSubscription)
-        assert arg.scanCode == 'MOST_ACTIVE'
+        assert ib.reqScannerData.call_count == len(IB_SCANNER_SCAN_CODES)
+        for call in ib.reqScannerData.call_args_list:
+            assert isinstance(call.args[0], ScannerSubscription)
+        used_codes = {call.args[0].scanCode for call in ib.reqScannerData.call_args_list}
+        assert used_codes == set(IB_SCANNER_SCAN_CODES)
+
+    def test_symbols_from_multiple_scanners_are_deduped(self):
+        """Symbols appearing in more than one scanner are only returned once."""
+        from src.config import IB_SCANNER_SCAN_CODES
+        n  = len(IB_SCANNER_SCAN_CODES)
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        # Each scanner returns AAPL (shared) plus one unique symbol
+        ib.reqScannerData.side_effect = [
+            [self._make_scan_item('AAPL'), self._make_scan_item(f'SYM{i}')]
+            for i in range(n)
+        ]
+
+        result = engine.get_institutional_scan()
+
+        assert result.count('AAPL') == 1
+        assert len(result) == n + 1  # AAPL + n unique SYMs
+
+    def test_failed_scanner_is_skipped_others_still_run(self):
+        """One failing scanner should not stop the remaining scanners."""
+        from src.config import IB_SCANNER_SCAN_CODES
+        n  = len(IB_SCANNER_SCAN_CODES)
+        if n < 2:
+            return  # test only meaningful with multiple scan codes
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        side_effects = [Exception("pacing")] + [
+            [self._make_scan_item('NVDA')] for _ in range(n - 1)
+        ]
+        ib.reqScannerData.side_effect = side_effects
+
+        result = engine.get_institutional_scan()
+
+        assert 'NVDA' in result
 
 
 class TestCashBucketBuffer:
@@ -1365,6 +1404,59 @@ class TestCandidateRanking:
         assert 'HIGH' not in engine.state, "Cancelled rank-1 must NOT be written to state"
         assert 'LOW'  in  engine.state,    "Rank-2 must be entered after rank-1 is cancelled"
 
+    def test_exit_checks_run_between_multiple_entries(self):
+        """
+        A broad scan can place more than one entry in the same cycle. After the
+        first fill, existing-position exit checks must run again before the next
+        order so software-managed exits are not starved by entry processing.
+        """
+        ctx_a = _ctx(price=101.0, orb=100.0, rsi=70.0, rsi_prev=62.0,
+                     ma50=95.0, ma200=85.0, rvol=5.0)
+        ctx_b = _ctx(price=104.0, orb=103.0, rsi=68.0, rsi_prev=61.0,
+                     ma50=96.0, ma200=84.0, rvol=4.0)
+
+        ib = self._make_ib_with_positions([], equity=1400.0, settled=5000.0)
+        engine = _make_engine(ib)
+        tz_ny = pytz.timezone('US/Eastern')
+        fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
+
+        buy_a = MagicMock()
+        buy_a.order.orderId = 11
+        buy_a.orderStatus.status = 'Filled'
+        buy_a.orderStatus.filled = 2.0
+        buy_a.orderStatus.avgFillPrice = 101.0
+        buy_a.fills = [_mock_fill(1.0)]
+
+        stop_a = MagicMock()
+        stop_a.order.orderId = 12
+        stop_a.orderStatus.status = 'Submitted'
+
+        buy_b = MagicMock()
+        buy_b.order.orderId = 13
+        buy_b.orderStatus.status = 'Filled'
+        buy_b.orderStatus.filled = 2.0
+        buy_b.orderStatus.avgFillPrice = 104.0
+        buy_b.fills = [_mock_fill(1.0)]
+
+        stop_b = MagicMock()
+        stop_b.order.orderId = 14
+        stop_b.orderStatus.status = 'Submitted'
+
+        ib.placeOrder.side_effect = [buy_a, stop_a, buy_b, stop_b]
+
+        with patch.object(engine, 'get_institutional_scan', return_value=['ALPHA', 'BETA']), \
+             patch.object(engine, 'get_technical_context', side_effect=lambda sym: {'ALPHA': ctx_a, 'BETA': ctx_b}[sym]), \
+             patch.object(engine, '_audit_stop_orders'), \
+             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, '_update_position_prices'), \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine.run_cycle()
+
+        assert {'ALPHA', 'BETA'} <= set(engine.state)
+        assert mock_exits.call_count == 2
+
 
 class TestDailyScanSkip:
     """
@@ -1435,6 +1527,37 @@ class TestDailyScanSkip:
 
         assert engine._daily_scan_skip == {}
 
+    def test_daily_bar_cache_clears_on_new_trading_day(self):
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._day_start_date = '2024-06-04'
+        engine._day_start_equity = 1400.0
+        engine._daily_scan_skip = {'LOWVOL': 'DolVol20d $99M < threshold $100M'}
+        engine._bar_cache = {'OLD': {'bars_daily': ['cached'], 'orb_high': 101.0}}
+
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, 10, 30))
+
+        with patch.object(engine, 'get_institutional_scan', return_value=[]):
+            self._run_cycle_at(engine, fake_now)
+
+        assert engine._daily_scan_skip == {}
+        assert engine._bar_cache == {}
+
+    def test_daily_bar_cache_is_kept_on_same_trading_day(self):
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._day_start_date = '2024-06-05'
+        engine._day_start_equity = 1400.0
+        cached = {'OLD': {'bars_daily': ['cached'], 'orb_high': 101.0}}
+        engine._bar_cache = dict(cached)
+
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, 10, 30))
+
+        with patch.object(engine, 'get_institutional_scan', return_value=[]):
+            self._run_cycle_at(engine, fake_now)
+
+        assert engine._bar_cache == cached
+
     def test_dynamic_orb_failure_is_not_cached(self):
         ib = _mock_ib()
         engine = _make_engine(ib)
@@ -1485,6 +1608,97 @@ class TestRuntimeProtectiveStopAudit:
     """Runtime cycles must not rely only on startup to protect open positions."""
 
     _TZ_NY = pytz.timezone('US/Eastern')
+
+    def test_post_open_audit_waits_until_checkpoint_time(self):
+        from src.config import POST_OPEN_AUDIT_TIME
+
+        engine = _make_engine(_mock_ib())
+        engine._last_audit_date = '2024-06-05'
+        engine.state = {
+            'AAPL': {
+                'price': 100.0,
+                'qty': 1.0,
+                'stop_loss': 94.0,
+                'stop_dist': 6.0,
+                'time': '2024-06-05T10:00:00-04:00',
+            }
+        }
+
+        h, m = POST_OPEN_AUDIT_TIME
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m - 1))
+
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch.object(engine, '_write_dashboard_data'), \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine._maybe_post_open_stop_audit()
+
+        mock_sync.assert_not_called()
+        mock_audit.assert_not_called()
+
+    def test_post_open_audit_runs_once_after_checkpoint_even_if_daily_audit_ran(self):
+        from src.config import POST_OPEN_AUDIT_TIME
+
+        engine = _make_engine(_mock_ib())
+        engine._last_audit_date = '2024-06-05'
+        engine.state = {
+            'AAPL': {
+                'price': 100.0,
+                'qty': 1.0,
+                'stop_loss': 94.0,
+                'stop_dist': 6.0,
+                'time': '2024-06-05T10:00:00-04:00',
+            }
+        }
+
+        h, m = POST_OPEN_AUDIT_TIME
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m))
+
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch.object(engine, '_update_position_prices') as mock_prices, \
+             patch.object(engine, '_write_dashboard_data') as mock_dashboard, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine._maybe_post_open_stop_audit()
+
+        mock_sync.assert_called_once()
+        mock_audit.assert_called_once()
+        mock_prices.assert_called_once()
+        mock_dashboard.assert_called_once_with(connected=True)
+        assert engine._last_post_open_audit_date == '2024-06-05'
+
+    def test_post_open_audit_skips_duplicate_same_day_checkpoint(self):
+        from src.config import POST_OPEN_AUDIT_TIME
+
+        engine = _make_engine(_mock_ib())
+        engine._last_post_open_audit_date = '2024-06-05'
+        engine.state = {
+            'AAPL': {
+                'price': 100.0,
+                'qty': 1.0,
+                'stop_loss': 94.0,
+                'stop_dist': 6.0,
+                'time': '2024-06-05T10:00:00-04:00',
+            }
+        }
+
+        h, m = POST_OPEN_AUDIT_TIME
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m + 5))
+
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch.object(engine, '_write_dashboard_data'), \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine._maybe_post_open_stop_audit()
+
+        mock_sync.assert_not_called()
+        mock_audit.assert_not_called()
 
     def test_unprotected_state_forces_audit_even_if_daily_audit_already_ran(self):
         engine = _make_engine(_mock_ib())

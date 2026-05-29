@@ -46,7 +46,7 @@ Entry rules (8096 production filter):
   7. ATR% cap            : ATR_CHAND / close ≤ ATR_PCT_MAX
   8. Gap cap             : open ≤ previous high × (1 + GAP_MAX_PCT)
   9. Spread              : not available in daily data — skipped
- 10. SPY regime          : SPY close > SMA50 > SMA200 (optional)
+ 10. SPY regime          : SPY close > SMA50 > SMA200 and SMA200 rising (optional)
  11. Correlation         : not practical in daily batch — skipped
  12. Sector clustering   : not practical in daily batch — skipped
 
@@ -182,7 +182,7 @@ class VelocityBacktest:
     min_price       : minimum close price filter
     min_volume      : minimum daily share volume filter
     min_dollar_vol  : minimum 20-day avg dollar volume
-    use_spy_filter  : if True, skip entries when SPY < SMA50 or SMA50 < SMA200
+    use_spy_filter  : if True, skip entries unless SPY close > SMA50 > SMA200 and SMA200 is rising
     use_vix_filter  : if True, skip new entries when VIX is missing or > VIX_THRESHOLD
     vix_delay_bars  : daily-bar proxy for delayed VIX data; 0=current bar,
                       1=prior available VIX bar (used for 15-minute delayed research)
@@ -786,11 +786,14 @@ class VelocityBacktest:
             sc    = spy_raw['close']
             ma50  = sc.rolling(50).mean()
             ma200 = sc.rolling(200).mean()
-            # Require both: price > MA50 AND MA50 > MA200 (golden cross).
+            # Require price > MA50 > MA200 and a rising SMA200. This blocks
+            # low-quality recovery rallies while the long-term trend is still
+            # falling.
             # This blocks entries during corrections AND recovery — the
             # recovery phase from a deep correction produces many false
             # breakouts before the trend is genuinely re-established.
-            self._spy_bull = (sc > ma50) & (ma50 > ma200)
+            ma200_slope = ma200 - ma200.shift(SMA200_SLOPE_LOOKBACK)
+            self._spy_bull = (sc > ma50) & (ma50 > ma200) & (ma200_slope > 0)
 
         if self._use_cache and self._regime_requirements_met():
             self._save_regime_cache()

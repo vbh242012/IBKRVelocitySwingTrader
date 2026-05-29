@@ -25,12 +25,14 @@ def silence_engine_logger():
 @pytest.fixture(autouse=True)
 def isolate_production_files(tmp_path):
     """
-    Redirect STATE_FILE, DASHBOARD_FILE, EQUITY_HIST_FILE, LOG_DIR and LOG_FILE
-    to a per-test temp directory so tests can never touch live data or log files.
+    Redirect STATE_FILE, DASHBOARD_FILE, EQUITY_HIST_FILE, READINESS_FILE,
+    LOG_DIR and LOG_FILE to a per-test temp directory so tests can never touch
+    live data or log files.
     """
     orig_state   = cfg.STATE_FILE
     orig_dash    = cfg.DASHBOARD_FILE
     orig_equity  = cfg.EQUITY_HIST_FILE
+    orig_ready   = cfg.READINESS_FILE
     orig_halt    = cfg.HALT_FILE
     orig_force   = cfg.FORCE_EXIT_FILE
     orig_log_dir = cfg.LOG_DIR
@@ -40,6 +42,7 @@ def isolate_production_files(tmp_path):
     cfg.STATE_FILE       = str(tmp_path / "engine_state.json")
     cfg.DASHBOARD_FILE   = str(tmp_path / "dashboard_data.json")
     cfg.EQUITY_HIST_FILE = str(tmp_path / "equity_history.json")
+    cfg.READINESS_FILE   = str(tmp_path / "readiness_snapshot.json")
     cfg.HALT_FILE        = str(tmp_path / "HALT_TRADING")
     cfg.FORCE_EXIT_FILE  = str(tmp_path / "FORCE_EXIT_ALL")
     cfg.LOG_DIR          = log_dir
@@ -48,6 +51,7 @@ def isolate_production_files(tmp_path):
     eng.STATE_FILE       = cfg.STATE_FILE
     eng.DASHBOARD_FILE   = cfg.DASHBOARD_FILE
     eng.EQUITY_HIST_FILE = cfg.EQUITY_HIST_FILE
+    eng.READINESS_FILE   = cfg.READINESS_FILE
     eng.HALT_FILE        = cfg.HALT_FILE
     eng.FORCE_EXIT_FILE  = cfg.FORCE_EXIT_FILE
     eng.LOG_DIR          = cfg.LOG_DIR
@@ -58,6 +62,7 @@ def isolate_production_files(tmp_path):
     cfg.STATE_FILE       = orig_state
     cfg.DASHBOARD_FILE   = orig_dash
     cfg.EQUITY_HIST_FILE = orig_equity
+    cfg.READINESS_FILE   = orig_ready
     cfg.HALT_FILE        = orig_halt
     cfg.FORCE_EXIT_FILE  = orig_force
     cfg.LOG_DIR          = orig_log_dir
@@ -66,6 +71,7 @@ def isolate_production_files(tmp_path):
     eng.STATE_FILE       = orig_state
     eng.DASHBOARD_FILE   = orig_dash
     eng.EQUITY_HIST_FILE = orig_equity
+    eng.READINESS_FILE   = orig_ready
     eng.HALT_FILE        = orig_halt
     eng.FORCE_EXIT_FILE  = orig_force
     eng.LOG_DIR          = orig_log_dir

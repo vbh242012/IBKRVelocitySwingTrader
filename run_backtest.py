@@ -206,7 +206,7 @@ def main():
     print(f"  Daily fill     : {'Conservative close-or-worse' if args.conservative_daily_entry else 'Legacy open/prev-high proxy'}")
     print(f"  Slippage      : 0.1% entry  |  Commission: ${args.commission_per_order*2:.2f}/round-trip")
     print(f"  Symbol cap    : {'FULL filtered universe' if args.max_symbols <= 0 else f'{args.max_symbols:,} symbols'}")
-    print(f"  SPY filter    : {'OFF' if args.no_spy_filter else 'ON (SPY > SMA50 > SMA200)'}")
+    print(f"  SPY filter    : {'OFF' if args.no_spy_filter else 'ON (SPY > SMA50 > SMA200 and SMA200 rising)'}")
     if args.vix_filter:
         vix_label = "ON (missing VIX or VIX > 35 blocks entries)"
         if args.vix_delay_bars > 0:

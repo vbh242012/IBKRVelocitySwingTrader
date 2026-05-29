@@ -709,6 +709,33 @@ class TestFullRunSynthetic:
         assert bt._spy_bull is not None
         assert bool(bt._spy_bull.dropna().iloc[-1])
 
+    def test_spy_regime_requires_rising_sma200(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(strategy_module, "_CACHE_DIR", str(tmp_path))
+        idx = pd.date_range("2022-01-01", periods=205, freq="B")
+        close = np.array([200.0] * 5 + [80.0] * 150 + [110.0] * 49 + [112.0])
+        fallback = pd.DataFrame({
+            "open": close,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": 1_000_000,
+        }, index=idx)
+
+        monkeypatch.setattr(strategy_module.yf, "download",
+                            lambda *args, **_kwargs: pd.DataFrame())
+        monkeypatch.setattr(VelocityBacktest, "_download_yahoo_chart_daily",
+                            staticmethod(lambda *args, **_kwargs: fallback))
+        monkeypatch.setattr(VelocityBacktest, "_download_stooq_daily",
+                            staticmethod(lambda *args, **_kwargs: pytest.fail("stooq should not be called")))
+
+        bt = VelocityBacktest(start="2023-01-01", end="2024-01-01",
+                              use_cache=False, use_spy_filter=True,
+                              use_vix_filter=False)
+        bt._download_regime_data()
+
+        assert bt._spy_bull is not None
+        assert bool(bt._spy_bull.iloc[-1]) is False
+
     def test_equity_curve_final_matches_closed_trade_pnl(self, monkeypatch):
         df = _make_df(n=300, seed=6, trend=0.3)
         bt = VelocityBacktest(start="2023-01-01", end="2024-01-01",
