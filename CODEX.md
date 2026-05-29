@@ -739,3 +739,73 @@
    - If a normal protective stop audit already ran after 09:35 ET in the same
      trading day, that audit counts as satisfying the post-open checkpoint so
      the engine does not duplicate broker calls in the same cycle.
+
+1. Live-session bug fixes, 2026-05-29
+
+   Four bugs identified from live log analysis and fixed in commit `28753bf`.
+
+   Stop-order race condition (cash account): entry used a bracket order
+   pattern (`BUY transmit=False` + child `TRAIL SELL` with `parentId`). IBKR
+   evaluates the child `SELL` before the parent `BUY` settles as a long
+   position in a cash account and rejects it as a short, leaving new positions
+   momentarily without a protective stop. Fix: replaced the bracket with a
+   sequential pattern. The `BUY` is transmitted standalone (`transmit=True`);
+   after `loopUntil()` confirms the fill, the engine places the `TRAIL SELL`
+   as a completely independent `GTC` order with no `parentId`. This matches
+   the proven standalone stop path used by `_audit_stop_orders()`. If the
+   stop is rejected or the pre-flight fails, `_audit_stop_orders()` is called
+   immediately.
+
+   Correlation check blocking all candidates after a new entry:
+   `_compute_book_correlation()` called
+   `pd.concat([cand_ret, book_ret], axis=1, join='inner')` on two Series with
+   independent integer row-indices from separate `reqHistoricalData` calls
+   (e.g., index 0–349 for a `DAILY_LOOKBACK` fetch vs. index 0–59 for a `'90
+   D'` on-demand fetch). The inner join on mismatched integer ranges produced
+   zero rows, triggering the `< 20` threshold and failing closed (returning
+   `1.0`), which silently blocked every candidate from entering against a
+   recently-bought book symbol. Fix: added `_daily_returns()` static method
+   that sets the `'date'` column as the DataFrame index before computing
+   returns so the inner join aligns by calendar date. Freshly-fetched book
+   bars are now also cached in `_bar_cache` so subsequent candidates in the
+   same scan cycle reuse them.
+
+   VIX live ticker always returning no price: `reqTickers()` for the VIX
+   index with delayed data type 3 returns a ticker where `marketPrice()` and
+   `close` are both empty. The `prevClose` and `last` fields, which delayed
+   subscriptions do populate, were not checked. Fix: added `last` and
+   `prevClose` field checks. Downgraded the ticker-miss log from `WARNING` to
+   `INFO` since this is expected behaviour with delayed subscriptions. The
+   historical fallback on error now returns the last cached VIX value instead
+   of `None` so entries are not unnecessarily blocked.
+
+   VIX timeout storm causing connection crashes: `_fetch_vix_price()` issued
+   a `reqHistoricalData` call for VIX on every cycle (~60 s). When IBKR's
+   HMDS feed was slow these calls piled up, each timing out and consuming a
+   `reqId` slot, eventually triggering Error 1100 and a
+   `ConnectionError: Socket disconnect` engine crash. Fix: added a 5-minute
+   TTL cache (`_last_vix_ts`). `_fetch_vix_price()` returns the cached value
+   immediately if it is fresher than 300 seconds. On historical-fallback
+   failure, the stale cached value is returned rather than `None`.
+
+   Pre-existing test fix: `test_run_cycle_skips_entries_when_account_summary_unavailable`
+   was already failing before these changes. `_maybe_run_off_hours_jobs()`
+   (added in the previous commit) calls `_write_dashboard_data()` during
+   post-close maintenance, adding a second dashboard write when the test runs
+   after market hours. Fix: patch `_maybe_run_off_hours_jobs` in the test and
+   change `assert_called_once_with` to `assert_called_with`.
+
+   Validation after these fixes:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -q -p no:cacheprovider
+   .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/config.py src/ib_gateway.py
+   ```
+
+   Results:
+
+   - Full suite: 365 passed.
+   - `py_compile`: passed.
+   - Engine restarted live at 11:21:51 ET; both PLTR and HPQ TRAIL SELL stops
+     confirmed on startup; no correlation errors or VIX warnings in the first
+     scan cycle.

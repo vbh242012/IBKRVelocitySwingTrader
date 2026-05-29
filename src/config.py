@@ -97,6 +97,7 @@ RISK_PER_TRADE_PCT   = 0.02    # risk 2% of current equity per trade (ATR-based 
 BREAK_EVEN_PCT       = 0.04    # once profit exceeds 4%, floor stop at entry — improves WR +4pp vs 3% threshold
 FRIDAY_CLOSE_HOUR    = 15      # ET hour after which Friday positions are evaluated for early close
 FRIDAY_MIN_PROFIT_PCT = 0.03   # Friday close: exit if profit < 3% to avoid carrying weekend gap risk
+EOD_EXIT_TIME        = (15, 45)  # ET — daily flat: liquidate any position not in profit before close
 
 # ── Bear-phase participation ──────────────────────────────────────────────────
 # Broad-market bear tape must not be treated like normal risk.  These settings

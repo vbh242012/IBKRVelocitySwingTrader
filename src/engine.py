@@ -54,6 +54,7 @@ from src.config import (
     BEAR_GAP_MAX_PCT,
     FRIDAY_CLOSE_HOUR,
     FRIDAY_MIN_PROFIT_PCT,
+    EOD_EXIT_TIME,
     MIN_CANDLES, VCP_RATIO, BREAKOUT_PCT, RVOL_MIN, SPREAD_MAX_PCT,
     SCAN_MIN_PRICE,
     CORR_MAX, MAX_SECTOR_COUNT, SMA200_SLOPE_LOOKBACK,
@@ -202,6 +203,8 @@ class VelocityEngine:
         # Last trading dates for non-trading operational jobs.
         self._last_premarket_readiness_date: Optional[str] = None
         self._last_post_close_maintenance_date: Optional[str] = None
+        # Daily EOD flat: track the date so the exit fires once per trading day.
+        self._last_eod_exit_date: Optional[str] = None
         # Avoid deleting state on one transient/partial IBKR positions snapshot.
         self._missing_position_counts: Dict[str, int] = {}
 
@@ -1994,9 +1997,16 @@ class VelocityEngine:
 
     # ── Exit management ────────────────────────────────────────────────────────
     def check_velocity_exits(self):
-        """Manages all forced exits: intraday hard stop, Friday close, and velocity exit."""
+        """Manages all forced exits: intraday hard stop, EOD flat, Friday close, velocity exit."""
         now_et          = datetime.now(_TZ_NY)
         is_friday_close = (now_et.weekday() == 4 and now_et.hour >= FRIDAY_CLOSE_HOUR)
+        today_str       = now_et.strftime('%Y-%m-%d')
+        hhmm            = (now_et.hour, now_et.minute)
+        is_eod_window   = (hhmm >= EOD_EXIT_TIME and now_et.weekday() < 5)
+        eod_exit_due    = (
+            is_eod_window
+            and self._last_eod_exit_date != today_str
+        )
         changed         = False
 
         for sym in list(self.state.keys()):
@@ -2057,7 +2067,24 @@ class VelocityEngine:
                     self.liquidate(sym)
                     continue
 
-            # ── 3. Velocity exit — counts Mon-Fri trading sessions, not weekend hours
+            # ── 3. EOD flat — liquidate any position not in profit at end of day
+            #
+            # Fires once per trading day after EOD_EXIT_TIME (default 15:45 ET),
+            # after the new-entry window closes (15:30 ET) and with enough time
+            # to fill before the 16:00 close. The intent is to not carry overnight
+            # risk on a position that hasn't paid off during its session.
+            if eod_exit_due and cur > 0:
+                eod_profit = (cur - entry_price) / entry_price
+                if eod_profit <= 0:
+                    logger.warning(
+                        f"EOD FLAT: {sym} not in profit at end of day "
+                        f"(profit={eod_profit*100:.2f}%, cur=${cur:.2f}, entry=${entry_price:.2f}) "
+                        f"— closing position."
+                    )
+                    self.liquidate(sym)
+                    continue
+
+            # ── 4. Velocity exit — counts Mon-Fri trading sessions, not weekend hours
             raw_time = data.get('time', '')
             if not raw_time:
                 logger.warning(f"EXIT: {sym} — missing entry timestamp; skipping velocity-exit check")
@@ -2083,6 +2110,11 @@ class VelocityEngine:
                 if profit < PROFIT_MIN_THRESHOLD:
                     logger.info(f"VELOCITY EXIT: {sym} stagnant. Freeing capital for T+1.")
                     self.liquidate(sym)
+
+        # Mark EOD exit as done for today so it doesn't re-fire on subsequent cycles.
+        if eod_exit_due:
+            self._last_eod_exit_date = today_str
+
         if changed:
             self.save_state()
 

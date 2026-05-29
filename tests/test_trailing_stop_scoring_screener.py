@@ -118,6 +118,7 @@ def _make_engine(ib_mock):
     engine._last_post_open_audit_date = None
     engine._last_premarket_readiness_date = None
     engine._last_post_close_maintenance_date = None
+    engine._last_eod_exit_date = None
     engine._missing_position_counts = {}
     return engine
 
@@ -3122,7 +3123,167 @@ class TestFridayClose:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 15. COMMISSION REPORT — async IB callback updates state
+# 15. EOD FLAT — liquidate unprofitable positions before end of trading day
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEodFlat:
+    """
+    After EOD_EXIT_TIME (default 15:45 ET) on any trading day, positions that
+    are not in profit (current_price <= entry_price) must be liquidated.
+    Positions in profit must be left alone. The rule fires at most once per
+    calendar trading day regardless of how many cycles run after 15:45.
+    """
+
+    def _state_entry(self, entry, cur, tz_ny):
+        return {
+            'price': entry, 'qty': 5.0, 'current_price': cur,
+            'stop_loss': entry * 0.93,
+            'volume': 0, 'score': 60,
+            'time': datetime.now(tz_ny).isoformat(),
+        }
+
+    def _make_position(self, symbol, qty):
+        pos = MagicMock()
+        pos.contract.symbol = symbol
+        pos.position        = qty
+        return pos
+
+    def test_eod_flat_triggers_when_at_loss(self):
+        """After EOD_EXIT_TIME a position with profit < 0 must be liquidated."""
+        from src.config import EOD_EXIT_TIME
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 98.0   # -2%, not in profit
+        engine.state = {'LOSS': self._state_entry(entry, cur, tz_ny)}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('LOSS', 5.0)]
+
+        # Wednesday at EOD_EXIT_TIME + 5 min
+        eod_time = tz_ny.localize(
+            datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
+        )
+        with patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = eod_time
+            mock_dt.fromisoformat    = datetime.fromisoformat
+            engine.check_velocity_exits()
+
+        assert engine.state['LOSS']['pending_exit'] is True, \
+            "EOD flat must liquidate position not in profit"
+
+    def test_eod_flat_triggers_when_exactly_at_entry(self):
+        """After EOD_EXIT_TIME a position with zero profit must also be liquidated."""
+        from src.config import EOD_EXIT_TIME
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 100.0  # exactly at entry, profit = 0
+        engine.state = {'FLAT': self._state_entry(entry, cur, tz_ny)}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('FLAT', 5.0)]
+
+        eod_time = tz_ny.localize(
+            datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
+        )
+        with patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = eod_time
+            mock_dt.fromisoformat    = datetime.fromisoformat
+            engine.check_velocity_exits()
+
+        assert engine.state['FLAT']['pending_exit'] is True, \
+            "EOD flat must liquidate zero-profit position"
+
+    def test_eod_flat_does_not_trigger_when_in_profit(self):
+        """A position with positive profit after EOD_EXIT_TIME must not be closed."""
+        from src.config import EOD_EXIT_TIME
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 101.0  # +1%, in profit
+        engine.state = {'GAIN': self._state_entry(entry, cur, tz_ny)}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+
+        eod_time = tz_ny.localize(
+            datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
+        )
+        with patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = eod_time
+            mock_dt.fromisoformat    = datetime.fromisoformat
+            engine.check_velocity_exits()
+
+        assert 'GAIN' in engine.state, "Profitable position must not be closed at EOD"
+        assert not ib.placeOrder.called
+
+    def test_eod_flat_does_not_trigger_before_eod_time(self):
+        """Before EOD_EXIT_TIME the EOD flat rule must be inactive."""
+        from src.config import EOD_EXIT_TIME
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 95.0   # -5%, would trigger if time were right
+        engine.state = {'EARLY': self._state_entry(entry, cur, tz_ny)}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+
+        # One minute before EOD_EXIT_TIME
+        before_eod = tz_ny.localize(
+            datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] - 1)
+        )
+        with patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = before_eod
+            mock_dt.fromisoformat    = datetime.fromisoformat
+            engine.check_velocity_exits()
+
+        assert 'EARLY' in engine.state, "EOD flat must not trigger before EOD_EXIT_TIME"
+        assert not ib.placeOrder.called
+
+    def test_eod_flat_fires_only_once_per_day(self):
+        """EOD flat must not re-liquidate on the second cycle of the same day."""
+        from src.config import EOD_EXIT_TIME
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 98.0
+        engine.state = {'ONCE': self._state_entry(entry, cur, tz_ny)}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('ONCE', 5.0)]
+
+        eod_time = tz_ny.localize(
+            datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
+        )
+        with patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = eod_time
+            mock_dt.fromisoformat    = datetime.fromisoformat
+            engine.check_velocity_exits()   # first call — fires
+
+        # Simulate position partially cleared, then second call same day
+        engine.state.setdefault('ONCE', self._state_entry(entry, cur, tz_ny))
+        engine.state['ONCE'].pop('pending_exit', None)   # reset for test
+        place_count_after_first = ib.placeOrder.call_count
+
+        with patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = eod_time
+            mock_dt.fromisoformat    = datetime.fromisoformat
+            engine.check_velocity_exits()   # second call same day — must not re-fire
+
+        assert ib.placeOrder.call_count == place_count_after_first, \
+            "EOD flat must not re-fire on the second cycle of the same trading day"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. COMMISSION REPORT — async IB callback updates state
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestCommissionReport:
