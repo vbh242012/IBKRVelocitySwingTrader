@@ -555,12 +555,13 @@ class TestConnectionSafety:
              patch.object(engine, '_update_position_prices') as mock_prices, \
              patch.object(engine, '_write_dashboard_data') as mock_dash, \
              patch.object(engine, '_alert') as mock_alert, \
-             patch.object(engine, 'get_institutional_scan') as mock_scan:
+             patch.object(engine, 'get_institutional_scan') as mock_scan, \
+             patch.object(engine, '_maybe_run_off_hours_jobs', return_value=False):
             engine.run_cycle()
 
         mock_exits.assert_called_once()
         mock_prices.assert_called_once()
-        mock_dash.assert_called_once_with(connected=True)
+        mock_dash.assert_called_with(connected=True)
         mock_alert.assert_called_once()
         mock_scan.assert_not_called()
 

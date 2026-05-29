@@ -173,6 +173,7 @@ class VelocityEngine:
         self._last_settled_cash: float           = 0.0
         self._equity_initialized: bool         = False   # True after first real IBKR fetch
         self._last_vix:         Optional[float] = None
+        self._last_vix_ts:      float           = 0.0   # time.time() of last successful VIX fetch
         self._last_scan_ts:     Optional[str]   = None
         self._next_scan_dt:     Optional[str]   = None   # ISO string for the web UI
 
@@ -309,23 +310,44 @@ class VelocityEngine:
                 self.ib.reqMarketDataType(restore_type)
 
     def _fetch_vix_price(self) -> Optional[float]:
-        """Return the current/delayed VIX value, with a robust historical fallback."""
+        """Return the current/delayed VIX value, with a robust historical fallback.
+
+        VIX is a regime filter — precision matters less than availability. Strategy:
+        1. If a valid VIX was fetched within the last 5 minutes, return it from cache
+           to avoid hammering IBKR with repeated reqHistoricalData calls (which can
+           cause timeout storms that destabilise the connection).
+        2. Try the live/delayed ticker, checking multiple price fields.
+        3. On ticker miss, fetch one day of historical data (suppressed to INFO since
+           delayed-data subscriptions routinely skip the VIX snapshot feed).
+        """
+        _VIX_TTL_SECS = 300  # 5 minutes
+
+        # Return cached value if still fresh enough.
+        if self._last_vix is not None and (time.time() - self._last_vix_ts) < _VIX_TTL_SECS:
+            return self._last_vix
+
         try:
             vix_tickers = self._request_vix_tickers()
         except Exception as e:
             logger.warning(f"VIX ticker request failed ({e}); trying historical fallback.")
             vix_tickers = []
+
         if vix_tickers:
             vix_ticker = vix_tickers[0]
+            # Check multiple fields: marketPrice() covers last/ask/bid; also try
+            # close and prevClose which are populated by delayed subscriptions.
             vix_price = (
                 self._coerce_positive_price(vix_ticker.marketPrice())
                 or self._coerce_positive_price(getattr(vix_ticker, 'close', None))
+                or self._coerce_positive_price(getattr(vix_ticker, 'last', None))
+                or self._coerce_positive_price(getattr(vix_ticker, 'prevClose', None))
             )
             if vix_price is not None:
+                self._last_vix_ts = time.time()
                 return vix_price
-            logger.warning("VIX ticker returned no usable price; trying historical fallback.")
+            logger.info("VIX ticker returned no usable price; using historical fallback.")
         else:
-            logger.warning("VIX ticker unavailable; trying historical fallback.")
+            logger.info("VIX ticker unavailable; using historical fallback.")
 
         try:
             bars = self.ib.reqHistoricalData(
@@ -333,16 +355,17 @@ class VelocityEngine:
             )
             if not bars:
                 logger.warning("VIX historical fallback returned no bars.")
-                return None
+                return self._last_vix  # reuse stale cache rather than blocking entries
             hist_price = self._coerce_positive_price(getattr(bars[-1], 'close', None))
             if hist_price is None:
                 logger.warning("VIX historical fallback returned an invalid close.")
-                return None
+                return self._last_vix
             logger.info(f"VIX fallback: using latest historical close {hist_price:.2f}")
+            self._last_vix_ts = time.time()
             return hist_price
         except Exception as e:
             logger.warning(f"VIX historical fallback failed: {e}")
-            return None
+            return self._last_vix  # reuse stale cache rather than blocking entries entirely
 
     def _ensure_connected(self) -> bool:
         if not self.ib.isConnected():
@@ -1672,6 +1695,27 @@ class VelocityEngine:
         self._sector_cache[symbol] = sector
         return sector
 
+    @staticmethod
+    def _daily_returns(df: pd.DataFrame) -> pd.Series:
+        """Return a date-indexed pct_change series (last 60 rows) for correlation.
+
+        ib_async util.df() gives an integer-indexed DataFrame with a 'date'
+        column.  Two DataFrames from separate reqHistoricalData calls have
+        independent integer indices, so pd.concat(join='inner') on the default
+        index produces zero overlap.  Setting the date column as the index
+        lets the inner-join align by calendar date instead.
+        """
+        s = df.copy()
+        if 'date' in s.columns:
+            s = s.set_index('date')
+        # Normalise to plain date so tz-aware and tz-naive indices align.
+        if hasattr(s.index, 'normalize'):
+            try:
+                s.index = s.index.normalize().date
+            except Exception:
+                pass
+        return s['close'].pct_change().dropna().tail(60)
+
     def _compute_book_correlation(self, sym: str, df_daily: pd.DataFrame) -> float:
         """Max absolute Pearson correlation of candidate vs current book.
 
@@ -1680,7 +1724,7 @@ class VelocityEngine:
         """
         if not self.state:
             return 0.0
-        cand_ret = df_daily['close'].pct_change().dropna().tail(60)
+        cand_ret = self._daily_returns(df_daily)
         max_corr  = 0.0
         for book_sym in self.state:
             if book_sym == sym:
@@ -1699,7 +1743,10 @@ class VelocityEngine:
                         )
                         return 1.0
                     book_df = util.df(bars)
-                book_ret = book_df['close'].pct_change().dropna().tail(60)
+                    # Cache the freshly fetched bars so subsequent candidates in this
+                    # scan cycle don't re-fetch and get a mismatched integer index.
+                    self._bar_cache.setdefault(book_sym, {})['bars_daily'] = bars
+                book_ret = self._daily_returns(book_df)
                 aligned  = pd.concat([cand_ret, book_ret], axis=1, join='inner').dropna()
                 if len(aligned) < 20:
                     logger.warning(
@@ -2920,7 +2967,7 @@ class VelocityEngine:
                         buy_order.tif           = ENTRY_PARENT_TIF
                         buy_order.allOrNone     = ENTRY_ALL_OR_NONE
                         buy_order.goodAfterTime = gat_str
-                        buy_order.transmit      = False   # hold until child is attached
+                        buy_order.transmit      = True   # standalone BUY, stop attached after fill
 
                         if not self._preflight_order(ctx['contract'], buy_order, sym):
                             logger.warning(
@@ -2929,30 +2976,6 @@ class VelocityEngine:
                             continue
 
                         parent_trade = self.ib.placeOrder(ctx['contract'], buy_order)
-
-                        stop_order               = Order()
-                        stop_order.action        = 'SELL'
-                        stop_order.orderType     = 'TRAIL'
-                        stop_order.totalQuantity = qty
-                        stop_order.auxPrice      = chandelier_dist  # trail amount in $
-                        stop_order.parentId      = parent_trade.order.orderId
-                        stop_order.tif           = 'GTC'
-                        stop_order.goodAfterTime = gat_str
-                        stop_order.transmit      = True   # transmits both orders atomically
-
-                        if not self._preflight_order(ctx['contract'], stop_order, sym):
-                            logger.warning(
-                                f"SKIP {sym}: child TRAIL pre-flight rejected by IB — "
-                                f"cancelling untransmitted BUY parent"
-                            )
-                            try:
-                                self.ib.cancelOrder(parent_trade.order)
-                            except Exception:
-                                pass
-                            continue
-
-                        stop_trade = self.ib.placeOrder(ctx['contract'], stop_order)
-                        trades = [parent_trade, stop_trade]
 
                         # Wait until IB confirms a terminal state (Filled / Cancelled /
                         # ApiCancelled / Inactive), up to 30 s.  loopUntil() returns
@@ -2973,7 +2996,7 @@ class VelocityEngine:
                             self._alert(
                                 "ERROR",
                                 f"PARTIAL FILL: {sym} filled={filled_qty:g}/{qty:g} "
-                                f"status={status}. Cancelling bracket and rebuilding protection from IBKR state."
+                                f"status={status}. Rebuilding protection from IBKR state."
                             )
 
                         # Only an actual fill creates a position. Submitted or
@@ -2981,14 +3004,13 @@ class VelocityEngine:
                         if status != 'Filled' or filled_qty <= 0:
                             logger.warning(
                                 f"ORDER NOT FILLED: {sym} status={status} filled={filled_qty} "
-                                f"qty={qty} limit=${limit_price:.2f}. Cancelling all legs "
+                                f"qty={qty} limit=${limit_price:.2f}. Cancelling BUY "
                                 f"and trying next candidate."
                             )
-                            for t in trades:
-                                try:
-                                    self.ib.cancelOrder(t.order)
-                                except Exception:
-                                    pass
+                            try:
+                                self.ib.cancelOrder(parent_trade.order)
+                            except Exception:
+                                pass
                             self.ib.sleep(1)
                             # If IB reports a late partial fill during cancellation,
                             # reconcile it immediately and ensure a protective stop.
@@ -3022,24 +3044,54 @@ class VelocityEngine:
                             if cr and not np.isnan(cr.commission) and cr.commission > 0:
                                 self.state[sym]['commission'] = round(float(cr.commission), 4)
                         self.save_state()
-                        if abs(float(filled_qty) - float(qty)) > 1e-6:
+
+                        # Place the protective TRAIL stop as a standalone order AFTER
+                        # the position is confirmed in IBKR's books. Attaching it as a
+                        # bracket child (parentId) is rejected in cash accounts with
+                        # "Short stock positions can only be held in a margin account"
+                        # because the broker evaluates the child SELL before the parent
+                        # BUY settles as a long position.
+                        stop_order               = Order()
+                        stop_order.action        = 'SELL'
+                        stop_order.orderType     = 'TRAIL'
+                        stop_order.totalQuantity = filled_qty
+                        stop_order.auxPrice      = chandelier_dist
+                        stop_order.tif           = 'GTC'
+                        stop_order.goodAfterTime = self._stop_good_after_time()
+                        stop_order.transmit      = True
+
+                        stop_placed = False
+                        if self._preflight_order(
+                            ctx['contract'], stop_order, sym,
+                            allow_protective_sell_fail_open=True,
+                        ):
+                            stop_trade = self.ib.placeOrder(ctx['contract'], stop_order)
+                            self.ib.sleep(2)   # let IB propagate acceptance/rejection
+                            stop_status = getattr(stop_trade.orderStatus, 'status', '')
+                            if stop_status in _REJECTED_ORDER_STATUSES:
+                                logger.error(
+                                    f"STOP REJECTED: {sym} TRAIL status={stop_status}. "
+                                    "Running immediate stop audit."
+                                )
+                                self._audit_stop_orders()
+                            else:
+                                stop_placed = True
+                        else:
+                            logger.warning(
+                                f"STOP PREFLIGHT FAILED: {sym} — running audit to place protection."
+                            )
+                            self._audit_stop_orders()
+
+                        if stop_placed and abs(float(filled_qty) - float(qty)) > 1e-6:
                             logger.warning(
                                 f"PARTIAL FILL PROTECTION: {sym} filled={filled_qty:g}/{qty:g}; "
-                                "cancelling original child stop and rebuilding protection "
-                                "for the actual filled quantity."
+                                "cancelling stop and rebuilding for actual filled quantity."
                             )
                             try:
                                 self.ib.cancelOrder(stop_order)
                             except Exception as e:
-                                logger.warning(f"PARTIAL FILL {sym}: child stop cancel failed: {e}")
+                                logger.warning(f"PARTIAL FILL {sym}: stop cancel failed: {e}")
                             self.ib.sleep(1)
-                            self._audit_stop_orders()
-                        stop_status = getattr(stop_trade.orderStatus, 'status', '')
-                        if stop_status in _REJECTED_ORDER_STATUSES:
-                            logger.error(
-                                f"STOP REJECTED: {sym} child TRAIL status={stop_status}. "
-                                "Running immediate stop audit."
-                            )
                             self._audit_stop_orders()
 
                         actual_order_cost = round(float(filled_qty) * float(fill_price), 2)

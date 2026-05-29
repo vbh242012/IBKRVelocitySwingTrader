@@ -310,11 +310,13 @@ class TestBracketOrderMath:
         buy_order = ib.placeOrder.call_args_list[0][0][1]
         assert buy_order.goodAfterTime == ''
 
-    def test_buy_order_transmit_is_false(self):
+    def test_buy_order_transmit_is_true(self):
+        # BUY is now transmitted immediately (standalone); TRAIL stop is placed
+        # after the fill is confirmed to avoid cash-account "short sell" rejections.
         ib, engine, ctx = self._setup()
         _run_entry_cycle(ib, engine, ctx)
         buy_order = ib.placeOrder.call_args_list[0][0][1]
-        assert buy_order.transmit == False
+        assert buy_order.transmit == True
 
     def test_stop_order_type_is_trail(self):
         ib, engine, ctx = self._setup()
@@ -1381,10 +1383,15 @@ class TestCandidateRanking:
         filled.orderStatus.avgFillPrice  = 104.0
         filled.fills = [_mock_fill(1.0)]
 
-        # 2 placeOrder calls per entry: BUY + TRAIL stop
+        stop_mock = MagicMock()
+        stop_mock.orderStatus.status = 'Submitted'
+
+        # Sequential pattern: cancelled BUY → 1 call (no TRAIL placed on miss);
+        # filled BUY → 2nd call, then standalone TRAIL → 3rd call.
         ib.placeOrder.side_effect = [
-            cancelled, cancelled,  # HIGH — BUY + TRAIL (both cancelled)
-            filled,    filled,     # LOW  — BUY + TRAIL (both filled)
+            cancelled,   # HIGH — BUY cancelled; no TRAIL submitted
+            filled,      # LOW  — BUY filled
+            stop_mock,   # LOW  — standalone TRAIL placed after fill
         ]
 
         tz_ny    = pytz.timezone('US/Eastern')
