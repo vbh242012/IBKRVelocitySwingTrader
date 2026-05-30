@@ -809,3 +809,33 @@
    - Engine restarted live at 11:21:51 ET; both PLTR and HPQ TRAIL SELL stops
      confirmed on startup; no correlation errors or VIX warnings in the first
      scan cycle.
+
+2. Off-hours maintenance validation follow-up, 2026-05-31
+
+   The off-hours readiness/reconciliation code was revalidated after the
+   environment date changed. A wall-clock-dependent test was corrected so it
+   explicitly exercises the active regular-session management path instead of
+   inheriting the actual weekend/off-hours clock.
+
+   Added direct test coverage proving:
+
+   - Premarket readiness writes `readiness_snapshot.json`, reconciles positions,
+     audits protective stops, refreshes prices, and does not call velocity
+     exits or scanner/new-entry logic.
+   - Post-close reconciliation writes the same readiness snapshot without
+     placing entries.
+   - Off-hours maintenance checkpoints run only once per trading date.
+   - Test helpers initialize `_last_vix_ts` and off-hours checkpoint dates so
+     tests match production engine state.
+
+   Validation:
+
+   ```bash
+   PYTHONPYCACHEPREFIX=/tmp/velocity-pycache VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/config.py src/ib_gateway.py tests/test_engine.py
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -q -p no:cacheprovider
+   ```
+
+   Results:
+
+   - Full suite: 373 passed.
+   - `py_compile`: passed.

@@ -38,6 +38,7 @@ def _mock_ib():
 
     # qualifyContracts returns a list with one item
     ib.qualifyContracts.return_value = [MagicMock()]
+    ib.reqAllOpenOrders.return_value = []
 
     # whatIfOrder pre-flight: empty warningText = IB accepts the order
     ib.whatIfOrder.return_value.warningText = ''
@@ -59,6 +60,7 @@ def _make_engine_patched(ib_mock):
             engine._last_settled_cash   = 0.0
             engine._equity_initialized  = False
             engine._last_vix            = None
+            engine._last_vix_ts         = 0.0
             engine._last_scan_ts        = None
             engine._next_scan_dt        = None
             # Attributes added after initial implementation
@@ -71,6 +73,10 @@ def _make_engine_patched(ib_mock):
             engine._sector_cache        = {}
             engine._daily_scan_skip     = {}
             engine._last_audit_date     = None
+            engine._last_audit_at       = None
+            engine._last_post_open_audit_date = None
+            engine._last_premarket_readiness_date = None
+            engine._last_post_close_maintenance_date = None
             engine._missing_position_counts = {}
             return engine
 
@@ -556,7 +562,8 @@ class TestConnectionSafety:
              patch.object(engine, '_write_dashboard_data') as mock_dash, \
              patch.object(engine, '_alert') as mock_alert, \
              patch.object(engine, 'get_institutional_scan') as mock_scan, \
-             patch.object(engine, '_maybe_run_off_hours_jobs', return_value=False):
+             patch.object(engine, '_maybe_run_off_hours_jobs', return_value=False), \
+             patch.object(engine, '_regular_management_active', return_value=True):
             engine.run_cycle()
 
         mock_exits.assert_called_once()
@@ -564,6 +571,114 @@ class TestConnectionSafety:
         mock_dash.assert_called_with(connected=True)
         mock_alert.assert_called_once()
         mock_scan.assert_not_called()
+
+
+class TestOffHoursMaintenance:
+    _TZ_NY = pytz.timezone('US/Eastern')
+
+    def test_premarket_readiness_collects_snapshot_without_exits_or_entries(self):
+        from src.config import PREMARKET_READINESS_TIME
+        from src.engine import READINESS_FILE
+
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+        engine.state = {
+            'AAPL': {
+                'fill_price': 100.0,
+                'price': 100.0,
+                'current_price': 101.0,
+                'qty': 2.0,
+                'stop_loss': 94.0,
+                'effective_stop': 95.0,
+                'stop_dist': 6.0,
+            }
+        }
+        h, m = PREMARKET_READINESS_TIME
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m, 0))
+
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch.object(engine, '_update_position_prices') as mock_prices, \
+             patch.object(engine, '_fetch_spy_trend', return_value=True), \
+             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, 'get_institutional_scan') as mock_scan, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine.run_cycle()
+
+        # One source-of-truth sync at cycle start, then one confirmation sync
+        # inside the off-hours maintenance checkpoint before stop audit.
+        assert mock_sync.call_count == 2
+        mock_audit.assert_called_once()
+        mock_prices.assert_called_once()
+        mock_exits.assert_not_called()
+        mock_scan.assert_not_called()
+        assert engine._last_premarket_readiness_date == '2024-06-05'
+        with open(READINESS_FILE, 'r') as f:
+            snapshot = json.load(f)
+        assert snapshot['checkpoint'] == 'premarket_readiness'
+        assert snapshot['positions'][0]['symbol'] == 'AAPL'
+        assert snapshot['account']['equity'] == 1400.0
+        assert snapshot['regime']['vix'] == 20.0
+
+    def test_post_close_reconciliation_runs_once_without_new_entries(self):
+        from src.config import POST_CLOSE_MAINTENANCE_TIME
+        from src.engine import READINESS_FILE
+
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+        engine.state = {
+            'MSFT': {
+                'fill_price': 300.0,
+                'price': 300.0,
+                'current_price': 301.0,
+                'qty': 1.0,
+                'stop_loss': 285.0,
+                'stop_dist': 15.0,
+            }
+        }
+        h, m = POST_CLOSE_MAINTENANCE_TIME
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m, 0))
+
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch.object(engine, '_update_position_prices'), \
+             patch.object(engine, '_fetch_spy_trend', return_value=False), \
+             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, 'get_institutional_scan') as mock_scan, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine.run_cycle()
+
+        # One source-of-truth sync at cycle start, then one confirmation sync
+        # inside the off-hours maintenance checkpoint before stop audit.
+        assert mock_sync.call_count == 2
+        mock_audit.assert_called_once()
+        mock_exits.assert_not_called()
+        mock_scan.assert_not_called()
+        assert engine._last_post_close_maintenance_date == '2024-06-05'
+        with open(READINESS_FILE, 'r') as f:
+            snapshot = json.load(f)
+        assert snapshot['checkpoint'] == 'post_close_reconciliation'
+        assert snapshot['positions'][0]['symbol'] == 'MSFT'
+
+    def test_off_hours_job_is_once_per_trading_date(self):
+        from src.config import PREMARKET_READINESS_TIME
+
+        engine = _make_engine_patched(_mock_ib())
+        engine._last_premarket_readiness_date = '2024-06-05'
+        h, m = PREMARKET_READINESS_TIME
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m + 5, 0))
+
+        with patch.object(engine, '_run_operational_maintenance') as mock_job, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            assert engine._maybe_run_off_hours_jobs() is False
+
+        mock_job.assert_not_called()
 
 
 # ── Logger handler guard ──────────────────────────────────────────────────────
