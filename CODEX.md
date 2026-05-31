@@ -239,7 +239,69 @@
    - Full-universe yearly backtest unchanged from the entry-price-floor
      validation, confirming no research-path regression.
 
-16. Optional IB Gateway / IBC auto-start integration
+16. Latest live-loop safety and health-report changes
+
+   The latest production-safety pass added operational observability and tighter
+   new-entry sequencing without changing the backtest strategy rules.
+
+   - Existing-position management now runs before entry-only gates such as VIX,
+     SPY regime, scanner calls, and available-slot checks. A bad VIX/scanner
+     path must not delay software exits for positions already held.
+   - VIX and scanner calls are skipped when there are no settled-cash entry
+     slots, and Friday new entries are blocked after `FRIDAY_ENTRY_CUTOFF_TIME`
+     while existing positions continue to be managed.
+   - Filled BUY orders now require protective TRAIL confirmation. If the stop is
+     not visible after the immediate audit/confirmation window, the position is
+     marked `protection_status=unconfirmed`, a CRITICAL alert is emitted, and no
+     further entries are attempted in that cycle.
+   - Stop audits mark protection state as confirmed or unconfirmed in
+     `engine_state.json` so restarts and dashboard review can see whether each
+     live position is protected.
+   - A compact daily operations report is written to
+     `daily_health_report.json`, including cycles, IB errors, reconnects, VIX
+     fallback counts, scanner counts, alert counts, protection status, equity,
+     settled cash, and current tracked positions.
+   - `_fetch_vix_price()` fails closed after the VIX cache TTL expires: if both
+     fresh ticker data and historical fallback fail, it returns `None` and new
+     entries are blocked. A stale VIX value may be reused only while it is still
+     inside the 5-minute TTL.
+
+   Validation after these changes:
+
+   ```bash
+   cd /home/harika/MyLearning/AI/IBKRVelocitySwingTrader
+   .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/config.py src/ib_gateway.py tests/conftest.py tests/test_engine.py tests/test_trailing_stop_scoring_screener.py
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -q -p no:cacheprovider
+   VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-31 --yearly
+   ```
+
+   Results:
+
+   - Syntax compile: passed.
+   - Full test suite: 376 passed in 11.13s.
+   - Full-universe yearly forward validation, 2020-01-01 through 2026-05-31:
+
+     ```text
+     2020 |  731 trades | +825.15% | Win 77.7% | PF 11.00 | MaxDD -4.62% | Sharpe  7.59
+     2021 | 1095 trades | +941.01% | Win 79.4% | PF  9.32 | MaxDD -3.97% | Sharpe  8.51
+     2022 |  358 trades |  +90.95% | Win 71.5% | PF  4.22 | MaxDD -4.88% | Sharpe  3.95
+     2023 |  416 trades | +348.26% | Win 81.7% | PF 11.20 | MaxDD -6.88% | Sharpe  6.20
+     2024 | 1047 trades | +999.47% | Win 81.1% | PF  9.51 | MaxDD -4.23% | Sharpe  9.25
+     2025 |  493 trades | +498.89% | Win 81.5% | PF 11.40 | MaxDD -7.37% | Sharpe  6.61
+     2026 |  173 trades | +315.84% | Win 84.4% | PF 21.75 | MaxDD -3.81% | Sharpe 10.97
+     ```
+
+   Follow-up validation after the VIX stale-cache fail-closed patch:
+
+   - Regression added:
+     `test_expired_stale_vix_cache_does_not_authorize_entries`.
+   - Focused VIX tests: 3 passed.
+   - Syntax compile with isolated pycache: passed.
+   - Full test suite: 377 passed in 7.08s.
+   - Cached bounded yearly backtest smoke, 2020-01-01 through 2026-05-22
+     with `--max-symbols 300 --vix-delay-bars 1`: matched the prior profile.
+
+17. Optional IB Gateway / IBC auto-start integration
 
    The trading app can optionally supervise an external IB Gateway or IBC
    launcher before connecting to IBKR. The application must not store broker
@@ -278,7 +340,7 @@
    - Full-universe yearly backtest unchanged from the latest validated strategy
      results.
 
-17. Runtime scan/audit safety pass
+18. Runtime scan/audit safety pass
 
    Preserve these live-engine safety changes:
 

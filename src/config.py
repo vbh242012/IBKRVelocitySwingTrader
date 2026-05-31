@@ -9,6 +9,7 @@ STATE_FILE       = os.path.join(BASE_DIR, "engine_state.json")
 DASHBOARD_FILE   = os.path.join(BASE_DIR, "dashboard_data.json")
 EQUITY_HIST_FILE = os.path.join(BASE_DIR, "equity_history.json")
 READINESS_FILE   = os.path.join(BASE_DIR, "readiness_snapshot.json")
+HEALTH_REPORT_FILE = os.path.join(BASE_DIR, "daily_health_report.json")
 HALT_FILE        = os.path.join(BASE_DIR, "HALT_TRADING")
 FORCE_EXIT_FILE  = os.path.join(BASE_DIR, "FORCE_EXIT_ALL")
 INSTANCE_LOCK_FILE = os.path.join(BASE_DIR, "velocity_engine.lock")
@@ -98,6 +99,7 @@ BREAK_EVEN_PCT       = 0.04    # once profit exceeds 4%, floor stop at entry —
 FRIDAY_CLOSE_HOUR    = 15      # ET hour after which Friday positions are evaluated for early close
 FRIDAY_MIN_PROFIT_PCT = 0.03   # Friday close: exit if profit < 3% to avoid carrying weekend gap risk
 EOD_EXIT_TIME        = (15, 45)  # ET — daily flat: liquidate any position not in profit before close
+FRIDAY_ENTRY_CUTOFF_TIME = (12, 0)  # ET — avoid opening new swing positions that will be force-reviewed hours later
 
 # ── Bear-phase participation ──────────────────────────────────────────────────
 # Broad-market bear tape must not be treated like normal risk.  These settings
@@ -130,6 +132,8 @@ POST_CLOSE_MAINTENANCE_TIME = (17, 0)  # ET — post-close reconciliation and re
 MARKET_CLOSE_TIME    = (16, 0)  # ET — stop software-managed market exits after regular session
 ENTRY_PARENT_TIF     = 'DAY'   # Entry BUYs must not survive overnight if cancellation fails
 ENTRY_ALL_OR_NONE    = True    # Avoid partial parent fills with full-size attached stop legs
+PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC = float(os.getenv("VELOCITY_PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC", "15"))
+PROTECTIVE_STOP_CONFIRM_POLL_SEC = float(os.getenv("VELOCITY_PROTECTIVE_STOP_CONFIRM_POLL_SEC", "2"))
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 RSI_PERIOD    = 14

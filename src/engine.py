@@ -18,7 +18,7 @@ from ib_async import IB, Index, Stock, MarketOrder, Order, util
 
 from src.config import (
     BASE_DIR, STATE_FILE, DASHBOARD_FILE, EQUITY_HIST_FILE, READINESS_FILE,
-    HALT_FILE, FORCE_EXIT_FILE,
+    HEALTH_REPORT_FILE, HALT_FILE, FORCE_EXIT_FILE,
     LOG_DIR, LOG_FILE,
     IB_HOST, IB_PORT, IB_CLIENT_ID, MARKET_DATA_TYPE, VIX_MARKET_DATA_TYPE,
     ACCOUNT_CURRENCY,
@@ -54,6 +54,7 @@ from src.config import (
     BEAR_GAP_MAX_PCT,
     FRIDAY_CLOSE_HOUR,
     FRIDAY_MIN_PROFIT_PCT,
+    FRIDAY_ENTRY_CUTOFF_TIME,
     EOD_EXIT_TIME,
     MIN_CANDLES, VCP_RATIO, BREAKOUT_PCT, RVOL_MIN, SPREAD_MAX_PCT,
     SCAN_MIN_PRICE,
@@ -61,6 +62,7 @@ from src.config import (
     ENTRY_REPRICE_MAX_AGE_SEC, ENTRY_MAX_PRICE_DRIFT_PCT,
     ENTRY_LIMIT_ASK_CUSHION_PCT, ENTRY_LIMIT_MIN_TICK, ENTRY_LIMIT_MAX_OVER_MARKET_PCT,
     CHANDELIER_PERIOD, CHANDELIER_MULT,
+    PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC, PROTECTIVE_STOP_CONFIRM_POLL_SEC,
 )
 from src.ib_gateway import ensure_ib_gateway_ready
 from src.indicators import apply_all
@@ -207,6 +209,11 @@ class VelocityEngine:
         self._last_eod_exit_date: Optional[str] = None
         # Avoid deleting state on one transient/partial IBKR positions snapshot.
         self._missing_position_counts: Dict[str, int] = {}
+        # Daily operational counters written to HEALTH_REPORT_FILE. These are
+        # deliberately lightweight so a long paper run can be reviewed from one
+        # compact JSON summary instead of only raw logs.
+        self._health_date = datetime.now(_TZ_NY).strftime('%Y-%m-%d')
+        self._health_metrics = self._new_health_metrics()
 
         self.connect()
 
@@ -250,12 +257,15 @@ class VelocityEngine:
         SILENT = {135, 162, 202, 2104, 2106, 2107, 2108, 2119, 2158, 10147, 10167}
         if errorCode in SILENT:
             return
+        self._metric_inc('ib_errors')
+        self._metric_inc('ib_error_codes', subkey=str(errorCode))
         if errorCode == 10349:
             logger.warning(f"IB preset override (10349) reqId={reqId}: {errorString}")
             return
         logger.warning(f"IB error {errorCode} reqId={reqId}: {errorString}")
 
     def _on_ib_disconnect(self):
+        self._metric_inc('ib_disconnects')
         self._alert("ERROR", "IB DISCONNECTED: connection lost — will attempt reconnect on next cycle.")
         self._write_dashboard_data(connected=False)
 
@@ -292,11 +302,13 @@ class VelocityEngine:
                 self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
                 self.ib.reqMarketDataType(MARKET_DATA_TYPE)
                 logger.info(f"RECONNECT: success on attempt {attempt}")
+                self._metric_inc('reconnect_successes')
                 self._write_dashboard_data(connected=True)
                 return True
             except Exception as e:
                 logger.warning(f"RECONNECT: attempt {attempt}/10 failed: {e}")
                 self.ib.sleep(5)
+        self._metric_inc('reconnect_failures')
         self._alert("CRITICAL", "RECONNECT: all 10 attempts failed — skipping trading cycles until restored")
         return False
 
@@ -322,6 +334,8 @@ class VelocityEngine:
         2. Try the live/delayed ticker, checking multiple price fields.
         3. On ticker miss, fetch one day of historical data (suppressed to INFO since
            delayed-data subscriptions routinely skip the VIX snapshot feed).
+        4. If both fresh paths fail, return None so entries fail closed. A stale
+           VIX reading must not authorize new risk.
         """
         _VIX_TTL_SECS = 300  # 5 minutes
 
@@ -333,6 +347,7 @@ class VelocityEngine:
             vix_tickers = self._request_vix_tickers()
         except Exception as e:
             logger.warning(f"VIX ticker request failed ({e}); trying historical fallback.")
+            self._metric_inc('vix_ticker_failures')
             vix_tickers = []
 
         if vix_tickers:
@@ -349,8 +364,10 @@ class VelocityEngine:
                 self._last_vix_ts = time.time()
                 return vix_price
             logger.info("VIX ticker returned no usable price; using historical fallback.")
+            self._metric_inc('vix_ticker_misses')
         else:
             logger.info("VIX ticker unavailable; using historical fallback.")
+            self._metric_inc('vix_ticker_misses')
 
         try:
             bars = self.ib.reqHistoricalData(
@@ -358,17 +375,21 @@ class VelocityEngine:
             )
             if not bars:
                 logger.warning("VIX historical fallback returned no bars.")
-                return self._last_vix  # reuse stale cache rather than blocking entries
+                self._metric_inc('vix_fallback_failures')
+                return None
             hist_price = self._coerce_positive_price(getattr(bars[-1], 'close', None))
             if hist_price is None:
                 logger.warning("VIX historical fallback returned an invalid close.")
-                return self._last_vix
+                self._metric_inc('vix_fallback_failures')
+                return None
             logger.info(f"VIX fallback: using latest historical close {hist_price:.2f}")
             self._last_vix_ts = time.time()
+            self._metric_inc('vix_fallback_successes')
             return hist_price
         except Exception as e:
             logger.warning(f"VIX historical fallback failed: {e}")
-            return self._last_vix  # reuse stale cache rather than blocking entries entirely
+            self._metric_inc('vix_fallback_failures')
+            return None
 
     def _ensure_connected(self) -> bool:
         if not self.ib.isConnected():
@@ -387,6 +408,7 @@ class VelocityEngine:
     def _alert(self, severity: str, message: str):
         """Send high-priority operational alerts without adding external deps."""
         severity = severity.upper()
+        self._metric_inc('alerts', subkey=severity.lower())
         log_fn = logger.error if severity in {'CRITICAL', 'ERROR'} else logger.warning
         log_fn(f"ALERT[{severity}]: {message}")
         if not ALERT_WEBHOOK_URL:
@@ -408,6 +430,125 @@ class VelocityEngine:
                 pass
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             logger.warning(f"ALERT: webhook delivery failed: {e}")
+
+    @staticmethod
+    def _new_health_metrics() -> dict:
+        return {
+            'cycles': 0,
+            'alerts': {},
+            'ib_errors': 0,
+            'ib_error_codes': {},
+            'ib_disconnects': 0,
+            'reconnect_successes': 0,
+            'reconnect_failures': 0,
+            'vix_ticker_misses': 0,
+            'vix_ticker_failures': 0,
+            'vix_fallback_successes': 0,
+            'vix_fallback_failures': 0,
+            'scanner_runs': 0,
+            'scanner_candidates': 0,
+            'scanner_skipped_no_slots': 0,
+            'scanner_skipped_friday_cutoff': 0,
+            'protective_stop_confirmed': 0,
+            'protective_stop_unconfirmed': 0,
+            'protective_stop_rebuilt': 0,
+            'protective_stop_rejected': 0,
+        }
+
+    def _ensure_health_metrics(self, now_ny: Optional[datetime] = None):
+        now_ny = now_ny or datetime.now(_TZ_NY)
+        today = now_ny.strftime('%Y-%m-%d')
+        if not hasattr(self, '_health_metrics') or not isinstance(self._health_metrics, dict):
+            self._health_metrics = self._new_health_metrics()
+        if not hasattr(self, '_health_date') or not self._health_date:
+            self._health_date = today
+        if self._health_date != today:
+            previous_date = self._health_date
+            self._write_health_report(
+                reason='date_rollover',
+                now_ny=now_ny,
+                report_date=previous_date,
+                roll=False,
+            )
+            self._health_date = today
+            self._health_metrics = self._new_health_metrics()
+
+    def _metric_inc(self, key: str, amount: int = 1, subkey: Optional[str] = None):
+        self._ensure_health_metrics()
+        if subkey is None:
+            current = self._health_metrics.get(key, 0)
+            try:
+                self._health_metrics[key] = int(current) + int(amount)
+            except (TypeError, ValueError):
+                self._health_metrics[key] = int(amount)
+            return
+        bucket = self._health_metrics.setdefault(key, {})
+        bucket[str(subkey)] = int(bucket.get(str(subkey), 0)) + int(amount)
+
+    def _write_health_report(
+        self,
+        reason: str = 'cycle',
+        now_ny: Optional[datetime] = None,
+        report_date: Optional[str] = None,
+        roll: bool = True,
+    ):
+        """Persist one compact daily operations snapshot for paper/live review."""
+        now_ny = now_ny or datetime.now(_TZ_NY)
+        if roll:
+            self._ensure_health_metrics(now_ny)
+        report_date = report_date or getattr(self, '_health_date', now_ny.strftime('%Y-%m-%d'))
+        try:
+            connected = bool(self.ib.isConnected())
+        except Exception:
+            connected = False
+        positions = []
+        unconfirmed = []
+        for sym, data in sorted((getattr(self, 'state', {}) or {}).items()):
+            status = data.get('protection_status', 'unknown')
+            if status != 'confirmed' and not data.get('pending_exit'):
+                unconfirmed.append(sym)
+            positions.append({
+                'symbol': sym,
+                'qty': float(data.get('qty', 0) or 0),
+                'entry_price': float(data.get('fill_price', data.get('price', 0)) or 0),
+                'current_price': float(data.get('current_price', data.get('price', 0)) or 0),
+                'protection_status': status,
+                'pending_exit': bool(data.get('pending_exit', False)),
+            })
+        payload = {
+            'date': report_date,
+            'generated_at': now_ny.isoformat(),
+            'reason': reason,
+            'trading_mode': TRADING_MODE,
+            'connected': connected,
+            'account': {
+                'equity': round(float(getattr(self, '_last_equity', 0.0) or 0.0), 2),
+                'settled_cash': round(float(getattr(self, '_last_settled_cash', 0.0) or 0.0), 2),
+            },
+            'regime': {
+                'vix': (
+                    round(float(self._last_vix), 2)
+                    if getattr(self, '_last_vix', None) is not None else None
+                ),
+                'vix_threshold': VIX_THRESHOLD,
+            },
+            'scanner': {
+                'last_scan': getattr(self, '_last_scan_ts', None),
+                'next_scan': getattr(self, '_next_scan_dt', None),
+            },
+            'risk': {
+                'unconfirmed_protection_symbols': unconfirmed,
+            },
+            'positions': positions,
+            'metrics': copy.deepcopy(getattr(self, '_health_metrics', {})),
+        }
+        tmp = HEALTH_REPORT_FILE + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(payload, f, indent=4, default=str)
+            os.replace(tmp, HEALTH_REPORT_FILE)
+        except OSError as e:
+            logger.warning(f"Could not write health report: {e}")
 
     def _validate_deployment_mode(self):
         """Fail closed when config points at live trading without explicit acknowledgement."""
@@ -649,6 +790,7 @@ class VelocityEngine:
                 json.dump(data, f, indent=4)
         except OSError as e:
             logger.warning(f"Could not write dashboard data: {e}")
+        self._write_health_report(reason='dashboard_update', now_ny=now)
 
         # Append equity snapshot to rolling history (kept for 60 days)
         # Skip until the first real IBKR accountSummary() reading arrives.
@@ -1119,6 +1261,119 @@ class VelocityEngine:
                 and sym in self.state
             )
 
+    def _mark_position_protection(
+        self,
+        sym: str,
+        status: str,
+        reason: str = '',
+        order_id: Optional[int] = None,
+    ):
+        if sym not in self.state:
+            return
+        self.state[sym]['protection_status'] = status
+        self.state[sym]['protection_checked_at'] = datetime.now(_TZ_NY).isoformat()
+        if reason:
+            self.state[sym]['protection_reason'] = reason
+        if status == 'confirmed':
+            self.state[sym]['protected_at'] = datetime.now(_TZ_NY).isoformat()
+            self.state[sym].pop('protection_reason', None)
+            self._metric_inc('protective_stop_confirmed')
+        elif status == 'unconfirmed':
+            self._metric_inc('protective_stop_unconfirmed')
+        try:
+            clean_order_id = int(order_id) if order_id is not None else None
+        except (TypeError, ValueError):
+            clean_order_id = None
+        if clean_order_id is not None and clean_order_id > 0:
+            self.state[sym]['stop_order_id'] = clean_order_id
+        self.save_state()
+
+    def _trade_is_matching_trail_sell(
+        self,
+        trade,
+        sym: str,
+        qty: float,
+        *,
+        expected_order=None,
+    ) -> bool:
+        """Return True when a trade/order can protect the full long quantity."""
+        order = expected_order if expected_order is not None else getattr(trade, 'order', None)
+        if order is None:
+            return False
+
+        status = getattr(getattr(trade, 'orderStatus', None), 'status', '')
+        if isinstance(status, str) and status in _REJECTED_ORDER_STATUSES:
+            return False
+
+        action = str(getattr(order, 'action', '') or '').upper()
+        order_type = str(getattr(order, 'orderType', '') or '').upper()
+        if action != 'SELL' or order_type != 'TRAIL':
+            return False
+
+        if expected_order is None:
+            contract = getattr(trade, 'contract', None)
+            trade_sym = str(getattr(contract, 'symbol', '') or '').upper()
+            if trade_sym and trade_sym != sym.upper():
+                return False
+
+        try:
+            order_qty = float(getattr(order, 'totalQuantity', 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        try:
+            expected_qty = float(qty)
+        except (TypeError, ValueError):
+            return False
+        if abs(order_qty - expected_qty) > 1e-6:
+            return False
+
+        pos_data = self.state.get(sym, {'qty': qty})
+        trail_ok, _, _, _ = self._trail_order_protection(order, pos_data)
+        return bool(trail_ok)
+
+    def _confirm_protective_stop(
+        self,
+        sym: str,
+        qty: float,
+        *,
+        known_trade=None,
+        expected_order=None,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Wait briefly until a valid TRAIL SELL is visible for a filled BUY.
+
+        A cash-account BUY is sent first, then the protective SELL is submitted
+        after the fill. This confirmation gate prevents the engine from adding
+        more exposure when the first position may still be unprotected.
+        """
+        timeout = (
+            PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC
+            if timeout is None else max(float(timeout), 0.0)
+        )
+        poll_s = max(float(PROTECTIVE_STOP_CONFIRM_POLL_SEC), 0.1)
+
+        if known_trade is not None and self._trade_is_matching_trail_sell(
+            known_trade,
+            sym,
+            qty,
+            expected_order=expected_order,
+        ):
+            return True
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                for trade in self._open_trades_for_audit():
+                    if self._trade_is_matching_trail_sell(trade, sym, qty):
+                        return True
+            except Exception as e:
+                logger.warning(f"STOP CONFIRM {sym}: open-order check failed: {e}")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.ib.sleep(min(poll_s, remaining))
+
     def _audit_stop_orders(self):
         """
         For every open position ensure exactly one chandelier TRAIL SELL order exists.
@@ -1259,8 +1514,11 @@ class VelocityEngine:
                 else:
                     self.state[sym]['stop_mode'] = 'dollar'
                     self.state[sym].pop('trailing_percent', None)
-                if stop_dist > 0 or stop_loss > 0:
-                    self.save_state()
+                self._mark_position_protection(
+                    sym,
+                    'confirmed',
+                    order_id=getattr(primary_trail.order, 'orderId', None),
+                )
                 logger.info(
                     f"AUDIT: {sym} — TRAIL SELL confirmed "
                     f"(id={primary_trail.order.orderId} "
@@ -1277,6 +1535,11 @@ class VelocityEngine:
                     contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
                 )
                 if not isinstance(bars, list) or len(bars) < CHANDELIER_PERIOD:
+                    self._mark_position_protection(
+                        sym,
+                        'unconfirmed',
+                        'insufficient_history_for_audit_stop',
+                    )
                     self._alert(
                         "CRITICAL",
                         f"AUDIT: {sym} — insufficient history "
@@ -1289,6 +1552,11 @@ class VelocityEngine:
                 df = apply_all(df)
                 atr_chandelier = float(df['ATR_CHAND'].iloc[-1])
                 if np.isnan(atr_chandelier) or atr_chandelier <= 0:
+                    self._mark_position_protection(
+                        sym,
+                        'unconfirmed',
+                        'invalid_atr_for_audit_stop',
+                    )
                     self._alert(
                         "CRITICAL",
                         f"AUDIT: {sym} — ATR_CHAND invalid ({atr_chandelier}), "
@@ -1315,6 +1583,11 @@ class VelocityEngine:
                     sym,
                     allow_protective_sell_fail_open=True,
                 ):
+                    self._mark_position_protection(
+                        sym,
+                        'unconfirmed',
+                        'audit_stop_preflight_rejected',
+                    )
                     self._alert(
                         "CRITICAL",
                         f"AUDIT: {sym} — TRAIL stop pre-flight rejected by IB; "
@@ -1328,6 +1601,13 @@ class VelocityEngine:
 
                 status = stop_trade.orderStatus.status
                 if status in _REJECTED_ORDER_STATUSES:
+                    self._mark_position_protection(
+                        sym,
+                        'unconfirmed',
+                        f'audit_stop_rejected_{status}',
+                        order_id=getattr(stop_trade.order, 'orderId', None),
+                    )
+                    self._metric_inc('protective_stop_rejected')
                     self._alert(
                         "CRITICAL",
                         f"AUDIT: {sym} — TRAIL stop rejected by IB "
@@ -1340,13 +1620,22 @@ class VelocityEngine:
                 self.state[sym]['stop_loss'] = round(
                     float(pos_data.get('price', 0)) - chandelier_dist, 2
                 )
-                self.save_state()
+                self._mark_position_protection(
+                    sym,
+                    'confirmed',
+                    order_id=getattr(stop_trade.order, 'orderId', None),
+                )
                 logger.info(
                     f"AUDIT: {sym} — TRAIL SELL live "
                     f"(qty={qty:.4f} dist=${chandelier_dist:.2f} "
                     f"status={status} id={stop_trade.order.orderId})"
                 )
             except Exception as e:
+                self._mark_position_protection(
+                    sym,
+                    'unconfirmed',
+                    f'audit_stop_exception_{type(e).__name__}',
+                )
                 self._alert("CRITICAL", f"AUDIT: {sym} — failed to place TRAIL stop: {e}")
 
     def _open_trades_for_audit(self) -> list:
@@ -1394,6 +1683,8 @@ class VelocityEngine:
         for data in self.state.values():
             if data.get('pending_exit'):
                 continue
+            if data.get('protection_status') == 'unconfirmed':
+                return True
             try:
                 qty = float(data.get('qty', 0) or 0)
                 stop_dist = float(data.get('stop_dist', 0) or 0)
@@ -2518,6 +2809,7 @@ class VelocityEngine:
 
     # ── Main cycle ─────────────────────────────────────────────────────────────
     def run_cycle(self):
+        self._metric_inc('cycles')
         if not hasattr(self, '_daily_scan_skip') or self._daily_scan_skip is None:
             self._daily_scan_skip = {}
 
@@ -2621,28 +2913,8 @@ class VelocityEngine:
             self._update_position_prices()
             return
 
-        # 3. Market Heat Check — qualify once, reuse across cycles
-        if not self._ensure_vix_contract():
-            logger.warning("VIX contract unavailable. Skipping entries as precaution.")
-            self.check_velocity_exits()
-            self._update_position_prices()
-            return
-        vix_price = self._fetch_vix_price()
-        if vix_price is None:
-            logger.warning("VIX price unavailable. Skipping entries as precaution.")
-            self._last_vix = None
-            self.check_velocity_exits()
-            self._update_position_prices()
-            return
-        self._last_vix = vix_price
-        if vix_price > VIX_THRESHOLD:
-            # Risk-Off: no new entries, but STILL manage and price existing positions.
-            logger.warning(f"VIX HIGH ({vix_price:.2f}). Risk Off — no new entries.")
-            self.check_velocity_exits()
-            self._update_position_prices()
-            return
-
-        # 4. Manage Existing
+        # 3. Manage Existing.  Entry-only gates such as VIX, SPY regime, scanner,
+        # and slot checks must not delay software exits for positions already held.
         self.check_velocity_exits()
 
         if self._operator_halt_active():
@@ -2667,6 +2939,15 @@ class VelocityEngine:
         if now_ny.weekday() < 5 and ENTRY_START <= (now_ny.hour, now_ny.minute) <= ENTRY_END:
             # On Fridays raise the liquidity bar to 2× to avoid holding over weekends.
             is_friday = (now_ny.weekday() == 4)
+            if is_friday and (now_ny.hour, now_ny.minute) >= FRIDAY_ENTRY_CUTOFF_TIME:
+                self._metric_inc('scanner_skipped_friday_cutoff')
+                logger.warning(
+                    f"FRIDAY ENTRY CUTOFF: no new entries after "
+                    f"{FRIDAY_ENTRY_CUTOFF_TIME[0]:02d}:{FRIDAY_ENTRY_CUTOFF_TIME[1]:02d} ET. "
+                    "Managing existing positions only."
+                )
+                self._update_position_prices()
+                return
             dol_vol_threshold = SCAN_MIN_DOLLAR_VOL * (VOL_MULT_FRIDAY if is_friday else 1.0)
 
             allocation = self._calc_entry_allocation(equity, settled, len(self.state))
@@ -2676,11 +2957,32 @@ class VelocityEngine:
             slots          = int(allocation['entry_slots'])
             bucket_size    = allocation['bucket_size']
             if slots <= 0:
+                self._metric_inc('scanner_skipped_no_slots')
                 logger.info(
                     f"SCAN: no entry slots available "
                     f"(capacity={capacity_slots}, settled_cash_slots={cash_slots}, max={max_pos})"
                 )
             else:
+                # Entry-only VIX gate. It intentionally runs after position
+                # management, manual halts, data-mode checks, Friday cutoff, and
+                # slot/cash checks so IBKR VIX/HMDS calls are not wasted when no
+                # new order can be placed anyway.
+                if not self._ensure_vix_contract():
+                    logger.warning("VIX contract unavailable. Skipping entries as precaution.")
+                    self._update_position_prices()
+                    return
+                vix_price = self._fetch_vix_price()
+                if vix_price is None:
+                    logger.warning("VIX price unavailable. Skipping entries as precaution.")
+                    self._last_vix = None
+                    self._update_position_prices()
+                    return
+                self._last_vix = vix_price
+                if vix_price > VIX_THRESHOLD:
+                    logger.warning(f"VIX HIGH ({vix_price:.2f}). Risk Off — no new entries.")
+                    self._update_position_prices()
+                    return
+
                 # Check SPY regime once per cycle — same answer for all candidates
                 spy_trend = self._fetch_spy_trend()
                 bear_phase = not spy_trend
@@ -2714,6 +3016,8 @@ class VelocityEngine:
                     risk_per_trade_pct = RISK_PER_TRADE_PCT
 
                 watchlist = self.get_institutional_scan()
+                self._metric_inc('scanner_runs')
+                self._metric_inc('scanner_candidates', len(watchlist))
                 logger.info(f"SCAN: {len(watchlist)} candidates → {watchlist}"
                             + (f" [FRIDAY: dolVol threshold ${dol_vol_threshold/1e6:.0f}M]" if is_friday else ""))
 
@@ -3067,6 +3371,8 @@ class VelocityEngine:
                             'volume':         ctx.get('volume', 0),
                             'score':          score,
                             'regime':         regime_label.lower(),
+                            'protection_status': 'pending',
+                            'protection_reason': 'awaiting_trail_stop_confirmation',
                         }
                         # Commission report sometimes lands synchronously with the fill.
                         # Capture it now if available; _on_commission_report handles it
@@ -3093,6 +3399,8 @@ class VelocityEngine:
                         stop_order.transmit      = True
 
                         stop_placed = False
+                        stop_trade = None
+                        audit_ran = False
                         if self._preflight_order(
                             ctx['contract'], stop_order, sym,
                             allow_protective_sell_fail_open=True,
@@ -3101,11 +3409,13 @@ class VelocityEngine:
                             self.ib.sleep(2)   # let IB propagate acceptance/rejection
                             stop_status = getattr(stop_trade.orderStatus, 'status', '')
                             if stop_status in _REJECTED_ORDER_STATUSES:
+                                self._metric_inc('protective_stop_rejected')
                                 logger.error(
                                     f"STOP REJECTED: {sym} TRAIL status={stop_status}. "
                                     "Running immediate stop audit."
                                 )
                                 self._audit_stop_orders()
+                                audit_ran = True
                             else:
                                 stop_placed = True
                         else:
@@ -3113,6 +3423,7 @@ class VelocityEngine:
                                 f"STOP PREFLIGHT FAILED: {sym} — running audit to place protection."
                             )
                             self._audit_stop_orders()
+                            audit_ran = True
 
                         if stop_placed and abs(float(filled_qty) - float(qty)) > 1e-6:
                             logger.warning(
@@ -3125,6 +3436,49 @@ class VelocityEngine:
                                 logger.warning(f"PARTIAL FILL {sym}: stop cancel failed: {e}")
                             self.ib.sleep(1)
                             self._audit_stop_orders()
+                            audit_ran = True
+
+                        protection_confirmed = False
+                        if stop_placed and not audit_ran:
+                            protection_confirmed = self._confirm_protective_stop(
+                                sym,
+                                filled_qty,
+                                known_trade=stop_trade,
+                                expected_order=stop_order,
+                            )
+                        if not protection_confirmed:
+                            if not audit_ran:
+                                logger.warning(
+                                    f"STOP CONFIRM: {sym} protective TRAIL not visible yet; "
+                                    "running immediate stop audit."
+                                )
+                                self._audit_stop_orders()
+                                audit_ran = True
+                            protection_confirmed = self._confirm_protective_stop(
+                                sym,
+                                filled_qty,
+                                timeout=PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC,
+                            )
+
+                        if protection_confirmed:
+                            self._mark_position_protection(
+                                sym,
+                                'confirmed',
+                                order_id=getattr(getattr(stop_trade, 'order', None), 'orderId', None)
+                                if stop_trade is not None else None,
+                            )
+                        else:
+                            self._mark_position_protection(
+                                sym,
+                                'unconfirmed',
+                                'protective_stop_confirmation_timeout',
+                            )
+                            self._alert(
+                                "CRITICAL",
+                                f"STOP UNCONFIRMED: {sym} BUY filled qty={filled_qty:g}, "
+                                "but no valid TRAIL SELL was confirmed after audit. "
+                                "No further entries will be attempted this cycle.",
+                            )
 
                         actual_order_cost = round(float(filled_qty) * float(fill_price), 2)
                         settled -= actual_order_cost
@@ -3147,8 +3501,11 @@ class VelocityEngine:
                             f"ChandelierStop=${round(fill_price-chandelier_dist,2):.2f} "
                             f"(dist=${chandelier_dist:.2f}, risk_dist=${risk_stop_dist:.2f}, "
                             f"risk={risk_per_trade_pct*100:.1f}%) | "
+                            f"Protection={'confirmed' if protection_confirmed else 'UNCONFIRMED'} | "
                             f"Settled remaining=${settled:.2f}"
                         )
+                        if not protection_confirmed:
+                            break
 
         # Refresh live prices for dashboard unrealized P&L
         self._update_position_prices()

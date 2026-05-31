@@ -1,10 +1,10 @@
 """
 Comprehensive validation of three critical VelocityEngine subsystems:
 
-  1. Chandelier trailing stop order construction (2-order structure: BUY + TRAIL)
+  1. Chandelier trailing stop order construction (standalone BUY + post-fill TRAIL)
      - chandelier_dist = ATR_CHAND × CHANDELIER_MULT (2.0)
      - goodAfterTime is omitted after 10:00 ET so IBKR cannot reject a past activation time
-     - BUY order: transmit=False; TRAIL stop: transmit=True, parentId set
+     - BUY order: transmit=True; TRAIL stop: standalone GTC transmit=True after fill
      - state.stop_loss  = fill - chandelier_dist
      - No take-profit order or state key
 
@@ -103,6 +103,7 @@ def _make_engine(ib_mock):
     engine._last_settled_cash  = 0.0
     engine._equity_initialized = False
     engine._last_vix           = None
+    engine._last_vix_ts        = 0.0
     engine._last_scan_ts       = None
     engine._next_scan_dt       = None
     engine._day_start_equity   = None
@@ -172,9 +173,28 @@ def _run_entry_cycle(ib, engine, ctx, sym='TSLA'):
     fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))   # Wed 10:30 — inside window
 
     fill_price = ctx['live_price']
+    from src.config import CHANDELIER_MULT, HARD_STOP_PCT, RISK_PER_TRADE_PCT
+
+    summary = {item.tag: float(item.value) for item in ib.accountSummary.return_value}
+    equity = summary.get('NetLiquidation', 1400.0)
+    settled = summary.get('SettledCash', 5000.0)
+    limit_price = engine._calc_entry_limit_price(ctx['live_price'], ctx['bid'], ctx['ask'])
+    allocation = engine._calc_entry_allocation(equity, settled, len(engine.state))
+    risk_dist = min(
+        round(ctx.get('atr_chandelier', ctx['atr']) * CHANDELIER_MULT, 2),
+        round(ctx['live_price'] * HARD_STOP_PCT, 2),
+    )
+    expected_qty = 0
+    if limit_price and risk_dist > 0:
+        expected_qty = min(
+            int(allocation['bucket_size'] / limit_price),
+            int((equity * RISK_PER_TRADE_PCT) / risk_dist),
+        )
+
     buy_trade  = MagicMock()
     buy_trade.order.orderId             = 1          # must be JSON-serializable
     buy_trade.orderStatus.status        = 'Filled'
+    buy_trade.orderStatus.filled        = float(expected_qty)
     buy_trade.orderStatus.avgFillPrice  = fill_price
     buy_trade.fills = [_mock_fill(1.0)]              # commission from IB report
 
@@ -248,6 +268,7 @@ class TestBracketOrderMath:
         ib, engine, ctx = self._setup()
         _run_entry_cycle(ib, engine, ctx)
         assert ib.placeOrder.call_count == 2, "Exactly 2 placeOrder calls: BUY + TRAIL stop"
+        assert engine.state['TSLA']['protection_status'] == 'confirmed'
 
     def test_buy_order_type_is_lmt(self):
         ib, engine, ctx = self._setup()
@@ -463,6 +484,43 @@ class TestBracketOrderMath:
         assert 'TSLA' in engine.state
         assert engine.state['TSLA']['price']      == pytest.approx(self.LIMIT, abs=0.01)
         assert engine.state['TSLA']['fill_price'] == pytest.approx(self.LIMIT, abs=0.01)
+
+    def test_unconfirmed_protective_stop_halts_additional_entries_this_cycle(self):
+        """After a filled BUY, no second entry is allowed until protection is confirmed."""
+        ib, engine, ctx = self._setup()
+
+        buy_trade = MagicMock()
+        buy_trade.order.orderId = 11
+        buy_trade.orderStatus.status = 'Filled'
+        buy_trade.orderStatus.filled = 4.0
+        buy_trade.orderStatus.avgFillPrice = self.ENTRY
+        buy_trade.fills = [_mock_fill(1.0)]
+
+        stop_trade = MagicMock()
+        stop_trade.orderStatus.status = 'Submitted'
+        ib.placeOrder.side_effect = [buy_trade, stop_trade]
+
+        tz_ny = pytz.timezone('US/Eastern')
+        fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
+
+        with patch.object(engine, 'get_institutional_scan', return_value=['TSLA', 'NVDA']), \
+             patch.object(engine, 'get_technical_context', return_value=ctx), \
+             patch.object(engine, '_confirm_protective_stop', return_value=False) as mock_confirm, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch.object(engine, '_alert') as mock_alert, \
+             patch.object(engine, '_update_position_prices'), \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine.run_cycle()
+
+        assert ib.placeOrder.call_count == 2
+        assert mock_confirm.call_count == 2
+        mock_audit.assert_called_once()
+        assert mock_alert.call_args.args[0] == "CRITICAL"
+        assert "STOP UNCONFIRMED" in mock_alert.call_args.args[1]
+        assert engine.state['TSLA']['protection_status'] == 'unconfirmed'
+        assert 'NVDA' not in engine.state
 
     def test_partial_fill_cancels_oversized_child_stop_and_audits(self):
         """A partial fill must not leave a full-quantity child TRAIL sell live."""
@@ -1030,6 +1088,7 @@ class TestCandidateRanking:
 
         with patch.object(engine, 'get_institutional_scan', return_value=symbols), \
              patch.object(engine, 'get_technical_context', side_effect=_ctx_for), \
+             patch.object(engine, '_confirm_protective_stop', return_value=True), \
              patch.object(engine, '_audit_stop_orders'), \
              patch.object(engine, 'check_velocity_exits'), \
              patch.object(engine, '_update_position_prices'), \
@@ -1401,6 +1460,7 @@ class TestCandidateRanking:
 
         with patch.object(engine, 'get_institutional_scan', return_value=['HIGH', 'LOW']), \
              patch.object(engine, 'get_technical_context', side_effect=lambda s: ctx_map.get(s)), \
+             patch.object(engine, '_confirm_protective_stop', return_value=True), \
              patch.object(engine, '_audit_stop_orders'), \
              patch.object(engine, 'check_velocity_exits'), \
              patch.object(engine, '_update_position_prices'), \
@@ -1454,6 +1514,7 @@ class TestCandidateRanking:
 
         with patch.object(engine, 'get_institutional_scan', return_value=['ALPHA', 'BETA']), \
              patch.object(engine, 'get_technical_context', side_effect=lambda sym: {'ALPHA': ctx_a, 'BETA': ctx_b}[sym]), \
+             patch.object(engine, '_confirm_protective_stop', return_value=True), \
              patch.object(engine, '_audit_stop_orders'), \
              patch.object(engine, 'check_velocity_exits') as mock_exits, \
              patch.object(engine, '_update_position_prices'), \
@@ -2297,6 +2358,24 @@ class TestEdgeCases:
         ib.reqHistoricalData.return_value = [hist_bar]
 
         assert engine._fetch_vix_price() == pytest.approx(21.75)
+
+    def test_expired_stale_vix_cache_does_not_authorize_entries(self):
+        """If fresh ticker and fallback both fail after TTL, VIX must fail closed."""
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._vix_contract = MagicMock()
+        engine._last_vix = 20.0
+        engine._last_vix_ts = 1.0
+
+        bad_ticker = MagicMock()
+        bad_ticker.marketPrice.return_value = float('nan')
+        bad_ticker.close = float('nan')
+        bad_ticker.last = float('nan')
+        bad_ticker.prevClose = float('nan')
+        ib.reqTickers.return_value = [bad_ticker]
+        ib.reqHistoricalData.return_value = []
+
+        assert engine._fetch_vix_price() is None
 
     # ── Strict comparison boundaries ─────────────────────────────────────────
 

@@ -299,8 +299,67 @@ class TestPositionLimit:
             mock_dt.fromisoformat    = datetime.fromisoformat  # keep real impl
 
             engine.run_cycle()
-            # All dynamic slots filled → scanner runs but get_technical_context never called
+            # All dynamic slots filled → no technical context is fetched.
             mock_ctx.assert_not_called()
+
+    def test_no_vix_or_scanner_call_when_cash_slots_are_zero(self):
+        """If no new entry can be placed, avoid VIX/HMDS and scanner API calls."""
+        ib = _mock_ib()
+        for item in ib.accountSummary.return_value:
+            if item.tag == 'SettledCash':
+                item.value = '0.0'
+        engine = _make_engine_patched(ib)
+
+        tz_ny = pytz.timezone('US/Eastern')
+        fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
+
+        with patch.object(engine, '_maybe_run_off_hours_jobs', return_value=False), \
+             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, '_ensure_vix_contract') as mock_vix_contract, \
+             patch.object(engine, '_fetch_vix_price') as mock_vix_price, \
+             patch.object(engine, 'get_institutional_scan') as mock_scan, \
+             patch.object(engine, '_update_position_prices'), \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+
+            engine.run_cycle()
+
+        mock_exits.assert_called_once()
+        mock_vix_contract.assert_not_called()
+        mock_vix_price.assert_not_called()
+        mock_scan.assert_not_called()
+
+    def test_friday_entry_cutoff_blocks_vix_and_scanner(self):
+        """Friday after the configured cutoff is position-management only."""
+        from src.config import FRIDAY_ENTRY_CUTOFF_TIME
+
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+
+        tz_ny = pytz.timezone('US/Eastern')
+        fake_now = tz_ny.localize(datetime(
+            2024, 6, 7,
+            FRIDAY_ENTRY_CUTOFF_TIME[0],
+            FRIDAY_ENTRY_CUTOFF_TIME[1] + 1,
+        ))
+
+        with patch.object(engine, '_maybe_run_off_hours_jobs', return_value=False), \
+             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, '_ensure_vix_contract') as mock_vix_contract, \
+             patch.object(engine, '_fetch_vix_price') as mock_vix_price, \
+             patch.object(engine, 'get_institutional_scan') as mock_scan, \
+             patch.object(engine, '_update_position_prices'), \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+
+            engine.run_cycle()
+
+        mock_exits.assert_called_once()
+        mock_vix_contract.assert_not_called()
+        mock_vix_price.assert_not_called()
+        mock_scan.assert_not_called()
 
 
 # ── State persistence ─────────────────────────────────────────────────────────
