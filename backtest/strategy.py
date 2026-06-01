@@ -90,14 +90,17 @@ from src.config import (
     CHANDELIER_PERIOD, CHANDELIER_MULT,
     RSI_MIN_DELTA, DAY_RANGE_LOCATION_MIN, INTRADAY_GAIN_MIN, ATR_PCT_MAX, HARD_STOP_PCT,
     SMA200_SLOPE_LOOKBACK,
+    SPREAD_MAX_PCT,
     RISK_PER_TRADE_PCT, BREAK_EVEN_PCT,
     BACKTEST_COMMISSION_PER_ORDER,
     BEAR_PHASE_TRADING_ENABLED, BEAR_PHASE_RISK_MULT,
     BEAR_PHASE_DOLLAR_VOL_MULT, BEAR_BACKTEST_RVOL_MIN,
     BEAR_VCP_RATIO, BEAR_BREAKOUT_PCT, BEAR_RSI_THRESHOLD,
     BEAR_RSI_MIN_DELTA, BEAR_GAP_MAX_PCT,
+    SCORING_MODEL,
 )
 from src.indicators import apply_all
+from src.scoring import score_candidate
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -221,6 +224,7 @@ class VelocityBacktest:
         max_symbols:          int   = BACKTEST_MAX_SYMBOLS,
         conservative_daily_entry: bool = False,
         use_cache:            bool  = True,
+        scoring_model:        str   = SCORING_MODEL,
     ):
         self.start                 = start
         self.end                   = end
@@ -245,6 +249,7 @@ class VelocityBacktest:
         self._max_symbols          = max(0, int(max_symbols or 0))
         self._conservative_daily_entry = bool(conservative_daily_entry)
         self._use_cache            = use_cache
+        self._scoring_model        = (scoring_model or "legacy").strip().lower()
 
         self._data:        Dict[str, pd.DataFrame] = {}
         self._vix_series:  Optional[pd.Series]     = None
@@ -839,11 +844,12 @@ class VelocityBacktest:
         today,
         rvol_min: Optional[float] = None,
         min_dollar_vol: Optional[float] = None,
+        gap_max_pct: float = GAP_MAX_PCT,
     ) -> List[Tuple[str, float]]:
         """
         Simulate the broad IB active-stock scanner with production pre-filters.
-        Returns list of (symbol, rvol) tuples, sorted by composite score
-        (% daily gain × RVOL) descending. scan_count <= 0 means every
+        Returns list of (symbol, rvol) tuples, sorted by the same shared
+        candidate scorer used by live trading.  scan_count <= 0 means every
         scanner-passed stock is returned.
         Fine signal rules are applied in _entry_signal.
         """
@@ -879,8 +885,34 @@ class VelocityBacktest:
 
             self._filter_stats['coarse_candidates'] += 1
 
-            pct   = (row['close'] - prev_row['close']) / prev_row['close']
-            score = pct * max(rvol, 1.0)   # composite: momentum × volume
+            # Daily bars are complete sessions, so full-day RVOL is already the
+            # daily equivalent of live time-normalized volume pace.
+            ctx = {
+                'ma50':           row.get('MA50'),
+                'ma200':          row.get('MA200'),
+                'rsi':            row.get('RSI'),
+                'rsi_prev':       prev_row.get('RSI'),
+                'rvol':           rvol,
+                'rvol_raw':       rvol,
+                'volume_pace':    rvol,
+                'spread_pct':     0.0,
+                'live_price':     row.get('close'),
+                'close':          row.get('close'),
+                'orb_high':       row.get('prev_high'),
+                'prev_high':      row.get('prev_high'),
+                'atr':            row.get('ATR'),
+                'ATR_CHAND':      row.get('ATR_CHAND'),
+                'atr_chandelier': row.get('ATR_CHAND', row.get('ATR')),
+                'dollar_vol_20d': row.get('avg_dollar_vol_20'),
+            }
+            score = score_candidate(
+                ctx,
+                model=self._scoring_model,
+                volume_floor=rvol_min if rvol_min is not None else self._rvol_min,
+                spread_max_pct=SPREAD_MAX_PCT,
+                atr_pct_max=ATR_PCT_MAX,
+                gap_max_pct=gap_max_pct,
+            )
             scored.append((sym, score, rvol))
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -1194,6 +1226,7 @@ class VelocityBacktest:
                     today,
                     rvol_min=regime_rvol_min,
                     min_dollar_vol=regime_min_dollar_vol,
+                    gap_max_pct=regime_gap_max_pct,
                 ):
                     allocation = self._calc_entry_allocation(
                         account_equity, settled_cash, len(open_positions)

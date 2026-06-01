@@ -940,3 +940,85 @@
    - Yearly full-universe backtest completed from 2020-01-01 through
      2026-05-01 using cached data; operational changes did not alter strategy
      rules.
+
+4. Shared scoring experiment, 2026-06-02
+
+   Added `src/scoring.py` so live trading and backtesting can use the same
+   candidate ranking functions. The live scanner now stores both raw intraday
+   RVOL and time-normalized volume pace; live ranking uses volume pace so early
+   regular-session candidates are not punished simply because only part of the
+   day has elapsed.
+
+   Added optional `VELOCITY_SCORING_MODEL=enhanced` / `--scoring-model enhanced`
+   research mode with:
+
+   - Softer RSI-over-75 treatment.
+   - Extension quality: rewards clean ORB breakouts and penalizes stretched
+     chase entries.
+   - ATR risk quality: prefers cleaner movers over wild ATR% names.
+   - Shared live/backtest scoring path.
+
+   Promotion decision:
+
+   - Do not promote enhanced scoring as production default.
+   - Keep `VELOCITY_SCORING_MODEL=legacy` for paper/live trading.
+   - Reason: enhanced was slightly better on the cached 282-symbol validation
+     set, but materially worse on the full cached 3,058-symbol universe.
+
+   Validation:
+
+   ```bash
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/scoring.py src/engine.py src/config.py backtest/strategy.py backtest/optimizer.py run_backtest.py
+   VELOCITY_BASE_DIR=/tmp/velocity_full_tests PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m pytest -q -p no:cacheprovider
+   PYTHONUNBUFFERED=1 VELOCITY_BASE_DIR=/tmp/velocity_bt_full_legacy PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 0 --scoring-model legacy
+   PYTHONUNBUFFERED=1 VELOCITY_BASE_DIR=/tmp/velocity_bt_full_enhanced PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 0 --scoring-model enhanced
+   ```
+
+   Results:
+
+   - Full suite: 390 passed.
+   - Full universe legacy: 10,459 trades, +1,314,669.32%, Win 78.9%, PF 11.47,
+     MaxDD -5.11%, Sharpe 8.42.
+   - Full universe enhanced: 10,896 trades, +508,686.95%, Win 78.5%, PF 8.48,
+     MaxDD -5.38%, Sharpe 8.41.
+   - Bounded 282-symbol validation favored enhanced slightly on aggregate, but
+     full-universe validation overrules it for production.
+
+5. Legacy v2 scoring promotion, 2026-06-02
+
+   Implemented a smaller, safer improvement to legacy scoring instead of
+   replacing the model with the broader enhanced scorer. `legacy_v2` keeps the
+   original legacy score dominant and adds bounded tie-breakers for:
+
+   - Volume pace follow-through.
+   - Dollar-liquidity depth.
+   - Clean ORB extension without chasing stretched names.
+   - ATR risk cleanliness.
+   - Mild high-RSI relief only when RSI is still rising.
+
+   Promotion decision:
+
+   - Promote `legacy_v2` as the default scoring model.
+   - `legacy` remains available for comparison and rollback.
+   - `enhanced` remains research-only and should not be used as production
+     default based on the full-universe result above.
+
+   Validation:
+
+   ```bash
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/scoring.py src/engine.py src/config.py backtest/strategy.py backtest/optimizer.py run_backtest.py
+   VELOCITY_BASE_DIR=/tmp/velocity_full_tests PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m pytest -q -p no:cacheprovider
+   PYTHONUNBUFFERED=1 VELOCITY_BASE_DIR=/tmp/velocity_bt_full_legacy_v2 PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 0 --scoring-model legacy_v2
+   ```
+
+   Results:
+
+   - Full suite: 394 passed.
+   - Full universe legacy baseline from the same cached 3,058-symbol universe:
+     10,459 trades, +1,314,669.32%, Win 78.9%, PF 11.47, MaxDD -5.11%,
+     Sharpe 8.42.
+   - Full universe legacy_v2: 10,623 trades, +1,320,010.65%, Win 79.0%,
+     PF 10.76, MaxDD -4.93%, Sharpe 8.46.
+   - Legacy v2 improved return, drawdown, Sharpe, win rate, and trade count.
+     Profit factor declined but remained very high; net risk-adjusted result
+     justified promotion.

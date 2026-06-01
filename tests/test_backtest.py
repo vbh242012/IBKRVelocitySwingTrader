@@ -29,8 +29,10 @@ from src.config import (
     DAY_RANGE_LOCATION_MIN,
     INTRADAY_GAIN_MIN,
     ATR_PCT_MAX,
+    GAP_MAX_PCT,
     PROFIT_MIN_THRESHOLD,
     BACKTEST_RVOL_MIN,
+    SCAN_MIN_DOLLAR_VOL,
 )
 
 
@@ -237,6 +239,76 @@ class TestEntrySignal:
         row['ATR_CHAND'] = ATR_PCT_MAX * row['close'] * 1.2
         assert not VelocityBacktest._entry_signal(
             row, prev_rsi=55, rvol=2.0, rvol_min=BACKTEST_RVOL_MIN)
+
+
+class TestDailyScanSharedScoring:
+    """Backtest scanner ranking must use the same shared scorer as live."""
+
+    @staticmethod
+    def _candidate_df(close: float, prev_high: float, atr: float) -> pd.DataFrame:
+        idx = pd.date_range("2025-01-02", periods=2, freq="B")
+        volume = SCAN_MIN_VOLUME + 1_000_000
+        return pd.DataFrame({
+            "open": [100.0, close],
+            "high": [101.0, close + 1.0],
+            "low": [99.0, close - 2.0],
+            "close": [100.0, close],
+            "volume": [volume, volume],
+            "avg_vol_20": [volume / 3.0, volume / 3.0],
+            "avg_dollar_vol_20": [300_000_000.0, 300_000_000.0],
+            "MA50": [106.0, 106.0],
+            "MA200": [100.0, 100.0],
+            "RSI": [60.0, 68.0],
+            "ATR": [2.0, atr],
+            "ATR_CHAND": [2.0, atr],
+            "prev_high": [99.0, prev_high],
+        }, index=idx)
+
+    def test_enhanced_daily_scan_prefers_clean_breakout_over_stretched_wild_name(self):
+        today = pd.Timestamp("2025-01-03")
+        bt = VelocityBacktest(
+            start="2025-01-02",
+            end="2025-01-06",
+            scan_count=1,
+            use_cache=False,
+            scoring_model="enhanced",
+        )
+        bt._data = {
+            "WILD": self._candidate_df(close=109.5, prev_high=100.0, atr=12.0),
+            "CLEAN": self._candidate_df(close=102.0, prev_high=100.0, atr=2.0),
+        }
+
+        selected = bt._daily_scan(
+            today,
+            rvol_min=BACKTEST_RVOL_MIN,
+            min_dollar_vol=SCAN_MIN_DOLLAR_VOL,
+            gap_max_pct=GAP_MAX_PCT,
+        )
+
+        assert selected == [("CLEAN", pytest.approx(3.0))]
+
+    def test_legacy_v2_daily_scan_prefers_clean_breakout_over_stretched_wild_name(self):
+        today = pd.Timestamp("2025-01-03")
+        bt = VelocityBacktest(
+            start="2025-01-02",
+            end="2025-01-06",
+            scan_count=1,
+            use_cache=False,
+            scoring_model="legacy_v2",
+        )
+        bt._data = {
+            "WILD": self._candidate_df(close=109.5, prev_high=100.0, atr=12.0),
+            "CLEAN": self._candidate_df(close=102.0, prev_high=100.0, atr=2.0),
+        }
+
+        selected = bt._daily_scan(
+            today,
+            rvol_min=BACKTEST_RVOL_MIN,
+            min_dollar_vol=SCAN_MIN_DOLLAR_VOL,
+            gap_max_pct=GAP_MAX_PCT,
+        )
+
+        assert selected == [("CLEAN", pytest.approx(3.0))]
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────

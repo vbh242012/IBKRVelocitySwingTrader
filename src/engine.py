@@ -58,7 +58,7 @@ from src.config import (
     FRIDAY_MIN_PROFIT_PCT,
     FRIDAY_ENTRY_CUTOFF_TIME,
     EOD_EXIT_TIME,
-    MIN_CANDLES, VCP_RATIO, BREAKOUT_PCT, RVOL_MIN, SPREAD_MAX_PCT,
+    MIN_CANDLES, VCP_RATIO, BREAKOUT_PCT, RVOL_MIN, SPREAD_MAX_PCT, SCORING_MODEL,
     SCAN_MIN_PRICE,
     CORR_MAX, MAX_SECTOR_COUNT, SMA200_SLOPE_LOOKBACK,
     ENTRY_REPRICE_MAX_AGE_SEC, ENTRY_MAX_PRICE_DRIFT_PCT,
@@ -69,6 +69,7 @@ from src.config import (
 from src.ib_gateway import ensure_ib_gateway_ready
 from src.indicators import apply_all
 from src.scanner import build_momentum_scanners
+from src.scoring import score_candidate, volume_pace_from_intraday
 
 os.makedirs(BASE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR,  exist_ok=True)
@@ -2475,7 +2476,8 @@ class VelocityEngine:
             spread_pct = float('inf')   # unavailable → fail-closed
 
         intraday_vol = float(ticker.volume) if not pd.isna(ticker.volume) else 0.0
-        rvol = intraday_vol / avg_20d_vol if avg_20d_vol > 0 else 0.0
+        raw_rvol = intraday_vol / avg_20d_vol if avg_20d_vol > 0 else 0.0
+        volume_pace = volume_pace_from_intraday(intraday_vol, avg_20d_vol, now_ny)
         intraday_gain = (live_price - day_open) / day_open
         try:
             day_high = float(getattr(ticker, 'high', np.nan))
@@ -2513,7 +2515,15 @@ class VelocityEngine:
             'bid':              bid,
             'ask':              ask,
             'spread_pct':       spread_pct,
-            'rvol':             rvol,
+            # Live ranking uses time-normalized volume pace.  Raw intraday
+            # RVOL stays available for diagnostics, but early-session ranking
+            # should not punish a stock just because only part of the day has
+            # elapsed.
+            'rvol':             volume_pace,
+            'rvol_raw':         raw_rvol,
+            'volume_pace':      volume_pace,
+            'intraday_volume':  intraday_vol,
+            'avg_20d_volume':   avg_20d_vol,
             'day_range_location': day_range_location,
             'intraday_gain':    intraday_gain,
             'volume':           int(df['volume'].iloc[-1]),
@@ -2815,40 +2825,22 @@ class VelocityEngine:
             self.ib.sleep(1)
         return cancelled
 
-    def _score_candidate(self, ctx: dict) -> float:
-        """
-        Rank a passing candidate 0-100.  Four components:
-          - Trend     (30 pts): MA50-MA200 separation, saturates at 6%
-          - RVOL      (25 pts): relative volume excess above 2.5× floor, saturates at 5×
-          - Momentum  (25 pts): RSI acceleration (0-15) + RSI level quality (0-10)
-          - Liquidity (20 pts): bid-ask spread tightness (0% spread = full 20 pts)
-        """
-        ma50       = ctx['ma50']
-        ma200      = ctx['ma200']
-        rsi        = ctx['rsi']
-        rsi_p      = ctx['rsi_prev']
-        rvol       = ctx.get('rvol', RVOL_MIN)
-        spread_pct = ctx.get('spread_pct', 0.0)
-
-        # 1. Trend strength (0-30): MA50-MA200 gap, saturates at 6% separation
-        sep   = (ma50 - ma200) / ma200 * 100 if ma200 else 0.0
-        trend = max(0.0, min(sep * 5.0, 30.0))
-
-        # 2. RVOL quality (0-25): excess above floor, saturates at 2× floor (5×)
-        rvol_score = min(max(rvol - RVOL_MIN, 0.0) / RVOL_MIN * 25.0, 25.0)
-
-        # 3. Momentum (0-25): RSI acceleration + level
-        rsi_delta = rsi - rsi_p
-        accel     = min(max(rsi_delta * 1.5, 0.0), 15.0)
-        if   rsi <= 70: level = 10.0
-        elif rsi <= 75: level = 5.0
-        else:           level = max(0.0, 10.0 - (rsi - 75) * 2.0)
-        momentum = accel + level
-
-        # 4. Liquidity (0-20): tighter spread earns more points
-        liquidity = max(0.0, (SPREAD_MAX_PCT - spread_pct) / SPREAD_MAX_PCT * 20.0)
-
-        return round(trend + rvol_score + momentum + liquidity, 2)
+    def _score_candidate(
+        self,
+        ctx: dict,
+        *,
+        volume_floor: float = RVOL_MIN,
+        gap_max_pct: float = GAP_MAX_PCT,
+    ) -> float:
+        """Rank a passing candidate with the shared live/backtest scorer."""
+        return score_candidate(
+            ctx,
+            model=SCORING_MODEL,
+            volume_floor=volume_floor,
+            spread_max_pct=SPREAD_MAX_PCT,
+            atr_pct_max=ATR_PCT_MAX,
+            gap_max_pct=gap_max_pct,
+        )
 
     def _entry_price_is_still_valid(
         self,
@@ -3338,14 +3330,15 @@ class VelocityEngine:
                         f"SCAN {sym} [{regime_label}]: price=${price:.2f} ORB=${orb_h:.2f} "
                         f"MA50=${ma50:.2f} MA200=${ma200:.2f} SMA200slope={sma200_slope:+.3f} "
                         f"ATR5/ATR20={atr_ratio:.2f}(vcp<{vcp_ratio}) "
-                        f"RVOL={rvol:.1f}(≥{rvol_min}) spread={spread_pct*100:.2f}%(≤{SPREAD_MAX_PCT*100:.1f}%) "
+                        f"VolPace={rvol:.1f}(≥{rvol_min}) rawRVOL={ctx.get('rvol_raw', rvol):.1f} "
+                        f"spread={spread_pct*100:.2f}%(≤{SPREAD_MAX_PCT*100:.1f}%) "
                         f"DayLoc={day_loc if day_loc is not None else float('nan'):.2f}(≥{DAY_RANGE_LOCATION_MIN:.2f}) "
                         f"OpenGain={intraday_gain if intraday_gain is not None else float('nan'):+.2%}(≥{INTRADAY_GAIN_MIN:.1%}) "
                         f"RSI={rsi:.1f}(Δ{rsi-rsi_p:+.1f}) "
                         f"ATR=${atr:.2f} ATR%={atr_chand/price if price > 0 else float('nan'):.2%}(≤{ATR_PCT_MAX:.0%}) "
                         f"DolVol20d=${dol_vol_20d/1e6:.0f}M(thr=${dol_vol_threshold/1e6:.0f}M) | "
                         f"InfoTrend={c_trend} InfoSlope={c_slope} InfoVCP={c_vcp} "
-                        f"InfoRVOL={c_rvol} Spread={c_spread} "
+                        f"InfoVolPace={c_rvol} Spread={c_spread} "
                         f"DayLoc={c_day_loc} OpenGain={c_open_gain} ATRPct={c_atr_pct} "
                         f"ORB={c_orb} Gap={c_gap} InfoRSI↑={c_rsi_rise} "
                         f"RSIΔ≥{rsi_min_delta}={c_rsi_delta} RSI>{rsi_threshold}={c_rsi_lvl} "
@@ -3396,12 +3389,17 @@ class VelocityEngine:
                         )
                         continue
 
-                    score = self._score_candidate(ctx)
+                    score = self._score_candidate(
+                        ctx,
+                        volume_floor=rvol_min,
+                        gap_max_pct=gap_max_pct,
+                    )
                     signals.append((score, sym, ctx))
                     logger.info(scan_detail)
                     logger.info(
                         f"SIGNAL {sym} [{regime_label}]: score={score:.1f}/100 | "
-                        f"RVOL={rvol:.1f}x trend_sep={(ma50-ma200)/ma200*100:.1f}% "
+                        f"VolPace={rvol:.1f}x rawRVOL={ctx.get('rvol_raw', rvol):.1f}x "
+                        f"trend_sep={(ma50-ma200)/ma200*100:.1f}% "
                         f"RSI_delta={rsi-rsi_p:.1f} spread={spread_pct*100:.2f}% "
                         f"DolVol20d=${dol_vol_20d/1e6:.0f}M"
                     )

@@ -31,6 +31,8 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, call
 import pytz
 
+from src.scoring import score_candidate, volume_pace_from_intraday
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
@@ -817,12 +819,11 @@ class TestScoringTrendStrength:
           rvol=RVOL_MIN → rvol_score=0; rsi delta=0 + rsi≤70 → momentum=10;
           spread=0 → liquidity=20  →  subtract 0+10+20=30 from total.
         """
-        engine = _make_engine(_mock_ib())
         ctx = _ctx(price=100.5, orb=100.0,
                    rsi=65.0, rsi_prev=65.0,
                    ma50=ma50, ma200=ma200,
                    rvol=2.5, spread_pct=0.0)
-        return engine._score_candidate(ctx) - 30
+        return score_candidate(ctx, model="legacy") - 30
 
     def test_6pct_separation_gives_30_pts(self):
         assert self._trend_score(106.0, 100.0) == pytest.approx(30.0, abs=0.1)
@@ -864,12 +865,11 @@ class TestScoringRVOL:
         Zero-out others: ma50=ma200 → trend=0; rsi delta=0 → accel=0;
         rsi≤70 → level=10; spread=0 → liquidity=20  →  subtract 0+10+20=30.
         """
-        engine = _make_engine(_mock_ib())
         ctx = _ctx(price=100.5, orb=100.0,
                    rsi=65.0, rsi_prev=65.0,
                    ma50=100.0, ma200=100.0,
                    rvol=rvol, spread_pct=0.0)
-        return engine._score_candidate(ctx) - 30
+        return score_candidate(ctx, model="legacy") - 30
 
     def test_rvol_at_floor_gives_zero(self):
         from src.config import RVOL_MIN
@@ -903,12 +903,11 @@ class TestScoringMomentum:
         Zero-out others: ma50=ma200 → trend=0; rvol=floor → rvol_score=0;
         spread=0 → liquidity=20  →  subtract 0+0+20=20.
         """
-        engine = _make_engine(_mock_ib())
         ctx = _ctx(price=100.5, orb=100.0,
                    rsi=rsi, rsi_prev=rsi_prev,
                    ma50=100.0, ma200=100.0,
                    rvol=2.5, spread_pct=0.0)
-        return engine._score_candidate(ctx) - 20
+        return score_candidate(ctx, model="legacy") - 20
 
     # ── RSI level tiers ───────────────────────────────────────────────────────
 
@@ -971,12 +970,11 @@ class TestScoringLiquidity:
         Zero-out others: ma50=ma200 → trend=0; rvol=floor → rvol_score=0;
         rsi delta=0 + rsi≤70 → momentum=10  →  subtract 0+0+10=10.
         """
-        engine = _make_engine(_mock_ib())
         ctx = _ctx(price=100.5, orb=100.0,
                    rsi=65.0, rsi_prev=65.0,
                    ma50=100.0, ma200=100.0,
                    rvol=2.5, spread_pct=spread_pct)
-        return engine._score_candidate(ctx) - 10
+        return score_candidate(ctx, model="legacy") - 10
 
     def test_zero_spread_gives_20_pts(self):
         assert self._liquidity_score(0.0) == pytest.approx(20.0, abs=0.1)
@@ -1005,39 +1003,116 @@ class TestScoringMaxAndTotal:
           spread=0            → liquidity=20
           Total = 30 + 25 + 25 + 20 = 100
         """
-        engine = _make_engine(_mock_ib())
         ctx = _ctx(price=101.0, orb=100.0,
                    rsi=65.0, rsi_prev=55.0,
                    ma50=106.0, ma200=100.0,
                    rvol=5.0, spread_pct=0.0)
-        assert engine._score_candidate(ctx) == pytest.approx(100.0, abs=0.1)
+        assert score_candidate(ctx, model="legacy") == pytest.approx(100.0, abs=0.1)
 
     def test_score_never_negative(self):
         """Even with all-bad inputs, score must be ≥ 0."""
-        engine = _make_engine(_mock_ib())
         ctx = _ctx(price=90.0, orb=100.0,
                    rsi=82.0, rsi_prev=85.0,
                    ma50=90.0, ma200=100.0,
                    rvol=1.0, spread_pct=0.01)
-        assert engine._score_candidate(ctx) >= 0.0
+        assert score_candidate(ctx, model="legacy") >= 0.0
 
     def test_score_never_exceeds_100(self):
         """No combination of inputs should exceed 100."""
-        engine = _make_engine(_mock_ib())
         ctx = _ctx(price=101.0, orb=100.0,
                    rsi=60.0, rsi_prev=20.0,
                    ma50=200.0, ma200=100.0,
                    rvol=10.0, spread_pct=0.0)
-        assert engine._score_candidate(ctx) <= 100.0
+        assert score_candidate(ctx, model="legacy") <= 100.0
 
     def test_score_is_rounded_to_2_decimals(self):
-        engine = _make_engine(_mock_ib())
         ctx = _ctx(price=101.0, orb=100.0,
                    rsi=65.0, rsi_prev=55.0,
                    ma50=106.0, ma200=100.0,
                    rvol=5.0, spread_pct=0.0)
-        score = engine._score_candidate(ctx)
+        score = score_candidate(ctx, model="legacy")
         assert score == round(score, 2)
+
+
+class TestSharedEnhancedScoring:
+    """Shared scorer checks for the optional enhanced ranking model."""
+
+    def test_live_volume_pace_normalizes_early_session_volume(self):
+        tz_ny = pytz.timezone("US/Eastern")
+        now = tz_ny.localize(datetime(2026, 6, 1, 10, 0))
+
+        # 100k shares in the first 30 of 390 regular-session minutes is
+        # running near a 1.3x full-day pace against a 1M-share average day.
+        assert volume_pace_from_intraday(100_000, 1_000_000, now) == pytest.approx(1.3)
+
+    def test_legacy_scorer_uses_volume_pace_when_available(self):
+        ctx = _ctx(rvol=1.0)
+        ctx["volume_pace"] = 5.0
+
+        with_pace = score_candidate(ctx, model="legacy")
+        raw_only = score_candidate({**ctx, "volume_pace": 1.0}, model="legacy")
+
+        assert with_pace > raw_only
+
+    def test_enhanced_score_softens_high_rsi_penalty(self):
+        base = _ctx(price=101.5, orb=100.0, rsi=80.0, rsi_prev=80.0,
+                    ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0)
+
+        assert score_candidate(base, model="enhanced") > score_candidate(base, model="legacy")
+
+    def test_enhanced_score_rewards_clean_breakout_not_stretched_chase(self):
+        clean = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
+                     ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0,
+                     atr_chandelier=2.0)
+        stretched = _ctx(price=109.0, orb=100.0, rsi=68.0, rsi_prev=62.0,
+                         ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0,
+                         atr_chandelier=2.0)
+
+        assert score_candidate(clean, model="enhanced") > score_candidate(stretched, model="enhanced")
+
+    def test_enhanced_score_prefers_cleaner_atr_risk(self):
+        clean = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
+                     ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0,
+                     atr_chandelier=2.0)
+        wild = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
+                    ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0,
+                    atr_chandelier=12.0)
+
+        assert score_candidate(clean, model="enhanced") > score_candidate(wild, model="enhanced")
+
+
+class TestLegacyV2Scoring:
+    """Legacy v2 keeps the legacy core and adds bounded quality tie-breakers."""
+
+    def test_legacy_v2_rewards_liquid_clean_breakout(self):
+        clean = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
+                     ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
+                     atr_chandelier=2.0, dollar_vol=900_000_000)
+        weak = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
+                    ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
+                    atr_chandelier=2.0, dollar_vol=110_000_000)
+
+        assert score_candidate(clean, model="legacy_v2") > score_candidate(weak, model="legacy_v2")
+
+    def test_legacy_v2_penalizes_stretched_or_wild_candidates(self):
+        clean = _ctx(price=102.0, orb=100.0, rsi=68.0, rsi_prev=62.0,
+                     ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
+                     atr_chandelier=2.0, dollar_vol=500_000_000)
+        stretched_wild = _ctx(price=111.0, orb=100.0, rsi=68.0, rsi_prev=62.0,
+                              ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
+                              atr_chandelier=12.0, dollar_vol=500_000_000)
+
+        assert score_candidate(clean, model="legacy_v2") > score_candidate(stretched_wild, model="legacy_v2")
+
+    def test_legacy_v2_softens_high_rsi_only_when_rising(self):
+        rising = _ctx(price=101.5, orb=100.0, rsi=80.0, rsi_prev=75.0,
+                      ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
+                      atr_chandelier=2.0, dollar_vol=500_000_000)
+        flat = _ctx(price=101.5, orb=100.0, rsi=80.0, rsi_prev=80.0,
+                    ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
+                    atr_chandelier=2.0, dollar_vol=500_000_000)
+
+        assert score_candidate(rising, model="legacy_v2") > score_candidate(flat, model="legacy_v2")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -45,6 +45,7 @@ from src.config import (
     BACKTEST_RVOL_MIN, BREAK_EVEN_PCT,
     CHANDELIER_MULT, CHANDELIER_PERIOD, PROFIT_MIN_THRESHOLD, HOLD_TRADING_BARS,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
+    SCORING_MODEL,
 )
 
 DEFAULT_HOLD_BARS = HOLD_TRADING_BARS
@@ -66,6 +67,8 @@ def parse_args():
                    help=f"Trading bars before velocity-exit check (default: live HOLD_TRADING_BARS={DEFAULT_HOLD_BARS})")
     p.add_argument("--rvol",            default=BACKTEST_RVOL_MIN,    type=float,
                    help=f"Legacy RVOL/ranking reference; 8096 does not gate entries on RVOL (default: {BACKTEST_RVOL_MIN}×)")
+    p.add_argument("--scoring-model", choices=["legacy", "legacy_v2", "enhanced"], default=SCORING_MODEL,
+                   help=f"Candidate ranking model used by live/backtest scoring (default: {SCORING_MODEL})")
     p.add_argument("--break-even-pct",  default=BREAK_EVEN_PCT,       type=float,
                    help=f"Break-even stop activation threshold (default: {BREAK_EVEN_PCT * 100:.0f}%%)")
     p.add_argument("--chandelier-mult", default=CHANDELIER_MULT,      type=float,
@@ -131,6 +134,7 @@ def _build_backtest(args, *, start: str, end: str, use_cache: bool) -> VelocityB
         use_spy_filter = not args.no_spy_filter,
         use_vix_filter = args.vix_filter,
         vix_delay_bars = args.vix_delay_bars,
+        scoring_model  = args.scoring_model,
         conservative_daily_entry = args.conservative_daily_entry,
         use_cache      = use_cache,
     )
@@ -198,6 +202,7 @@ def main():
     _bucket = _deployable_capital / _init_slots if _init_slots > 0 else 0.0
     print(f"  Max pos       : {MAX_POSITIONS_CAP} cap | Dynamic max=floor(equity/${MIN_BUCKET_SIZE:.0f}) | Initial slots={_init_slots}, bucket≈${_bucket:,.2f} using {SETTLED_CASH_DEPLOYMENT_PCT:.0%} deployable cash")
     print(f"  Entry rules   : 8096 momentum/risk screener")
+    print(f"  Scoring model : {args.scoring_model}")
     print(f"  RVOL ref      : {args.rvol:.1f}× (scanner ranking only; not an entry gate)")
     print(f"  Exit          : Chandelier (ATR{CHANDELIER_PERIOD}×{args.chandelier_mult}) + 7% hard stop + {args.break_even_pct:.0%} break-even")
     print(f"  Velocity exit : profit_min {PROFIT_MIN_THRESHOLD:.0%} after {args.hold_bars} bars")
@@ -239,6 +244,7 @@ def main():
             use_spy_filter = not args.no_spy_filter,
             use_vix_filter = args.vix_filter,
             use_cache      = not args.no_cache,
+            scoring_model  = args.scoring_model,
             progress       = True,
         )
         print(format_optimization_table(runs))

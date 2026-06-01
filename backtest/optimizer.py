@@ -95,6 +95,7 @@ def _prepare_base(
     use_vix_filter: bool,
     use_cache: bool,
     max_symbols: int | None = None,
+    scoring_model: str | None = None,
 ) -> VelocityBacktest:
     base = VelocityBacktest(
         start=start,
@@ -106,6 +107,7 @@ def _prepare_base(
         use_spy_filter=use_spy_filter,
         use_vix_filter=use_vix_filter,
         use_cache=use_cache,
+        scoring_model=scoring_model,
     )
     if use_cache and base._try_load_cache():
         base._download_regime_data()
@@ -188,6 +190,7 @@ def _run_with_params(
         bear_phase_trading=base._bear_phase_trading,
         commission_per_order=base._round_trip_cost / 2.0,
         use_cache=False,
+        scoring_model=base._scoring_model,
     )
     bt._data = _slice_data(base, end)
     bt._spy_bull = base._spy_bull
@@ -211,6 +214,7 @@ def run_optimization(
     use_vix_filter: bool = True,
     use_cache: bool = True,
     max_symbols: int | None = BACKTEST_MAX_SYMBOLS,
+    scoring_model: str | None = None,
     progress: bool = False,
 ) -> List[OptimizationRun]:
     base = _prepare_base(
@@ -223,6 +227,7 @@ def run_optimization(
         use_vix_filter=use_vix_filter,
         use_cache=use_cache,
         max_symbols=max_symbols,
+        scoring_model=scoring_model,
     )
     candidates = list(grid or default_grid())
     runs: List[OptimizationRun] = []

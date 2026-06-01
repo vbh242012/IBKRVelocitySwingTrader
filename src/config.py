@@ -212,6 +212,7 @@ BREAKOUT_PCT         = 0.10    # legacy optimizer parameter; 10-day-high proximi
 RVOL_MIN             = 2.5     # live scoring/ranking reference; not an active 8096 entry gate
 BACKTEST_RVOL_MIN    = 1.1     # legacy daily close RVOL proxy; scanner ranking only in 8096 backtests
 SPREAD_MAX_PCT       = 0.005   # maximum bid-ask spread (0.5%)
+SCORING_MODEL        = os.getenv("VELOCITY_SCORING_MODEL", "legacy_v2").strip().lower()
 CORR_MAX             = 0.7     # max daily-return correlation with any current position
 MAX_SECTOR_COUNT     = 2       # max simultaneous positions in the same sector
 SMA200_SLOPE_LOOKBACK   = 5     # days over which SMA200 slope is measured
