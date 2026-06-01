@@ -901,3 +901,42 @@
 
    - Full suite: 373 passed.
    - `py_compile`: passed.
+
+3. HMDS/VIX reliability hardening, 2026-06-01
+
+   Live session showed IBKR Historical Market Data Service instability:
+   repeated VIX fallback timeouts, SPY historical timeouts, `2105` HMDS
+   broken messages, and socket disconnects. Since SPY also timed out, this was
+   diagnosed as a broader IBKR HMDS/session issue rather than simply missing
+   VIX permissions.
+
+   Fixes implemented:
+
+   - Added SPY-then-VIX historical warmup after connect/reconnect. SPY failure
+     now identifies general HMDS failure; SPY success + VIX failure identifies
+     a VIX-specific data/entitlement problem.
+   - Added VIX failure cooldown so repeated HMDS failures do not trigger
+     historical requests every scan cycle. Fresh VIX cache is still allowed;
+     stale VIX still fails closed and blocks new entries.
+   - Added VIX data health fields to the health report: source, last success,
+     failure count, last failure, next retry, and historical data probe status.
+   - Added bounded historical request timeouts for warmup/fallback probes.
+   - Reworked real IB account-summary requests to cancel the low-level
+     `reqAccountSummary` subscription in `finally`, avoiding leaked summary
+     subscriptions after disconnects/timeouts.
+   - Treated socket disconnects during sleep as reconnectable events instead
+     of logging them as generic runtime crashes.
+
+   Validation:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity_full_tests PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m pytest -q -p no:cacheprovider
+   .venv/bin/python run_backtest.py --yearly --start 2020-01-01
+   ```
+
+   Results:
+
+   - Full suite: 384 passed.
+   - Yearly full-universe backtest completed from 2020-01-01 through
+     2026-05-01 using cached data; operational changes did not alter strategy
+     rules.

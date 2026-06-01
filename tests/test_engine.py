@@ -574,12 +574,14 @@ class TestConnectionSafety:
 
         with patch.object(engine, '_validate_deployment_mode'), \
              patch.object(engine, '_write_dashboard_data') as mock_dash, \
+             patch.object(engine, '_warmup_historical_data') as mock_warmup, \
              patch.object(eng_mod, 'ensure_ib_gateway_ready', return_value=True) as mock_ready:
             engine.connect()
 
         mock_ready.assert_called_once()
         ib.connect.assert_called_once()
         mock_dash.assert_called_once_with(connected=True)
+        mock_warmup.assert_called_once_with(reason="connect")
 
     def test_connect_fails_closed_when_gateway_unavailable(self):
         from src.engine import VelocityEngine
@@ -630,6 +632,42 @@ class TestConnectionSafety:
         mock_dash.assert_called_with(connected=True)
         mock_alert.assert_called_once()
         mock_scan.assert_not_called()
+
+
+class TestHistoricalDataWarmup:
+    def test_warmup_marks_general_hmds_unhealthy_when_spy_fails(self):
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+        ib.qualifyContracts.return_value = [MagicMock()]
+        ib.reqHistoricalData.return_value = []
+
+        assert engine._warmup_historical_data(reason="test") is False
+        assert engine._historical_data_health['SPY']['ok'] is False
+        assert ib.reqHistoricalData.call_count == 1
+
+    def test_warmup_marks_vix_specific_failure_after_spy_success(self):
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+        ib.qualifyContracts.side_effect = [[MagicMock()], [MagicMock()]]
+        ib.reqHistoricalData.side_effect = [[MagicMock(close=450.0)], []]
+
+        assert engine._warmup_historical_data(reason="test") is False
+        assert engine._historical_data_health['SPY']['ok'] is True
+        assert engine._historical_data_health['VIX']['ok'] is False
+        assert engine._vix_failure_count == 1
+
+    def test_warmup_success_caches_vix(self):
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+        ib.qualifyContracts.side_effect = [[MagicMock()], [MagicMock()]]
+        ib.reqHistoricalData.side_effect = [
+            [MagicMock(close=450.0)],
+            [MagicMock(close=16.25)],
+        ]
+
+        assert engine._warmup_historical_data(reason="test") is True
+        assert engine._last_vix == pytest.approx(16.25)
+        assert engine._last_vix_source == "historical_warmup"
 
 
 class TestOffHoursMaintenance:

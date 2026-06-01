@@ -2377,6 +2377,62 @@ class TestEdgeCases:
 
         assert engine._fetch_vix_price() is None
 
+    def test_vix_failure_starts_retry_cooldown(self):
+        """Repeated HMDS failures must back off instead of hammering IBKR every minute."""
+        from src.config import VIX_FAILURE_COOLDOWN_BASE_SEC
+
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._vix_contract = MagicMock()
+
+        bad_ticker = MagicMock()
+        bad_ticker.marketPrice.return_value = float('nan')
+        bad_ticker.close = float('nan')
+        bad_ticker.last = float('nan')
+        bad_ticker.prevClose = float('nan')
+        ib.reqTickers.return_value = [bad_ticker]
+        ib.reqHistoricalData.return_value = []
+
+        with patch('src.engine.time.time', return_value=1_000.0):
+            assert engine._fetch_vix_price() is None
+
+        assert engine._vix_failure_count == 1
+        assert engine._next_vix_retry_ts == pytest.approx(
+            1_000.0 + VIX_FAILURE_COOLDOWN_BASE_SEC
+        )
+
+    def test_vix_retry_cooldown_suppresses_ib_requests(self):
+        """While VIX is cooling down, no ticker or historical request should be sent."""
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._vix_contract = MagicMock()
+        engine._next_vix_retry_ts = 2_000.0
+
+        with patch('src.engine.time.time', return_value=1_500.0):
+            assert engine._fetch_vix_price() is None
+
+        ib.reqTickers.assert_not_called()
+        ib.reqHistoricalData.assert_not_called()
+
+    def test_vix_success_resets_retry_cooldown(self):
+        """A good fresh VIX read clears prior cooldown state."""
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._vix_contract = MagicMock()
+        engine._vix_failure_count = 3
+        engine._next_vix_retry_ts = 0.0
+        engine._last_vix_failure_ts = 900.0
+
+        ticker = _mock_price_ticker(19.5)
+        ib.reqTickers.return_value = [ticker]
+
+        with patch('src.engine.time.time', return_value=1_000.0):
+            assert engine._fetch_vix_price() == pytest.approx(19.5)
+
+        assert engine._vix_failure_count == 0
+        assert engine._next_vix_retry_ts == 0.0
+        assert engine._last_vix_source == "ticker"
+
     # ── Strict comparison boundaries ─────────────────────────────────────────
 
     def test_price_exactly_at_orb_high_does_not_enter(self):

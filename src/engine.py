@@ -21,6 +21,8 @@ from src.config import (
     HEALTH_REPORT_FILE, HALT_FILE, FORCE_EXIT_FILE,
     LOG_DIR, LOG_FILE,
     IB_HOST, IB_PORT, IB_CLIENT_ID, MARKET_DATA_TYPE, VIX_MARKET_DATA_TYPE,
+    VIX_CACHE_TTL_SEC, VIX_FAILURE_COOLDOWN_BASE_SEC, VIX_FAILURE_COOLDOWN_MAX_SEC,
+    HISTORICAL_DATA_TIMEOUT_SEC, HISTORICAL_DATA_WARMUP_ENABLED,
     ACCOUNT_CURRENCY,
     TRADING_MODE, LIVE_TRADING_ACK, LIVE_TRADING_ACK_PHRASE, LIVE_IB_PORTS, PAPER_IB_PORTS,
     ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
@@ -177,8 +179,13 @@ class VelocityEngine:
         self._equity_initialized: bool         = False   # True after first real IBKR fetch
         self._last_vix:         Optional[float] = None
         self._last_vix_ts:      float           = 0.0   # time.time() of last successful VIX fetch
+        self._last_vix_source:  Optional[str]   = None
+        self._vix_failure_count: int            = 0
+        self._next_vix_retry_ts: float          = 0.0
+        self._last_vix_failure_ts: float        = 0.0
         self._last_scan_ts:     Optional[str]   = None
         self._next_scan_dt:     Optional[str]   = None   # ISO string for the web UI
+        self._historical_data_health: Dict[str, dict] = {}
 
         # Daily loss circuit breaker
         self._day_start_equity: Optional[float] = None
@@ -236,6 +243,7 @@ class VelocityEngine:
                 f"(mode={TRADING_MODE}, host={IB_HOST}, port={IB_PORT}, clientId={IB_CLIENT_ID})."
             )
             self._write_dashboard_data(connected=True)
+            self._warmup_historical_data(reason="connect")
         except Exception as e:
             self._alert("CRITICAL", f"CONNECTION FAILED: Is IB Gateway open? {e}")
             sys.exit()
@@ -304,10 +312,11 @@ class VelocityEngine:
                 logger.info(f"RECONNECT: success on attempt {attempt}")
                 self._metric_inc('reconnect_successes')
                 self._write_dashboard_data(connected=True)
+                self._warmup_historical_data(reason="reconnect")
                 return True
             except Exception as e:
                 logger.warning(f"RECONNECT: attempt {attempt}/10 failed: {e}")
-                self.ib.sleep(5)
+                time.sleep(5)
         self._metric_inc('reconnect_failures')
         self._alert("CRITICAL", "RECONNECT: all 10 attempts failed — skipping trading cycles until restored")
         return False
@@ -328,20 +337,27 @@ class VelocityEngine:
         """Return the current/delayed VIX value, with a robust historical fallback.
 
         VIX is a regime filter — precision matters less than availability. Strategy:
-        1. If a valid VIX was fetched within the last 5 minutes, return it from cache
-           to avoid hammering IBKR with repeated reqHistoricalData calls (which can
-           cause timeout storms that destabilise the connection).
+        1. If a valid VIX was fetched within the configured TTL, return it from
+           cache to avoid hammering IBKR with repeated reqHistoricalData calls.
         2. Try the live/delayed ticker, checking multiple price fields.
-        3. On ticker miss, fetch one day of historical data (suppressed to INFO since
-           delayed-data subscriptions routinely skip the VIX snapshot feed).
-        4. If both fresh paths fail, return None so entries fail closed. A stale
-           VIX reading must not authorize new risk.
+        3. On ticker miss, fetch bounded historical data.
+        4. If both fresh paths fail, enter a cooldown. A stale VIX reading must
+           not authorize new risk.
         """
-        _VIX_TTL_SECS = 300  # 5 minutes
-
+        now = time.time()
         # Return cached value if still fresh enough.
-        if self._last_vix is not None and (time.time() - self._last_vix_ts) < _VIX_TTL_SECS:
+        if self._last_vix is not None and (now - self._last_vix_ts) < VIX_CACHE_TTL_SEC:
             return self._last_vix
+
+        next_retry_ts = float(getattr(self, '_next_vix_retry_ts', 0.0) or 0.0)
+        if now < next_retry_ts:
+            wait_s = int(next_retry_ts - now)
+            self._metric_inc('vix_retry_suppressed')
+            logger.warning(
+                f"VIX data unavailable; retry cooldown active for {wait_s}s. "
+                "Skipping entries as precaution."
+            )
+            return None
 
         try:
             vix_tickers = self._request_vix_tickers()
@@ -361,7 +377,7 @@ class VelocityEngine:
                 or self._coerce_positive_price(getattr(vix_ticker, 'prevClose', None))
             )
             if vix_price is not None:
-                self._last_vix_ts = time.time()
+                self._record_vix_success(vix_price, source="ticker")
                 return vix_price
             logger.info("VIX ticker returned no usable price; using historical fallback.")
             self._metric_inc('vix_ticker_misses')
@@ -369,32 +385,186 @@ class VelocityEngine:
             logger.info("VIX ticker unavailable; using historical fallback.")
             self._metric_inc('vix_ticker_misses')
 
-        try:
-            bars = self.ib.reqHistoricalData(
-                self._vix_contract, '', '5 D', DAILY_BAR_SIZE, 'TRADES', False
-            )
-            if not bars:
-                logger.warning("VIX historical fallback returned no bars.")
-                self._metric_inc('vix_fallback_failures')
-                return None
-            hist_price = self._coerce_positive_price(getattr(bars[-1], 'close', None))
-            if hist_price is None:
-                logger.warning("VIX historical fallback returned an invalid close.")
-                self._metric_inc('vix_fallback_failures')
-                return None
-            logger.info(f"VIX fallback: using latest historical close {hist_price:.2f}")
-            self._last_vix_ts = time.time()
-            self._metric_inc('vix_fallback_successes')
-            return hist_price
-        except Exception as e:
-            logger.warning(f"VIX historical fallback failed: {e}")
+        bars = self._request_historical_bars(
+            self._vix_contract,
+            label="VIX",
+            duration='5 D',
+            bar_size=DAILY_BAR_SIZE,
+            what='TRADES',
+            use_rth=False,
+            timeout=HISTORICAL_DATA_TIMEOUT_SEC,
+            metric_prefix='vix',
+        )
+        if not bars:
+            logger.warning("VIX historical fallback returned no bars.")
             self._metric_inc('vix_fallback_failures')
+            self._record_vix_failure("historical_no_bars")
             return None
+        hist_price = self._coerce_positive_price(getattr(bars[-1], 'close', None))
+        if hist_price is None:
+            logger.warning("VIX historical fallback returned an invalid close.")
+            self._metric_inc('vix_fallback_failures')
+            self._record_vix_failure("historical_invalid_close")
+            return None
+        logger.info(f"VIX fallback: using latest historical close {hist_price:.2f}")
+        self._metric_inc('vix_fallback_successes')
+        self._record_vix_success(hist_price, source="historical")
+        return hist_price
 
     def _ensure_connected(self) -> bool:
         if not self.ib.isConnected():
             logger.warning("ENGINE: not connected — attempting reconnect before cycle")
             return self._reconnect()
+        return True
+
+    def _safe_sleep(self, seconds: float, context: str = "sleep"):
+        """Sleep through IB's event loop, but treat socket loss as reconnectable."""
+        try:
+            self.ib.sleep(seconds)
+        except ConnectionError as e:
+            self._metric_inc('ib_sleep_disconnects')
+            logger.warning(
+                f"{context}: IB socket disconnected during sleep ({e}); "
+                "next cycle will reconnect."
+            )
+            self._write_dashboard_data(connected=False)
+            time.sleep(min(max(float(seconds), 1.0), ERROR_WAIT))
+
+    def _record_vix_success(self, price: float, source: str):
+        self._last_vix = price
+        self._last_vix_ts = time.time()
+        self._last_vix_source = source
+        self._vix_failure_count = 0
+        self._next_vix_retry_ts = 0.0
+        self._last_vix_failure_ts = 0.0
+
+    def _record_vix_failure(self, reason: str):
+        if not hasattr(self, '_vix_failure_count'):
+            self._vix_failure_count = 0
+        if not hasattr(self, '_next_vix_retry_ts'):
+            self._next_vix_retry_ts = 0.0
+        self._vix_failure_count = int(getattr(self, '_vix_failure_count', 0) or 0) + 1
+        self._last_vix_failure_ts = time.time()
+        base = max(float(VIX_FAILURE_COOLDOWN_BASE_SEC), 0.0)
+        max_wait = max(float(VIX_FAILURE_COOLDOWN_MAX_SEC), base)
+        cooldown = min(base * self._vix_failure_count, max_wait)
+        self._next_vix_retry_ts = self._last_vix_failure_ts + cooldown
+        next_retry = datetime.fromtimestamp(self._next_vix_retry_ts, _TZ_NY)
+        logger.warning(
+            f"VIX failure recorded ({reason}); retry in {cooldown:.0f}s "
+            f"at {next_retry.strftime('%H:%M:%S %Z')}."
+        )
+
+    def _request_historical_bars(
+        self,
+        contract,
+        label: str,
+        duration: str,
+        bar_size: str,
+        what: str,
+        use_rth: bool,
+        timeout: float,
+        metric_prefix: Optional[str] = None,
+    ):
+        """Bounded historical request with compact health bookkeeping."""
+        if not hasattr(self, '_historical_data_health'):
+            self._historical_data_health = {}
+        started = time.time()
+        try:
+            bars = self.ib.reqHistoricalData(
+                contract, '', duration, bar_size, what, use_rth, timeout=timeout
+            )
+            latency = time.time() - started
+            ok = bool(bars)
+            self._historical_data_health[label] = {
+                'ok': ok,
+                'last_checked_at': datetime.now(_TZ_NY).isoformat(),
+                'latency_sec': round(latency, 3),
+                'bars': len(bars) if bars else 0,
+                'error': None if ok else 'no_bars',
+            }
+            if metric_prefix and not ok:
+                self._metric_inc(f'{metric_prefix}_historical_no_bars')
+            return bars
+        except Exception as e:
+            latency = time.time() - started
+            self._historical_data_health[label] = {
+                'ok': False,
+                'last_checked_at': datetime.now(_TZ_NY).isoformat(),
+                'latency_sec': round(latency, 3),
+                'bars': 0,
+                'error': str(e),
+            }
+            if metric_prefix:
+                self._metric_inc(f'{metric_prefix}_historical_exceptions')
+            logger.warning(f"{label} historical request failed after {latency:.1f}s: {e}")
+            return []
+
+    def _warmup_historical_data(self, reason: str = "manual") -> bool:
+        """Probe SPY then VIX so HMDS wakes before the entry gate depends on it."""
+        if not HISTORICAL_DATA_WARMUP_ENABLED:
+            return True
+        try:
+            spy = Stock('SPY', 'SMART', 'USD', primaryExchange='ARCA')
+            qualified = self.ib.qualifyContracts(spy)
+            if qualified:
+                spy = qualified[0]
+        except Exception as e:
+            logger.warning(f"HMDS WARMUP[{reason}]: SPY qualification failed: {e}")
+            self._metric_inc('historical_warmup_failures')
+            return False
+
+        spy_bars = self._request_historical_bars(
+            spy,
+            label="SPY",
+            duration='5 D',
+            bar_size=DAILY_BAR_SIZE,
+            what='TRADES',
+            use_rth=True,
+            timeout=HISTORICAL_DATA_TIMEOUT_SEC,
+            metric_prefix='spy',
+        )
+        if not spy_bars:
+            logger.warning(
+                f"HMDS WARMUP[{reason}]: SPY historical failed. "
+                "IBKR historical farm is not healthy yet."
+            )
+            self._metric_inc('historical_warmup_failures')
+            return False
+
+        if not self._ensure_vix_contract():
+            logger.warning(f"HMDS WARMUP[{reason}]: VIX contract unavailable.")
+            self._metric_inc('historical_warmup_failures')
+            return False
+
+        vix_bars = self._request_historical_bars(
+            self._vix_contract,
+            label="VIX",
+            duration='5 D',
+            bar_size=DAILY_BAR_SIZE,
+            what='TRADES',
+            use_rth=False,
+            timeout=HISTORICAL_DATA_TIMEOUT_SEC,
+            metric_prefix='vix',
+        )
+        if not vix_bars:
+            logger.warning(
+                f"HMDS WARMUP[{reason}]: SPY historical OK but VIX historical failed. "
+                "Treating VIX as unavailable until a later retry succeeds."
+            )
+            self._record_vix_failure("warmup_vix_failed")
+            self._metric_inc('historical_warmup_failures')
+            return False
+
+        hist_price = self._coerce_positive_price(getattr(vix_bars[-1], 'close', None))
+        if hist_price is not None:
+            self._record_vix_success(hist_price, source="historical_warmup")
+        vix_text = f"{hist_price:.2f}" if hist_price is not None else "unknown"
+        logger.info(
+            f"HMDS WARMUP[{reason}]: SPY and VIX historical data OK "
+            f"(VIX={vix_text})."
+        )
+        self._metric_inc('historical_warmup_successes')
         return True
 
     def _operator_halt_active(self) -> bool:
@@ -439,12 +609,22 @@ class VelocityEngine:
             'ib_errors': 0,
             'ib_error_codes': {},
             'ib_disconnects': 0,
+            'ib_sleep_disconnects': 0,
             'reconnect_successes': 0,
             'reconnect_failures': 0,
             'vix_ticker_misses': 0,
             'vix_ticker_failures': 0,
             'vix_fallback_successes': 0,
             'vix_fallback_failures': 0,
+            'vix_retry_suppressed': 0,
+            'vix_historical_no_bars': 0,
+            'vix_historical_exceptions': 0,
+            'spy_historical_no_bars': 0,
+            'spy_historical_exceptions': 0,
+            'historical_warmup_successes': 0,
+            'historical_warmup_failures': 0,
+            'account_summary_cancelled': 0,
+            'account_summary_cancel_failures': 0,
             'scanner_runs': 0,
             'scanner_candidates': 0,
             'scanner_skipped_no_slots': 0,
@@ -531,6 +711,25 @@ class VelocityEngine:
                     if getattr(self, '_last_vix', None) is not None else None
                 ),
                 'vix_threshold': VIX_THRESHOLD,
+                'vix_source': getattr(self, '_last_vix_source', None),
+                'vix_last_success_at': (
+                    datetime.fromtimestamp(self._last_vix_ts, _TZ_NY).isoformat()
+                    if getattr(self, '_last_vix_ts', 0.0) else None
+                ),
+                'vix_failure_count': int(getattr(self, '_vix_failure_count', 0) or 0),
+                'vix_last_failure_at': (
+                    datetime.fromtimestamp(self._last_vix_failure_ts, _TZ_NY).isoformat()
+                    if getattr(self, '_last_vix_failure_ts', 0.0) else None
+                ),
+                'vix_next_retry_at': (
+                    datetime.fromtimestamp(self._next_vix_retry_ts, _TZ_NY).isoformat()
+                    if getattr(self, '_next_vix_retry_ts', 0.0) else None
+                ),
+            },
+            'market_data': {
+                'historical': copy.deepcopy(
+                    getattr(self, '_historical_data_health', {}) or {}
+                ),
             },
             'scanner': {
                 'last_scan': getattr(self, '_last_scan_ts', None),
@@ -821,6 +1020,44 @@ class VelocityEngine:
             logger.warning(f"Could not write readiness snapshot: {e}")
 
     # ── Account ────────────────────────────────────────────────────────────────
+    def _request_account_summary_snapshot(self):
+        """Request account summary as a bounded one-shot and cancel the stream.
+
+        ib_async.accountSummary() is convenient, but if Gateway disconnects while
+        a request is open, IBKR can keep counting it against the account-summary
+        subscription limit. For real IB instances we use the lower-level request
+        API and always send cancelAccountSummary(reqId) in finally.
+        """
+        if not isinstance(self.ib, IB):
+            return self.ib.accountSummary()
+
+        client = getattr(self.ib, 'client', None)
+        wrapper = getattr(self.ib, 'wrapper', None)
+        if client is None or wrapper is None:
+            return self.ib.accountSummary()
+
+        req_id = client.getReqId()
+        future = wrapper.startReq(req_id)
+        tags = (
+            "AccountType,NetLiquidation,TotalCashValue,SettledCash,"
+            "AvailableFunds,ExcessLiquidity,BuyingPower,$LEDGER:ALL"
+        )
+        try:
+            try:
+                wrapper.acctSummary.clear()
+            except Exception:
+                pass
+            client.reqAccountSummary(req_id, "All", tags)
+            self.ib._run(future)
+            return list(wrapper.acctSummary.values())
+        finally:
+            try:
+                client.cancelAccountSummary(req_id)
+                self._metric_inc('account_summary_cancelled')
+            except Exception as e:
+                self._metric_inc('account_summary_cancel_failures')
+                logger.warning(f"ACCOUNT: cancelAccountSummary({req_id}) failed: {e}")
+
     def _get_account_values(self) -> Tuple[float, float]:
         """Return (net_liquidation, settled_cash) using fresh IBKR data only.
 
@@ -831,7 +1068,7 @@ class VelocityEngine:
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
-                summary = self.ib.accountSummary()
+                summary = self._request_account_summary_snapshot()
                 if summary:
                     net_liq = settled = 0.0
                     settled_seen = False
@@ -878,7 +1115,7 @@ class VelocityEngine:
         while True:
             attempt += 1
             try:
-                summary = self.ib.accountSummary()
+                summary = self._request_account_summary_snapshot()
                 if summary:
                     for item in summary:
                         if not self._account_currency_matches(item):
@@ -993,7 +1230,7 @@ class VelocityEngine:
                         f"{getattr(trade.order, 'action', '?')} order for "
                         f"{getattr(trade.contract, 'symbol', '?')}: {e}"
                     )
-            self.ib.sleep(2)
+            self._safe_sleep(2, context="INIT orphan-cancel settle")
 
         logger.info("INIT: Phase 1 — immediate position sync and stop-order audit...")
         self._sync_positions_from_ibkr()
@@ -1049,7 +1286,7 @@ class VelocityEngine:
             f"for pre-entry position sync & stop audit "
             f"(entry window opens at {ENTRY_START[0]:02d}:{ENTRY_START[1]:02d} ET)."
         )
-        self.ib.sleep(wait_s)
+        self._safe_sleep(wait_s, context="INIT pre-entry wait")
 
     def _entry_good_after_time(self) -> str:
         """Return a 10:00 ET activation string only while that time is still future."""
@@ -3528,7 +3765,7 @@ class VelocityEngine:
                 ).isoformat()
                 self._write_dashboard_data(connected=True)
 
-                self.ib.sleep(SCAN_INTERVAL)
+                self._safe_sleep(SCAN_INTERVAL, context="main loop")
 
             except Exception as e:
                 logger.exception("RUNTIME ERROR")
@@ -3537,4 +3774,4 @@ class VelocityEngine:
                     datetime.now(_TZ_NY) + timedelta(seconds=ERROR_WAIT)
                 ).isoformat()
                 self._write_dashboard_data(connected=self.ib.isConnected())
-                self.ib.sleep(ERROR_WAIT)
+                self._safe_sleep(ERROR_WAIT, context="error backoff")

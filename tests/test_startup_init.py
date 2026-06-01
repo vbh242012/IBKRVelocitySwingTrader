@@ -170,6 +170,34 @@ class TestFetchEquityWithRetry:
 # ── _get_account_values ───────────────────────────────────────────────────────
 
 class TestAccountValues:
+    def test_account_summary_snapshot_cancels_live_request(self):
+        """Live IB account-summary requests must be cancelled to avoid leaks."""
+        class FakeIB(eng_mod.IB):
+            pass
+
+        ib = FakeIB.__new__(FakeIB)
+        ib.disconnect = MagicMock()
+        ib.client = MagicMock()
+        ib.client.getReqId.return_value = 77
+        ib.wrapper = MagicMock()
+        ib.wrapper.startReq.return_value = object()
+        snapshot = {
+            ('U123', 'NetLiquidation', 'USD'): _acct_item('NetLiquidation', '5000.0', 'USD'),
+            ('U123', 'SettledCash', 'USD'): _acct_item('SettledCash', '1200.0', 'USD'),
+        }
+        ib.wrapper.acctSummary = {}
+        ib._run = MagicMock(side_effect=lambda _future: ib.wrapper.acctSummary.update(snapshot))
+
+        engine = _make_engine(ib)
+        summary = engine._request_account_summary_snapshot()
+
+        assert {item.tag: float(item.value) for item in summary} == {
+            'NetLiquidation': 5000.0,
+            'SettledCash': 1200.0,
+        }
+        ib.client.reqAccountSummary.assert_called_once()
+        ib.client.cancelAccountSummary.assert_called_once_with(77)
+
     def test_get_account_values_ignores_non_usd_rows(self):
         ib = MagicMock()
         ib.accountSummary.return_value = [
