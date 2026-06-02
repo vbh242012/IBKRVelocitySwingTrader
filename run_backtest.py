@@ -64,7 +64,7 @@ def parse_args():
     p.add_argument("--max-symbols", default=BACKTEST_MAX_SYMBOLS, type=int,
                    help="Cap downloaded symbols for bounded validation; 0 means full filtered universe")
     p.add_argument("--hold-bars",       default=DEFAULT_HOLD_BARS,    type=int,
-                   help=f"Trading bars before EOD profit-cleanup check (default: live HOLD_TRADING_BARS={DEFAULT_HOLD_BARS})")
+                   help="Legacy compatibility parameter; live EOD cleanup is same-day")
     p.add_argument("--rvol",            default=BACKTEST_RVOL_MIN,    type=float,
                    help=f"Legacy RVOL/ranking reference; 8096 does not gate entries on RVOL (default: {BACKTEST_RVOL_MIN}×)")
     p.add_argument("--scoring-model", choices=["legacy", "legacy_v2", "enhanced"], default=SCORING_MODEL,
@@ -205,8 +205,8 @@ def main():
     print(f"  Scoring model : {args.scoring_model}")
     print(f"  RVOL ref      : {args.rvol:.1f}× (scanner ranking only; not an entry gate)")
     print(f"  Exit          : Chandelier (ATR{CHANDELIER_PERIOD}×{args.chandelier_mult}) + 7% hard stop + {args.break_even_pct:.0%} break-even")
-    print(f"  EOD cleanup   : profit_min {PROFIT_MIN_THRESHOLD:.0%} after {args.hold_bars} bars")
-    print(f"  Hold bars     : {args.hold_bars} trading days before EOD profit check")
+    print(f"  EOD cleanup   : same-day close if profit < {PROFIT_MIN_THRESHOLD:.0%}")
+    print(f"  Hold bars     : {args.hold_bars} (legacy parameter; EOD cleanup is same-day)")
     print(f"  Position size : Whole shares, ATR-based (2% equity risk) capped by bucket")
     print(f"  Daily fill     : {'Conservative close-or-worse' if args.conservative_daily_entry else 'Legacy open/prev-high proxy'}")
     print(f"  Slippage      : 0.1% entry  |  Commission: ${args.commission_per_order*2:.2f}/round-trip")

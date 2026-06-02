@@ -876,7 +876,7 @@ setInterval(refresh, 5000);
 _HTML = _HTML.replace(
     "__EOD_PROFIT_CLEANUP_RULE__",
     (
-        f"After {HOLD_TRADING_BARS} trading day(s), at/after "
+        f"Same day at/after "
         f"{EOD_EXIT_TIME[0] % 12 or 12}:{EOD_EXIT_TIME[1]:02d} PM ET: if profit < "
         f"{PROFIT_MIN_THRESHOLD * 100:.0f}%, force-liquidate via Market SELL; "
         "frees capital for T+1 settlement"

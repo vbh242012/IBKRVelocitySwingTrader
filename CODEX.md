@@ -6,7 +6,7 @@
 
    You also possess expert-level, up-to-date knowledge of the entire Python ecosystem, especially all the best free and open-source libraries, and constantly optimize production trading systems by leveraging the most powerful, battle-tested features from libraries such as pandas, NumPy, Numba, Polars, TA-Lib, vectorbt, Backtrader, Zipline Reloaded, QuantLib, PyAlgoTrade, ccxt, asyncio and websockets, Redis, RQ, Celery, Prometheus and Grafana, Loguru, structlog, pydantic, SQLAlchemy, Joblib, Dask, Ray, PyArrow, SciPy, Statsmodels, scikit-learn, XGBoost, LightGBM, Optuna, and others.
 
-   We are building an automated swing trading bot with a velocity review after 1 completed trading session. For upward-trending stocks, the Chandelier trailing stop decides the exit after the velocity window if the trade is working. The bot is for a cash account with T+1 settlement, starting initial capital of $2,000, and it should use compounded account growth for further trading.
+   We are building an automated swing trading bot where broker-side Chandelier trailing stops are the primary exit for working trades, and same-day EOD profit cleanup at 15:50 ET closes positions below the configured profit threshold so cash can settle T+1. The bot is for a cash account with T+1 settlement, starting initial capital of $2,000, and it should use compounded account growth for further trading.
 
 2. Repository ownership and active project folder
 
@@ -1074,9 +1074,9 @@
    - Renamed the live exit manager to `manage_position_exits()`.
    - Kept `check_velocity_exits()` as a backward-compatible wrapper.
    - Updated engine call sites and tests to use `manage_position_exits()`.
-   - EOD flat no longer closes same-day swing entries.
-   - EOD flat now requires `HOLD_TRADING_BARS` to have elapsed before it can
-     liquidate a non-profitable position.
+   - Historical note: this pass temporarily stopped EOD flat from closing
+     same-day swing entries. Section 8 supersedes that behavior; current EOD
+     profit cleanup is same-day.
    - Software exits now require a fresh broker price; cached `current_price`
      and stale ticker `close` values are no longer allowed to liquidate a
      position.
@@ -1090,8 +1090,8 @@
      fresh broker price only.
    - Break-even giveback: fresh broker price only.
    - Friday close: explicit weekend-risk policy.
-   - EOD profit cleanup: older positions only, after the minimum swing hold
-     window, using the configured profit threshold.
+   - EOD profit cleanup: same-day at/after 15:50 ET, using the configured
+     profit threshold.
 
    Validation:
 
@@ -1123,32 +1123,34 @@
    - Moved `EOD_EXIT_TIME` from `15:45 ET` to `15:50 ET`.
    - Live `manage_position_exits()` now has no separate velocity liquidation
      branch.
-   - EOD cleanup rule after `HOLD_TRADING_BARS`: if profit is below
-     `PROFIT_MIN_THRESHOLD` at/after `15:50 ET`, close via market sell to free
-     capital for T+1 settlement.
+   - EOD cleanup rule is same-day: if profit is below `PROFIT_MIN_THRESHOLD`
+     at/after `15:50 ET`, close via market sell to free capital for T+1
+     settlement.
    - Hard stop, break-even giveback, Friday close, and broker trailing stops
      remain independent safety exits and are not delayed to 15:50 ET.
    - Dashboard rule text now says:
-     `After 1 trading day(s), at/after 3:50 PM ET: if profit < 5%, force-liquidate via Market SELL; frees capital for T+1 settlement`.
+     `Same day at/after 3:50 PM ET: if profit < 5%, force-liquidate via Market SELL; frees capital for T+1 settlement`.
    - `/api/state` now exposes `eod_exit_time`.
 
    Validation:
 
    ```bash
-   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_eod_cleanup_tests .venv/bin/python -m pytest -q tests/test_engine.py::TestEodProfitCleanup tests/test_trailing_stop_scoring_screener.py::TestExitOrders tests/test_trailing_stop_scoring_screener.py::TestEodFlat tests/test_dashboard_server.py -p no:cacheprovider
-   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/engine.py src/config.py dashboard_server.py backtest/strategy.py run_backtest.py tests/test_engine.py tests/test_trailing_stop_scoring_screener.py tests/test_dashboard_server.py
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_same_day_eod_tests .venv/bin/python -m pytest -q tests/test_engine.py::TestEodProfitCleanup tests/test_trailing_stop_scoring_screener.py::TestExitOrders tests/test_trailing_stop_scoring_screener.py::TestEodFlat tests/test_dashboard_server.py tests/test_backtest.py::TestOptimizerHelpers -p no:cacheprovider
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/engine.py src/config.py dashboard_server.py backtest/strategy.py backtest/optimizer.py run_backtest.py tests/test_engine.py tests/test_trailing_stop_scoring_screener.py tests/test_dashboard_server.py tests/test_backtest.py
    PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_full_tests .venv/bin/python -m pytest -q -p no:cacheprovider
-   PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_bt_eod_cleanup .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 300 --scoring-model legacy_v2
+   PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_bt_same_day_eod .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 300 --scoring-model legacy_v2
    ```
 
    Results:
 
-   - Focused EOD cleanup/dashboard tests: 30 passed.
+   - Focused same-day EOD cleanup/dashboard/optimizer tests: 38 passed.
    - Syntax compile: passed.
    - Full suite: 401 passed.
    - Cached 282-symbol forward backtest, 2020-01-01 through 2026-05-22:
-     2,599 trades, +1,780.77% total return, 73.1% win rate, 6.07 profit
-     factor, -4.40% max drawdown, 4.57 Sharpe.
+     3,018 trades, +2,939.50% total return, 92.1% win rate, 119.24 profit
+     factor, -4.58% max drawdown, 6.27 Sharpe.
    - Backtest exit breakdown now reports `eod_profit_cleanup` instead of
-     `velocity_exit`; the daily-bar backtester already evaluates this
-     stale-capital rule at the end-of-day close.
+     `velocity_exit`.
+   - Important research caveat: same-day daily-bar cleanup fills weak entries at
+     the completed daily close. This matches the intended live 15:50 ET rule at
+     a coarse level, but it is still less realistic than an intraday replay.

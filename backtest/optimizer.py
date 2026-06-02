@@ -48,13 +48,12 @@ def default_grid() -> List[OptimizationParams]:
     """Small robustness grid over active 8096 parameters only."""
     return [
         OptimizationParams(
-            hold_bars=hold_bars,
+            hold_bars=HOLD_TRADING_BARS,
             break_even_pct=break_even_pct,
             chandelier_mult=chandelier_mult,
         )
-        for hold_bars, break_even_pct, chandelier_mult
+        for break_even_pct, chandelier_mult
         in product(
-            [1, 2, 3],
             [0.03, 0.04],
             [1.8, 2.0, 2.2],
         )
@@ -65,12 +64,11 @@ def quick_grid() -> List[OptimizationParams]:
     """Very small grid for a fast smoke-test optimization pass."""
     return [
         OptimizationParams(
-            hold_bars=hold_bars,
+            hold_bars=HOLD_TRADING_BARS,
             break_even_pct=BREAK_EVEN_PCT,
             chandelier_mult=chandelier_mult,
         )
-        for hold_bars, chandelier_mult
-        in product([1, 2], [1.8, 2.0])
+        for chandelier_mult in [1.8, 2.0]
     ]
 
 
@@ -259,7 +257,7 @@ def run_optimization(
             print(
                 f"  [{idx:>2}/{len(candidates)}] robust={robust_score:.2f} "
                 f"forward={forward_score:.2f} trades_f={forward.metrics.get('total_trades', 0)} "
-                f"hold={params.hold_bars} be={params.break_even_pct:.2f} "
+                f"legacy_hold={params.hold_bars} be={params.break_even_pct:.2f} "
                 f"chand={params.chandelier_mult}",
                 flush=True,
             )
@@ -282,7 +280,7 @@ def format_optimization_table(runs: Iterable[OptimizationRun]) -> str:
             f"{fm.get('total_return_pct', 0.0):>6.1f}% "
             f"{fm.get('sharpe_ratio', 0.0):>7.2f} "
             f"{fm.get('max_drawdown_pct', 0.0):>6.1f}% "
-            f"hold={p.hold_bars}, be={p.break_even_pct:.2f}, "
+            f"legacy_hold={p.hold_bars}, be={p.break_even_pct:.2f}, "
             f"chand={p.chandelier_mult}, "
             f"train_trades={tm.get('total_trades', 0)}"
         )

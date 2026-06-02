@@ -80,5 +80,6 @@ def test_dashboard_equity_chart_uses_intraday_time_labels():
     assert "toLocaleTimeString" in html
     assert "toLocaleDateString" in html
     assert "3:50 PM ET" in html
+    assert "Same day at/after" in html
     assert "EOD Profit Cleanup" in html
     assert "Velocity Exit" not in html

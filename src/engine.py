@@ -27,7 +27,7 @@ from src.config import (
     TRADING_MODE, LIVE_TRADING_ACK, LIVE_TRADING_ACK_PHRASE, LIVE_IB_PORTS, PAPER_IB_PORTS,
     ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
-    VIX_THRESHOLD, HOLD_TRADING_BARS, PROFIT_MIN_THRESHOLD, BREAK_EVEN_PCT,
+    VIX_THRESHOLD, PROFIT_MIN_THRESHOLD, BREAK_EVEN_PCT,
     ENTRY_START, ENTRY_END, STOP_ACTIVATION_TIME, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
     POST_OPEN_AUDIT_TIME, PREMARKET_READINESS_TIME, POST_CLOSE_MAINTENANCE_TIME,
     MARKET_CLOSE_TIME, ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
@@ -2581,25 +2581,6 @@ class VelocityEngine:
             self.state[sym]['price_checked_at'] = now_et.isoformat()
             changed = True
 
-            raw_time = data.get('time', '')
-            trading_days_held = None
-            if raw_time:
-                try:
-                    entry_dt = datetime.fromisoformat(raw_time)
-                    if entry_dt.tzinfo is None:
-                        entry_dt = _TZ_NY.localize(entry_dt)
-                    trading_days_held = _count_trading_days(entry_dt, now_et)
-                except (ValueError, TypeError):
-                    logger.warning(
-                        f"EXIT: {sym} — malformed entry timestamp {raw_time!r}; "
-                        "minimum-hold exits are disabled for this cycle"
-                    )
-            else:
-                logger.warning(
-                    f"EXIT: {sym} — missing entry timestamp; minimum-hold exits "
-                    "are disabled for this cycle"
-                )
-
             # ── 1. Intraday hard stop — requires a fresh broker price
             drawdown = (cur - entry_price) / entry_price
             if drawdown <= -HARD_STOP_PCT:
@@ -2634,26 +2615,15 @@ class VelocityEngine:
                     self.liquidate(sym)
                     continue
 
-            # ── 3. EOD profit cleanup — never rejects a same-day swing entry.
+            # ── 3. EOD profit cleanup — same-day capital recycling.
             #
-            # Fires once per trading day after EOD_EXIT_TIME (default 15:50 ET),
-            # but only after HOLD_TRADING_BARS has elapsed. Positions that have
-            # not reached the minimum profit threshold are sold near the close so
-            # capital can settle T+1 instead of being tied up in weak follow-through.
+            # Fires once per trading day after EOD_EXIT_TIME (default 15:50 ET).
+            # Positions that have not reached the minimum profit threshold are
+            # sold near the close so capital can settle T+1 instead of being tied
+            # up in weak follow-through. This intentionally applies to same-day
+            # entries too.
             if eod_exit_due:
                 eod_exit_checked = True
-                if trading_days_held is None:
-                    logger.warning(
-                        f"EOD PROFIT CLEANUP: {sym} skipped — entry timestamp is unavailable "
-                        "or malformed; cannot prove minimum hold window."
-                    )
-                    continue
-                if trading_days_held < HOLD_TRADING_BARS:
-                    logger.info(
-                        f"EOD PROFIT CLEANUP: {sym} skipped — held {trading_days_held} "
-                        f"trading sessions (< {HOLD_TRADING_BARS}); swing hold window active."
-                    )
-                    continue
                 eod_profit = (cur - entry_price) / entry_price
                 if eod_profit < PROFIT_MIN_THRESHOLD:
                     logger.warning(

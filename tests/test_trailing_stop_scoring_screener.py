@@ -2256,19 +2256,21 @@ class TestExitOrders:
         assert 'WINNER' in engine.state, "Profitable position must NOT be liquidated"
         assert not ib.placeOrder.called
 
-    def test_eod_profit_cleanup_does_not_trigger_before_hold_window(self):
-        """Position still within hold window must never be touched."""
+    def test_eod_profit_cleanup_triggers_same_day_when_below_threshold(self):
+        """Same-day weak positions are closed by the 15:50 ET cleanup."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
         engine.state = {'NEW': self._make_state_entry(
             entry_time=self._et(2024, 6, 5, 10, 0).isoformat()
         )}
         ib.reqTickers.return_value = [_mock_price_ticker(100.0)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('NEW', 1.0)]
 
-        self._run_exit_check(engine)
+        self._run_exit_check(engine, now=self._et(2024, 6, 5, 15, 50))
 
-        assert 'NEW' in engine.state
-        assert not ib.placeOrder.called
+        assert engine.state['NEW']['pending_exit'] is True
+        assert ib.placeOrder.called
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3343,14 +3345,14 @@ class TestFridayClose:
         assert engine.state['FRI']['pending_exit'] is True, "Friday close must mark below-threshold position pending exit"
 
     def test_friday_close_does_not_trigger_above_threshold(self):
-        """Profit above FRIDAY_MIN_PROFIT_PCT on Friday must keep position open."""
-        from src.config import FRIDAY_CLOSE_HOUR, FRIDAY_MIN_PROFIT_PCT
+        """Profit above Friday and EOD thresholds on Friday must keep position open."""
+        from src.config import FRIDAY_CLOSE_HOUR, FRIDAY_MIN_PROFIT_PCT, PROFIT_MIN_THRESHOLD
         ib     = _mock_ib()
         engine = _make_engine(ib)
         tz_ny  = pytz.timezone('US/Eastern')
 
         entry = 100.0
-        cur   = round(entry * (1 + FRIDAY_MIN_PROFIT_PCT + 0.01), 2)   # above threshold
+        cur   = round(entry * (1 + max(FRIDAY_MIN_PROFIT_PCT, PROFIT_MIN_THRESHOLD) + 0.01), 2)
         engine.state = {'FRI': self._state_entry(entry, cur, tz_ny)}
         ib.reqTickers.return_value = [_mock_price_ticker(cur)]
 
@@ -3394,10 +3396,8 @@ class TestFridayClose:
 class TestEodFlat:
     """
     After EOD_EXIT_TIME (default 15:50 ET) on any trading day, positions below
-    the profit threshold may be liquidated only after the minimum swing hold
-    window has elapsed. Same-day entries are not rejected just because they are
-    below the threshold near the close. The rule fires at most once per calendar
-    trading day.
+    the profit threshold may be liquidated, including same-day entries. The rule
+    fires at most once per calendar trading day.
     """
 
     def _state_entry(self, entry, cur, tz_ny, entry_time=None):
@@ -3517,8 +3517,8 @@ class TestEodFlat:
         assert 'GAIN' in engine.state, "Strong profitable position must not be closed at EOD"
         assert not ib.placeOrder.called
 
-    def test_eod_flat_does_not_close_same_day_weak_position(self):
-        """A same-day swing entry must not be closed by EOD cleanup."""
+    def test_eod_flat_closes_same_day_weak_position(self):
+        """A same-day weak position must be closed by EOD cleanup."""
         from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -3529,6 +3529,8 @@ class TestEodFlat:
         same_day_entry = tz_ny.localize(datetime(2024, 6, 5, 11, 20))
         engine.state = {'NEW': self._state_entry(entry, cur, tz_ny, same_day_entry)}
         ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('NEW', 5.0)]
 
         eod_time = tz_ny.localize(
             datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
@@ -3538,8 +3540,9 @@ class TestEodFlat:
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
 
-        assert 'NEW' in engine.state, "Same-day swing entry must not be closed at EOD"
-        assert not ib.placeOrder.called
+        assert engine.state['NEW']['pending_exit'] is True, \
+            "Same-day weak position must be closed at EOD"
+        assert ib.placeOrder.called
 
     def test_eod_flat_does_not_trigger_before_eod_time(self):
         """Before EOD_EXIT_TIME the EOD cleanup rule must be inactive."""

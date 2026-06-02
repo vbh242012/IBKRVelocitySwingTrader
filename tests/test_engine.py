@@ -246,7 +246,7 @@ class TestEodProfitCleanup:
             self._run_exit_check(engine)
             mock_liq.assert_not_called()
 
-    def test_same_day_position_not_exited(self):
+    def test_same_day_position_below_profit_threshold_exits_at_eod(self):
         ib      = _mock_ib()
         engine  = _make_engine_patched(ib)
 
@@ -259,7 +259,7 @@ class TestEodProfitCleanup:
 
         with patch.object(engine, 'liquidate') as mock_liq:
             self._run_exit_check(engine)
-            mock_liq.assert_not_called()
+            mock_liq.assert_called_once_with('AAPL')
 
     def test_older_position_below_threshold_not_exited_before_eod_cleanup_time(self):
         ib      = _mock_ib()

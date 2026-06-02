@@ -497,11 +497,11 @@ class TestOptimizerHelpers:
 
     def test_default_grid_only_varies_active_8096_parameters(self):
         grid = default_grid()
-        assert len(grid) == 18
+        assert len(grid) == 6
         assert len({p.rvol_min for p in grid}) == 1
         assert len({p.breakout_pct for p in grid}) == 1
         assert len({p.vcp_ratio for p in grid}) == 1
-        assert len({p.hold_bars for p in grid}) > 1
+        assert len({p.hold_bars for p in grid}) == 1
         assert len({p.break_even_pct for p in grid}) > 1
         assert len({p.chandelier_mult for p in grid}) > 1
 

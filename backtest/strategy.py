@@ -54,7 +54,7 @@ Exit rules (production):
   • Chandelier trailing stop : peak_high - ATR_CHAND × CHANDELIER_MULT
   • Hard stop                : entry × (1 - HARD_STOP_PCT) = 7% from entry
   • Break-even floor         : if profit > BREAK_EVEN_PCT, stop ≥ entry
-  • EOD profit cleanup       : held ≥ hold_bars and profit < 5%
+  • EOD profit cleanup       : same-day close if profit < 5%
   • (No take-profit bracket — removed from production)
 """
 
@@ -179,7 +179,7 @@ class VelocityBacktest:
     end             : backtest end date    (YYYY-MM-DD)
     capital         : starting capital in USD
     max_pos         : safety cap for dynamic max simultaneous positions
-    hold_bars       : trading bars before EOD profit-cleanup check
+    hold_bars       : legacy compatibility parameter; live EOD cleanup is same-day
     scan_count      : top-N from daily scanner considered per bar; 0 means all
     max_symbols     : download cap for bounded validation; 0/None means full filtered universe
     min_price       : minimum close price filter
@@ -191,7 +191,7 @@ class VelocityBacktest:
                       1=prior available VIX bar (used for 15-minute delayed research)
     rvol_min             : legacy optimizer parameter; 8096 uses RVOL for ranking, not as an entry gate
     break_even_pct       : once profit exceeds this, floor the stop at entry (0.04 optimal)
-    profit_min_threshold : EOD profit cleanup fires if profit < this after hold_bars
+    profit_min_threshold : EOD profit cleanup fires if close profit < this
     chandelier_mult      : ATR multiplier for trailing stop
     breakout_pct         : legacy optimizer parameter; 10-day-high proximity is no longer an entry gate
     vcp_ratio            : legacy optimizer parameter; 8096 does not gate on VCP
@@ -1136,7 +1136,7 @@ class VelocityBacktest:
                 if float(row['low']) <= effective_stop:
                     exit_reason = "chandelier_stop"
                     exit_price = self._stop_fill_price(row, effective_stop)
-                elif bars_held >= self.hold_bars and profit_pct < self._profit_min_threshold:
+                elif profit_pct < self._profit_min_threshold:
                     exit_reason = "eod_profit_cleanup"
 
                 if exit_reason:
@@ -1316,6 +1316,38 @@ class VelocityBacktest:
                             self._filter_stats['bear_phase_entries'] += 1
                         else:
                             self._filter_stats['bull_phase_entries'] += 1
+
+            # Daily-bar approximation of the live 15:50 ET EOD cleanup. The
+            # live engine can close a same-day entry near the close if it is
+            # still below the profit threshold. Daily data only has the final
+            # close, so apply the same stale-capital rule after all same-day
+            # entries have been selected. This does not free same-day buying
+            # power because sale proceeds settle on the next trading session.
+            today_date = today.date() if hasattr(today, 'date') else today
+            for sym in list(open_positions.keys()):
+                t = open_positions[sym]
+                if t.entry_date != today_date or t.__dict__.get('_bars_held', 0) != 0:
+                    continue
+                df = self._data.get(sym)
+                if df is None or today not in df.index:
+                    continue
+                close_px = float(df.loc[today]['close'])
+                t.__dict__['_last_close'] = close_px
+                profit_pct = (close_px - t.entry_price) / t.entry_price
+                if profit_pct >= self._profit_min_threshold:
+                    continue
+
+                t.exit_date   = today_date
+                t.exit_price  = close_px
+                t.exit_reason = "eod_profit_cleanup"
+                sale_proceeds = t.exit_price * t.qty - t.round_trip_commission
+                settle_date = next_trading_session(today)
+                pending_settlements[settle_date] = (
+                    pending_settlements.get(settle_date, 0.0) + sale_proceeds
+                )
+                self._filter_stats['total_commissions'] += t.round_trip_commission
+                trades.append(t)
+                del open_positions[sym]
 
             if past_start:
                 equity_curve[today] = mark_to_market(today)
