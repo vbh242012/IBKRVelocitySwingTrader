@@ -1948,17 +1948,17 @@ class TestPortfolioRiskGates:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. EXIT ORDERS — velocity exits, liquidation
+# 9. EXIT ORDERS — EOD profit cleanup, liquidation
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestExitOrders:
     """
-    Verify velocity exit (manage_position_exits → liquidate) behaviour:
+    Verify EOD profit cleanup (manage_position_exits → liquidate) behaviour:
     - MarketOrder('SELL', position) placed with exact qty reported by IBKR
     - Open symbol orders are cancelled before the market sell
     - Cash-account exits cancel protective SELLs first to avoid oversell rejection
     - MarketOrder TIF is explicit DAY so IBKR presets cannot override it to GTC
-    - Exit fires only when stagnant; profitable positions are kept
+    - Exit fires near the close when older positions are below the profit threshold
     """
 
     def _make_position(self, symbol, qty):
@@ -1980,7 +1980,7 @@ class TestExitOrders:
             datetime(year, month, day, hour, minute)
         )
 
-    def _run_velocity_check(self, engine, now=None):
+    def _run_exit_check(self, engine, now=None):
         now = now or self._et(2024, 6, 5, 15, 50)
         with patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = now
@@ -2178,8 +2178,8 @@ class TestExitOrders:
 
     # ── manage_position_exits() ──────────────────────────────────────────────
 
-    def test_velocity_exit_triggers_when_stagnant_after_hold_window(self):
-        """Position held for configured trading sessions with weak profit → liquidated."""
+    def test_eod_profit_cleanup_triggers_when_below_threshold_after_hold_window(self):
+        """Older position below the profit threshold near the close → liquidated."""
         from src.config import PROFIT_MIN_THRESHOLD
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -2192,13 +2192,13 @@ class TestExitOrders:
         engine.state = {'SLOW': self._make_state_entry(price=entry_price,
                                                         entry_time=self._et(2024, 6, 3).isoformat())}
 
-        self._run_velocity_check(engine)
+        self._run_exit_check(engine)
 
         assert engine.state['SLOW']['pending_exit'] is True, "Stagnant position must be marked pending exit"
         assert ib.placeOrder.called, "Market sell must be issued"
 
-    def test_velocity_exit_waits_until_configured_eod_time(self):
-        """Held stagnant positions must not be velocity-sold before 15:50 ET."""
+    def test_eod_profit_cleanup_waits_until_configured_eod_time(self):
+        """Held weak positions must not be sold before 15:50 ET."""
         from src.config import PROFIT_MIN_THRESHOLD
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -2211,7 +2211,7 @@ class TestExitOrders:
             entry_time=self._et(2024, 6, 3).isoformat(),
         )}
 
-        self._run_velocity_check(engine, now=self._et(2024, 6, 5, 15, 49))
+        self._run_exit_check(engine, now=self._et(2024, 6, 5, 15, 49))
 
         assert 'pending_exit' not in engine.state['SLOW']
         assert not ib.placeOrder.called
@@ -2234,12 +2234,12 @@ class TestExitOrders:
         entry['pending_exit'] = True
         engine.state = {'SLOW': entry}
 
-        self._run_velocity_check(engine)
+        self._run_exit_check(engine)
 
         assert not ib.placeOrder.called
         assert engine.state['SLOW']['pending_exit'] is True
 
-    def test_velocity_exit_does_not_trigger_when_profitable(self):
+    def test_eod_profit_cleanup_does_not_trigger_when_profit_threshold_met(self):
         """Position held through the window but profit ≥ threshold → kept."""
         from src.config import PROFIT_MIN_THRESHOLD
         ib     = _mock_ib()
@@ -2251,12 +2251,12 @@ class TestExitOrders:
         engine.state = {'WINNER': self._make_state_entry(price=entry_price,
                                                           entry_time=self._et(2024, 6, 3).isoformat())}
 
-        self._run_velocity_check(engine)
+        self._run_exit_check(engine)
 
         assert 'WINNER' in engine.state, "Profitable position must NOT be liquidated"
         assert not ib.placeOrder.called
 
-    def test_velocity_exit_does_not_trigger_before_hold_window(self):
+    def test_eod_profit_cleanup_does_not_trigger_before_hold_window(self):
         """Position still within hold window must never be touched."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -2265,7 +2265,7 @@ class TestExitOrders:
         )}
         ib.reqTickers.return_value = [_mock_price_ticker(100.0)]
 
-        self._run_velocity_check(engine)
+        self._run_exit_check(engine)
 
         assert 'NEW' in engine.state
         assert not ib.placeOrder.called
@@ -2282,7 +2282,7 @@ class TestEdgeCases:
     - ATR = 0 or NaN → skip entry, no malformed bracket
     - MA200 = 0 → no division by zero in scoring
     - ORB high = 0 → get_technical_context returns None
-    - Entry price = 0 in velocity exit → skipped, no division by zero
+    - Entry price = 0 in EOD exit management → skipped, no division by zero
     - VIX at threshold (=35) → entries allowed; above (>35) → blocked
     - Strict comparisons: price > ORB, RSI strictly rising
     - Friday dollar-volume threshold doubled
@@ -2763,8 +2763,8 @@ class TestEdgeCases:
 
         assert 'AAPL' not in engine.state
 
-    def test_sync_avgcost_zero_position_skips_velocity_exit_profit_check(self):
-        """Position synced with avgCost=0 must not crash velocity exit (division by zero)."""
+    def test_sync_avgcost_zero_position_skips_eod_profit_cleanup_check(self):
+        """Position synced with avgCost=0 must not crash EOD exit management."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
 
@@ -3388,15 +3388,16 @@ class TestFridayClose:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 15. EOD FLAT — liquidate unprofitable positions before end of trading day
+# 15. EOD PROFIT CLEANUP — liquidate weak positions near the close
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestEodFlat:
     """
-    After EOD_EXIT_TIME (default 15:45 ET) on any trading day, positions that
-    are not in profit may be liquidated only after the minimum swing hold window
-    has elapsed. Same-day entries are not rejected just because they are flat or
-    down near the close. The rule fires at most once per calendar trading day.
+    After EOD_EXIT_TIME (default 15:50 ET) on any trading day, positions below
+    the profit threshold may be liquidated only after the minimum swing hold
+    window has elapsed. Same-day entries are not rejected just because they are
+    below the threshold near the close. The rule fires at most once per calendar
+    trading day.
     """
 
     def _state_entry(self, entry, cur, tz_ny, entry_time=None):
@@ -3414,7 +3415,7 @@ class TestEodFlat:
         return pos
 
     def test_eod_flat_triggers_when_older_position_at_loss(self):
-        """After EOD_EXIT_TIME an older position with profit < 0 must be liquidated."""
+        """After EOD_EXIT_TIME an older losing position must be liquidated."""
         from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -3438,7 +3439,33 @@ class TestEodFlat:
             engine.manage_position_exits()
 
         assert engine.state['LOSS']['pending_exit'] is True, \
-            "EOD flat must liquidate position not in profit"
+            "EOD cleanup must liquidate weak losing position"
+
+    def test_eod_flat_triggers_when_older_position_below_profit_threshold(self):
+        """After EOD_EXIT_TIME an older weak winner below 5% must be liquidated."""
+        from src.config import EOD_EXIT_TIME, PROFIT_MIN_THRESHOLD
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = entry * (1 + PROFIT_MIN_THRESHOLD - 0.01)
+        old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 30))
+        engine.state = {'WEAK': self._state_entry(entry, cur, tz_ny, old_entry)}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('WEAK', 5.0)]
+
+        eod_time = tz_ny.localize(
+            datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
+        )
+        with patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = eod_time
+            mock_dt.fromisoformat    = datetime.fromisoformat
+            engine.manage_position_exits()
+
+        assert engine.state['WEAK']['pending_exit'] is True, \
+            "EOD cleanup must liquidate older positions below the profit threshold"
 
     def test_eod_flat_triggers_when_older_position_exactly_at_entry(self):
         """After EOD_EXIT_TIME an older zero-profit position must also be liquidated."""
@@ -3464,9 +3491,9 @@ class TestEodFlat:
             engine.manage_position_exits()
 
         assert engine.state['FLAT']['pending_exit'] is True, \
-            "EOD flat must liquidate zero-profit position"
+            "EOD cleanup must liquidate zero-profit position"
 
-    def test_eod_flat_does_not_trigger_when_profit_clears_velocity_threshold(self):
+    def test_eod_flat_does_not_trigger_when_profit_clears_profit_threshold(self):
         """A strong older winner after EOD_EXIT_TIME must not be closed."""
         from src.config import EOD_EXIT_TIME, PROFIT_MIN_THRESHOLD
         ib     = _mock_ib()
@@ -3490,8 +3517,8 @@ class TestEodFlat:
         assert 'GAIN' in engine.state, "Strong profitable position must not be closed at EOD"
         assert not ib.placeOrder.called
 
-    def test_eod_flat_does_not_close_same_day_loss(self):
-        """A same-day swing entry must not be closed by EOD flat."""
+    def test_eod_flat_does_not_close_same_day_weak_position(self):
+        """A same-day swing entry must not be closed by EOD cleanup."""
         from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -3515,16 +3542,16 @@ class TestEodFlat:
         assert not ib.placeOrder.called
 
     def test_eod_flat_does_not_trigger_before_eod_time(self):
-        """Before EOD_EXIT_TIME the EOD flat rule must be inactive."""
+        """Before EOD_EXIT_TIME the EOD cleanup rule must be inactive."""
         from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
         tz_ny  = pytz.timezone('US/Eastern')
 
         entry = 100.0
-        cur   = 95.0   # -5%, would trigger if time were right
-        same_day_entry = tz_ny.localize(datetime(2024, 6, 5, 10, 0))
-        engine.state = {'EARLY': self._state_entry(entry, cur, tz_ny, same_day_entry)}
+        cur   = 104.0   # +4%, would trigger if time were right
+        old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 0))
+        engine.state = {'EARLY': self._state_entry(entry, cur, tz_ny, old_entry)}
         ib.reqTickers.return_value = [_mock_price_ticker(cur)]
 
         # One minute before EOD_EXIT_TIME
@@ -3536,11 +3563,11 @@ class TestEodFlat:
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
 
-        assert 'EARLY' in engine.state, "EOD flat must not trigger before EOD_EXIT_TIME"
+        assert 'EARLY' in engine.state, "EOD cleanup must not trigger before EOD_EXIT_TIME"
         assert not ib.placeOrder.called
 
     def test_eod_flat_fires_only_once_per_day(self):
-        """EOD flat must not re-liquidate on the second cycle of the same day."""
+        """EOD cleanup must not re-liquidate on the second cycle of the same day."""
         from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -3573,7 +3600,7 @@ class TestEodFlat:
             engine.manage_position_exits()   # second call same day — must not re-fire
 
         assert ib.placeOrder.call_count == place_count_after_first, \
-            "EOD flat must not re-fire on the second cycle of the same trading day"
+            "EOD cleanup must not re-fire on the second cycle of the same trading day"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

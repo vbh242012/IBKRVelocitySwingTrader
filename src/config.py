@@ -92,9 +92,8 @@ CHANDELIER_MULT   = 2.0    # ATR multiplier — kept after rule-combo sweep; 1.9
 
 # ── Risk rules ────────────────────────────────────────────────────────────────
 VIX_THRESHOLD        = 35
-HOLD_TRADING_BARS    = 1       # Mon-Fri trading session before velocity exit fires; weekend days are excluded
-PROFIT_MIN_THRESHOLD = 0.05    # 5% min gain to avoid velocity exit (cross-validated: 0.05 > 0.03 on both 2023-24 and 2025-26)
-VELOCITY_EXIT_TIME   = (15, 50)  # ET — stagnant-trade velocity exits are only evaluated near the close
+HOLD_TRADING_BARS    = 1       # Mon-Fri trading sessions before EOD profit cleanup; weekend days are excluded
+PROFIT_MIN_THRESHOLD = 0.05    # 5% min gain required to keep an older position overnight
 GAP_MAX_PCT          = 0.10    # max allowed ORB extension; >10% = chasing, skip entry
 MAX_DAILY_LOSS_PCT   = 0.03    # 3% intraday equity drawdown halts new entries for the day
 RSI_MIN_DELTA        = 2.0     # minimum RSI point rise; full-universe sweep improved quality vs 1.0
@@ -106,7 +105,7 @@ RISK_PER_TRADE_PCT   = 0.02    # risk 2% of current equity per trade (ATR-based 
 BREAK_EVEN_PCT       = 0.04    # once profit exceeds 4%, floor stop at entry — improves WR +4pp vs 3% threshold
 FRIDAY_CLOSE_HOUR    = 15      # ET hour after which Friday positions are evaluated for early close
 FRIDAY_MIN_PROFIT_PCT = 0.03   # Friday close: exit if profit < 3% to avoid carrying weekend gap risk
-EOD_EXIT_TIME        = (15, 45)  # ET — EOD flat only after minimum swing hold; same-day entries are not closed
+EOD_EXIT_TIME        = (15, 50)  # ET — EOD profit cleanup only after minimum swing hold; same-day entries are not closed
 FRIDAY_ENTRY_CUTOFF_TIME = (12, 0)  # ET — avoid opening new swing positions that will be force-reviewed hours later
 
 # ── Bear-phase participation ──────────────────────────────────────────────────

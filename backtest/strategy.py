@@ -5,7 +5,7 @@ Improvements over v1:
   1. RVOL is used for scanner ranking, not as an entry gate in the 8096 rule set.
   2. bars_held counts actual trading bars open (not calendar days).
      Previously, Friday entry → Saturday + Sunday counted as 2 bars,
-     firing velocity_exit after only 1 real trading session.
+     firing stale-capital cleanup after only 1 real trading session.
   3. Break-even floor: once profit ≥ BREAK_EVEN_PCT (4%), the effective
      stop cannot fall below entry price — locks in break-even.
   4. ATR-based whole-share position sizing: risk RISK_PER_TRADE_PCT (2%)
@@ -54,7 +54,7 @@ Exit rules (production):
   • Chandelier trailing stop : peak_high - ATR_CHAND × CHANDELIER_MULT
   • Hard stop                : entry × (1 - HARD_STOP_PCT) = 7% from entry
   • Break-even floor         : if profit > BREAK_EVEN_PCT, stop ≥ entry
-  • Velocity time exit       : held ≥ hold_bars and profit < 5%
+  • EOD profit cleanup       : held ≥ hold_bars and profit < 5%
   • (No take-profit bracket — removed from production)
 """
 
@@ -179,7 +179,7 @@ class VelocityBacktest:
     end             : backtest end date    (YYYY-MM-DD)
     capital         : starting capital in USD
     max_pos         : safety cap for dynamic max simultaneous positions
-    hold_bars       : trading bars before velocity time-exit check
+    hold_bars       : trading bars before EOD profit-cleanup check
     scan_count      : top-N from daily scanner considered per bar; 0 means all
     max_symbols     : download cap for bounded validation; 0/None means full filtered universe
     min_price       : minimum close price filter
@@ -191,7 +191,7 @@ class VelocityBacktest:
                       1=prior available VIX bar (used for 15-minute delayed research)
     rvol_min             : legacy optimizer parameter; 8096 uses RVOL for ranking, not as an entry gate
     break_even_pct       : once profit exceeds this, floor the stop at entry (0.04 optimal)
-    profit_min_threshold : velocity exit fires if profit < this after hold_bars
+    profit_min_threshold : EOD profit cleanup fires if profit < this after hold_bars
     chandelier_mult      : ATR multiplier for trailing stop
     breakout_pct         : legacy optimizer parameter; 10-day-high proximity is no longer an entry gate
     vcp_ratio            : legacy optimizer parameter; 8096 does not gate on VCP
@@ -1137,7 +1137,7 @@ class VelocityBacktest:
                     exit_reason = "chandelier_stop"
                     exit_price = self._stop_fill_price(row, effective_stop)
                 elif bars_held >= self.hold_bars and profit_pct < self._profit_min_threshold:
-                    exit_reason = "velocity_exit"
+                    exit_reason = "eod_profit_cleanup"
 
                 if exit_reason:
                     t.exit_date   = today.date() if hasattr(today, 'date') else today

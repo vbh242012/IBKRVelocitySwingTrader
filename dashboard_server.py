@@ -37,7 +37,7 @@ from src.config import (
     VIX_THRESHOLD,
     HOLD_TRADING_BARS,
     PROFIT_MIN_THRESHOLD,
-    VELOCITY_EXIT_TIME,
+    EOD_EXIT_TIME,
     DASHBOARD_ALLOWED_ORIGINS,
     DASHBOARD_TOKEN,
 )
@@ -228,7 +228,7 @@ def get_state():
         "vix":               dash_data.get("vix"),
         "vix_threshold":     VIX_THRESHOLD,
         "hold_trading_bars": HOLD_TRADING_BARS,
-        "velocity_exit_time": f"{VELOCITY_EXIT_TIME[0]:02d}:{VELOCITY_EXIT_TIME[1]:02d}",
+        "eod_exit_time":     f"{EOD_EXIT_TIME[0]:02d}:{EOD_EXIT_TIME[1]:02d}",
         "last_scan":         dash_data.get("last_scan"),
         "next_scan":         dash_data.get("next_scan"),
         "last_updated":      dash_data.get("last_updated"),
@@ -608,11 +608,11 @@ const ENTRY_CONDITIONS = [
 ];
 const EXIT_CONDITIONS = [
   ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(22)×2.0 from peak price; IB raises stop automatically as price climbs — only stop type used"],
-  ["2", "Velocity Exit",    "ex", "__VELOCITY_EXIT_RULE__"],
+  ["2", "EOD Profit Cleanup", "ex", "__EOD_PROFIT_CLEANUP_RULE__"],
   ["3", "Hard Stop",        "ex", "7% drawdown from fill price triggers immediate Market SELL regardless of ATR distance"],
   ["4", "Break-Even Floor", "ex", "Once profit exceeds 4%, chandelier stop floored at fill price — eliminates risk of turning a winner into a loser"],
   ["5", "Friday Close",     "ex", "After 3 PM ET on Fridays, positions with < 3% profit are liquidated to avoid weekend gap risk"],
-  ["6", "VIX Risk-Off",     "ex", "VIX > 35 blocks new entries; existing positions exit via chandelier stop, velocity exit, or hard stop"],
+  ["6", "VIX Risk-Off",     "ex", "VIX > 35 blocks new entries; existing positions exit via chandelier stop, EOD cleanup, or hard stop"],
   ["7", "Daily Loss Halt",  "ex", "3% intraday equity drawdown halts all new entries for the remainder of the trading day"],
 ];
 function renderConds(arr, containerId) {
@@ -874,10 +874,10 @@ setInterval(refresh, 5000);
 </html>"""
 
 _HTML = _HTML.replace(
-    "__VELOCITY_EXIT_RULE__",
+    "__EOD_PROFIT_CLEANUP_RULE__",
     (
         f"After {HOLD_TRADING_BARS} trading day(s), at/after "
-        f"{VELOCITY_EXIT_TIME[0] % 12 or 12}:{VELOCITY_EXIT_TIME[1]:02d} PM ET: if profit < "
+        f"{EOD_EXIT_TIME[0] % 12 or 12}:{EOD_EXIT_TIME[1]:02d} PM ET: if profit < "
         f"{PROFIT_MIN_THRESHOLD * 100:.0f}%, force-liquidate via Market SELL; "
         "frees capital for T+1 settlement"
     ),

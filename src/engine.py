@@ -27,7 +27,7 @@ from src.config import (
     TRADING_MODE, LIVE_TRADING_ACK, LIVE_TRADING_ACK_PHRASE, LIVE_IB_PORTS, PAPER_IB_PORTS,
     ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
-    VIX_THRESHOLD, HOLD_TRADING_BARS, PROFIT_MIN_THRESHOLD, VELOCITY_EXIT_TIME, BREAK_EVEN_PCT,
+    VIX_THRESHOLD, HOLD_TRADING_BARS, PROFIT_MIN_THRESHOLD, BREAK_EVEN_PCT,
     ENTRY_START, ENTRY_END, STOP_ACTIVATION_TIME, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
     POST_OPEN_AUDIT_TIME, PREMARKET_READINESS_TIME, POST_CLOSE_MAINTENANCE_TIME,
     MARKET_CLOSE_TIME, ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
@@ -213,7 +213,7 @@ class VelocityEngine:
         # Last trading dates for non-trading operational jobs.
         self._last_premarket_readiness_date: Optional[str] = None
         self._last_post_close_maintenance_date: Optional[str] = None
-        # Daily EOD flat: track the date so the exit fires once per trading day.
+        # Daily EOD profit cleanup: track the date so the exit fires once per trading day.
         self._last_eod_exit_date: Optional[str] = None
         # Avoid deleting state on one transient/partial IBKR positions snapshot.
         self._missing_position_counts: Dict[str, int] = {}
@@ -2551,7 +2551,6 @@ class VelocityEngine:
         today_str       = now_et.strftime('%Y-%m-%d')
         hhmm            = (now_et.hour, now_et.minute)
         is_eod_window   = (hhmm >= EOD_EXIT_TIME and now_et.weekday() < 5)
-        is_velocity_exit_window = (hhmm >= VELOCITY_EXIT_TIME and now_et.weekday() < 5)
         eod_exit_due    = (
             is_eod_window
             and getattr(self, '_last_eod_exit_date', None) != today_str
@@ -2635,53 +2634,36 @@ class VelocityEngine:
                     self.liquidate(sym)
                     continue
 
-            # ── 3. EOD flat — never rejects a same-day swing entry.
+            # ── 3. EOD profit cleanup — never rejects a same-day swing entry.
             #
-            # Fires once per trading day after EOD_EXIT_TIME (default 15:45 ET),
-            # but only after HOLD_TRADING_BARS has elapsed. This keeps the
-            # strategy aligned with its swing mandate while retaining an
-            # end-of-day stale-capital cleanup for older positions.
+            # Fires once per trading day after EOD_EXIT_TIME (default 15:50 ET),
+            # but only after HOLD_TRADING_BARS has elapsed. Positions that have
+            # not reached the minimum profit threshold are sold near the close so
+            # capital can settle T+1 instead of being tied up in weak follow-through.
             if eod_exit_due:
                 eod_exit_checked = True
                 if trading_days_held is None:
                     logger.warning(
-                        f"EOD FLAT: {sym} skipped — entry timestamp is unavailable "
+                        f"EOD PROFIT CLEANUP: {sym} skipped — entry timestamp is unavailable "
                         "or malformed; cannot prove minimum hold window."
                     )
                     continue
                 if trading_days_held < HOLD_TRADING_BARS:
                     logger.info(
-                        f"EOD FLAT: {sym} skipped — held {trading_days_held} "
+                        f"EOD PROFIT CLEANUP: {sym} skipped — held {trading_days_held} "
                         f"trading sessions (< {HOLD_TRADING_BARS}); swing hold window active."
                     )
                     continue
                 eod_profit = (cur - entry_price) / entry_price
-                if eod_profit <= 0:
+                if eod_profit < PROFIT_MIN_THRESHOLD:
                     logger.warning(
-                        f"EOD FLAT: {sym} not in profit at end of day "
-                        f"(profit={eod_profit*100:.2f}%, cur=${cur:.2f}, entry=${entry_price:.2f}) "
+                        f"EOD PROFIT CLEANUP: {sym} profit={eod_profit*100:.2f}% < "
+                        f"{PROFIT_MIN_THRESHOLD*100:.0f}% near the close "
+                        f"(cur=${cur:.2f}, entry=${entry_price:.2f}) "
                         f"— closing position."
                     )
                     self.liquidate(sym)
                     continue
-
-            # ── 4. Velocity exit — counts Mon-Fri trading sessions, not weekend hours
-            #
-            # Stagnant-trade recycling is intentionally an end-of-day decision.
-            # A valid swing position should not be liquidated just because it has
-            # not reached the profit threshold during the morning or midday.
-            if trading_days_held is not None and trading_days_held >= HOLD_TRADING_BARS:
-                if not is_velocity_exit_window:
-                    logger.debug(
-                        f"VELOCITY EXIT: {sym} skipped until "
-                        f"{VELOCITY_EXIT_TIME[0]:02d}:{VELOCITY_EXIT_TIME[1]:02d} ET "
-                        f"(held={trading_days_held} trading sessions)."
-                    )
-                    continue
-                profit = (cur - entry_price) / entry_price
-                if profit < PROFIT_MIN_THRESHOLD:
-                    logger.info(f"VELOCITY EXIT: {sym} stagnant. Freeing capital for T+1.")
-                    self.liquidate(sym)
 
         # Mark EOD exit as done only after at least one live-price evaluation.
         if eod_exit_due and eod_exit_checked:
@@ -2691,7 +2673,7 @@ class VelocityEngine:
             self.save_state()
 
     def check_velocity_exits(self):
-        """Backward-compatible wrapper for older callers."""
+        """Deprecated compatibility wrapper for the consolidated EOD exit manager."""
         return self.manage_position_exits()
 
     def _active_open_trades_for_symbol(self, symbol: str) -> list:
@@ -2941,7 +2923,7 @@ class VelocityEngine:
             if avg_cost <= 0:
                 logger.warning(
                     f"SYNC: {sym} — avgCost={avg_cost} from IBKR; "
-                    f"velocity-exit profit check will be skipped until price is corrected."
+                    f"EOD profit cleanup will be skipped until price is corrected."
                 )
 
             if sym not in self.state:

@@ -1090,9 +1090,8 @@
      fresh broker price only.
    - Break-even giveback: fresh broker price only.
    - Friday close: explicit weekend-risk policy.
-   - EOD flat: older positions only, after the minimum swing hold window.
-   - Velocity exit: after the configured trading-bar hold window, if profit is
-     still below `PROFIT_MIN_THRESHOLD`.
+   - EOD profit cleanup: older positions only, after the minimum swing hold
+     window, using the configured profit threshold.
 
    Validation:
 
@@ -1113,37 +1112,43 @@
      baseline because this was a live execution-policy fix, not a backtest alpha
      rule change.
 
-8. Velocity exit timing gate, 2026-06-02
+8. EOD profit cleanup consolidation, 2026-06-02
 
-   Changed live velocity exits from an all-day post-hold-window check to an
-   end-of-day capital recycling check.
+   Removed the separate live velocity-exit rule and folded the stale-capital
+   logic into one end-of-day profit cleanup rule.
 
    Fix:
 
-   - Added `VELOCITY_EXIT_TIME = (15, 50)` in `src/config.py`.
-   - Live `manage_position_exits()` now only applies the velocity sell after
-     `15:50 ET`.
-   - The hold/profit condition is unchanged:
-     after `HOLD_TRADING_BARS`, if profit is still below
-     `PROFIT_MIN_THRESHOLD`, velocity exit can liquidate.
+   - Removed `VELOCITY_EXIT_TIME` from `src/config.py`.
+   - Moved `EOD_EXIT_TIME` from `15:45 ET` to `15:50 ET`.
+   - Live `manage_position_exits()` now has no separate velocity liquidation
+     branch.
+   - EOD cleanup rule after `HOLD_TRADING_BARS`: if profit is below
+     `PROFIT_MIN_THRESHOLD` at/after `15:50 ET`, close via market sell to free
+     capital for T+1 settlement.
    - Hard stop, break-even giveback, Friday close, and broker trailing stops
-     remain independent safety exits and are not delayed to 15:50.
+     remain independent safety exits and are not delayed to 15:50 ET.
    - Dashboard rule text now says:
      `After 1 trading day(s), at/after 3:50 PM ET: if profit < 5%, force-liquidate via Market SELL; frees capital for T+1 settlement`.
-   - `/api/state` now exposes `velocity_exit_time`.
+   - `/api/state` now exposes `eod_exit_time`.
 
    Validation:
 
    ```bash
-   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_velocity_time_tests .venv/bin/python -m pytest -q tests/test_engine.py::TestVelocityExit tests/test_trailing_stop_scoring_screener.py::TestExitOrders tests/test_dashboard_server.py -p no:cacheprovider
-   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/engine.py src/config.py dashboard_server.py tests/test_engine.py tests/test_trailing_stop_scoring_screener.py tests/test_dashboard_server.py
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_eod_cleanup_tests .venv/bin/python -m pytest -q tests/test_engine.py::TestEodProfitCleanup tests/test_trailing_stop_scoring_screener.py::TestExitOrders tests/test_trailing_stop_scoring_screener.py::TestEodFlat tests/test_dashboard_server.py -p no:cacheprovider
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/engine.py src/config.py dashboard_server.py backtest/strategy.py run_backtest.py tests/test_engine.py tests/test_trailing_stop_scoring_screener.py tests/test_dashboard_server.py
    PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_full_tests .venv/bin/python -m pytest -q -p no:cacheprovider
+   PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_bt_eod_cleanup .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 300 --scoring-model legacy_v2
    ```
 
    Results:
 
-   - Focused velocity/dashboard tests: 23 passed.
-   - Full suite: 400 passed.
-   - No backtest metrics changed: the daily-bar backtester already evaluates
-     velocity exits at end-of-day close; this fix aligns live intraday behavior
-     with that daily-bar assumption.
+   - Focused EOD cleanup/dashboard tests: 30 passed.
+   - Syntax compile: passed.
+   - Full suite: 401 passed.
+   - Cached 282-symbol forward backtest, 2020-01-01 through 2026-05-22:
+     2,599 trades, +1,780.77% total return, 73.1% win rate, 6.07 profit
+     factor, -4.40% max drawdown, 4.57 Sharpe.
+   - Backtest exit breakdown now reports `eod_profit_cleanup` instead of
+     `velocity_exit`; the daily-bar backtester already evaluates this
+     stale-capital rule at the end-of-day close.

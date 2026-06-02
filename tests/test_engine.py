@@ -2,7 +2,7 @@
 Unit tests for VelocityEngine business logic.
 
 IB is fully mocked — no live connection required.
-Tests exercise entry signals, velocity exits, position limits,
+Tests exercise entry signals, EOD exit management, position limits,
 and bracket order construction.
 """
 
@@ -194,8 +194,8 @@ class TestExpertFilter:
         assert self._passes(self._ctx(spread_pct=SPREAD_MAX_PCT + 0.001)) is False
 
 
-# ── Velocity exit logic ───────────────────────────────────────────────────────
-class TestVelocityExit:
+# ── EOD profit cleanup logic ──────────────────────────────────────────────────
+class TestEodProfitCleanup:
     _TZ_NY = pytz.timezone('US/Eastern')
 
     def _entry_after_hold_window(self):
@@ -206,14 +206,14 @@ class TestVelocityExit:
         """Same-day Wednesday entry/check: 0 Mon-Fri sessions elapsed."""
         return self._TZ_NY.localize(datetime(2024, 6, 5, 10, 0)).isoformat()
 
-    def _run_velocity_check(self, engine, hour=15, minute=50):
+    def _run_exit_check(self, engine, hour=15, minute=50):
         check_time = self._TZ_NY.localize(datetime(2024, 6, 5, hour, minute))
         with patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = check_time
             mock_dt.fromisoformat = datetime.fromisoformat
             engine.manage_position_exits()
 
-    def test_stagnant_position_older_than_hold_window_triggers_exit(self):
+    def test_older_position_below_profit_threshold_triggers_eod_cleanup(self):
         ib      = _mock_ib()
         engine  = _make_engine_patched(ib)
 
@@ -227,26 +227,26 @@ class TestVelocityExit:
         ib.positions.return_value  = []
 
         with patch.object(engine, 'liquidate') as mock_liq:
-            self._run_velocity_check(engine)
+            self._run_exit_check(engine)
             mock_liq.assert_called_once_with('AAPL')
 
-    def test_profitable_position_not_exited_early(self):
+    def test_position_above_profit_threshold_not_exited_at_eod(self):
         ib      = _mock_ib()
         engine  = _make_engine_patched(ib)
 
         old_time = self._entry_after_hold_window()
         engine.state = {'AAPL': {'price': 100.0, 'time': old_time}}
 
-        # 6% gain — above PROFIT_MIN_THRESHOLD (5%) → must NOT trigger velocity exit
+        # 6% gain — above PROFIT_MIN_THRESHOLD (5%) → must NOT trigger EOD cleanup
         ticker = MagicMock()
         ticker.marketPrice.return_value = 106.0
         ib.reqTickers.return_value = [ticker]
 
         with patch.object(engine, 'liquidate') as mock_liq:
-            self._run_velocity_check(engine)
+            self._run_exit_check(engine)
             mock_liq.assert_not_called()
 
-    def test_fresh_position_not_exited(self):
+    def test_same_day_position_not_exited(self):
         ib      = _mock_ib()
         engine  = _make_engine_patched(ib)
 
@@ -258,10 +258,10 @@ class TestVelocityExit:
         ib.reqTickers.return_value = [ticker]
 
         with patch.object(engine, 'liquidate') as mock_liq:
-            self._run_velocity_check(engine)
+            self._run_exit_check(engine)
             mock_liq.assert_not_called()
 
-    def test_stagnant_position_not_exited_before_velocity_exit_time(self):
+    def test_older_position_below_threshold_not_exited_before_eod_cleanup_time(self):
         ib      = _mock_ib()
         engine  = _make_engine_patched(ib)
 
@@ -273,7 +273,7 @@ class TestVelocityExit:
         ib.reqTickers.return_value = [ticker]
 
         with patch.object(engine, 'liquidate') as mock_liq:
-            self._run_velocity_check(engine, hour=15, minute=49)
+            self._run_exit_check(engine, hour=15, minute=49)
             mock_liq.assert_not_called()
 
     def test_stale_close_price_does_not_trigger_exit_when_market_price_missing(self):
@@ -294,7 +294,7 @@ class TestVelocityExit:
         ib.positions.return_value       = []
 
         with patch.object(engine, 'liquidate') as mock_liq:
-            self._run_velocity_check(engine)
+            self._run_exit_check(engine)
             mock_liq.assert_not_called()
 
 
@@ -466,9 +466,9 @@ class TestFridayFilter:
 
 # ── VIX-High still manages positions ─────────────────────────────────────────
 class TestVixHighBranch:
-    """When VIX > threshold, velocity exits and price updates must still run."""
+    """When VIX > threshold, existing-position exits and price updates must still run."""
 
-    def test_vix_high_still_calls_velocity_exits(self):
+    def test_vix_high_still_calls_position_exit_management(self):
         import pytz as real_pytz
 
         ib     = _mock_ib()
@@ -487,7 +487,7 @@ class TestVixHighBranch:
         tz_ny    = real_pytz.timezone('US/Eastern')
         fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
 
-        with patch.object(engine, 'manage_position_exits') as mock_vel, \
+        with patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, '_update_position_prices') as mock_upd, \
              patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value  = fake_now
@@ -495,10 +495,10 @@ class TestVixHighBranch:
 
             engine.run_cycle()
 
-        mock_vel.assert_called_once()
+        mock_exits.assert_called_once()
         mock_upd.assert_called_once()
 
-    def test_vix_nan_still_calls_velocity_exits(self):
+    def test_vix_nan_still_calls_position_exit_management(self):
         import pytz as real_pytz
 
         ib     = _mock_ib()
@@ -517,7 +517,7 @@ class TestVixHighBranch:
         tz_ny    = real_pytz.timezone('US/Eastern')
         fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
 
-        with patch.object(engine, 'manage_position_exits') as mock_vel, \
+        with patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, '_update_position_prices') as mock_upd, \
              patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value  = fake_now
@@ -525,7 +525,7 @@ class TestVixHighBranch:
 
             engine.run_cycle()
 
-        mock_vel.assert_called_once()
+        mock_exits.assert_called_once()
         mock_upd.assert_called_once()
 
 
