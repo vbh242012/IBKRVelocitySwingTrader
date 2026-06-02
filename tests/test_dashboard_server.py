@@ -5,7 +5,7 @@ import pytz
 import pytest
 
 import dashboard_server as dashboard
-from src.config import SETTLED_CASH_DEPLOYMENT_PCT
+from src.config import SETTLED_CASH_DEPLOYMENT_PCT, VELOCITY_EXIT_TIME
 
 
 def _write_json(path, data):
@@ -53,6 +53,7 @@ def test_dashboard_bucket_uses_deployable_settled_cash(dashboard_files):
     assert data["cash"] == pytest.approx(1000.0)
     assert data["deployable_cash"] == pytest.approx(1000.0 * SETTLED_CASH_DEPLOYMENT_PCT)
     assert data["bucket_size"] == pytest.approx(950.0)
+    assert data["velocity_exit_time"] == f"{VELOCITY_EXIT_TIME[0]:02d}:{VELOCITY_EXIT_TIME[1]:02d}"
 
 
 def test_dashboard_blocks_bucket_when_buffer_pushes_cash_below_floor(dashboard_files):
@@ -78,3 +79,4 @@ def test_dashboard_equity_chart_uses_intraday_time_labels():
     assert "INTRADAY TODAY" in html
     assert "toLocaleTimeString" in html
     assert "toLocaleDateString" in html
+    assert "3:50 PM ET" in html

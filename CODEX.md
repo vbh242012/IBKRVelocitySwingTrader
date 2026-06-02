@@ -1057,10 +1057,10 @@
    VELOCITY_BASE_DIR=/tmp/velocity_full_tests PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m pytest -q -p no:cacheprovider
    ```
 
-  Results:
+   Results:
 
-  - Focused engine/backtest/scoring tests: passed.
-  - Full suite: 397 passed.
+   - Focused engine/backtest/scoring tests: passed.
+   - Full suite: 397 passed.
 
 7. Live exit-policy cleanup, 2026-06-02
 
@@ -1112,3 +1112,38 @@
    - Backtest metrics stayed aligned with the promoted `legacy_v2` production
      baseline because this was a live execution-policy fix, not a backtest alpha
      rule change.
+
+8. Velocity exit timing gate, 2026-06-02
+
+   Changed live velocity exits from an all-day post-hold-window check to an
+   end-of-day capital recycling check.
+
+   Fix:
+
+   - Added `VELOCITY_EXIT_TIME = (15, 50)` in `src/config.py`.
+   - Live `manage_position_exits()` now only applies the velocity sell after
+     `15:50 ET`.
+   - The hold/profit condition is unchanged:
+     after `HOLD_TRADING_BARS`, if profit is still below
+     `PROFIT_MIN_THRESHOLD`, velocity exit can liquidate.
+   - Hard stop, break-even giveback, Friday close, and broker trailing stops
+     remain independent safety exits and are not delayed to 15:50.
+   - Dashboard rule text now says:
+     `After 1 trading day(s), at/after 3:50 PM ET: if profit < 5%, force-liquidate via Market SELL; frees capital for T+1 settlement`.
+   - `/api/state` now exposes `velocity_exit_time`.
+
+   Validation:
+
+   ```bash
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_velocity_time_tests .venv/bin/python -m pytest -q tests/test_engine.py::TestVelocityExit tests/test_trailing_stop_scoring_screener.py::TestExitOrders tests/test_dashboard_server.py -p no:cacheprovider
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/engine.py src/config.py dashboard_server.py tests/test_engine.py tests/test_trailing_stop_scoring_screener.py tests/test_dashboard_server.py
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_full_tests .venv/bin/python -m pytest -q -p no:cacheprovider
+   ```
+
+   Results:
+
+   - Focused velocity/dashboard tests: 23 passed.
+   - Full suite: 400 passed.
+   - No backtest metrics changed: the daily-bar backtester already evaluates
+     velocity exits at end-of-day close; this fix aligns live intraday behavior
+     with that daily-bar assumption.

@@ -1981,7 +1981,7 @@ class TestExitOrders:
         )
 
     def _run_velocity_check(self, engine, now=None):
-        now = now or self._et(2024, 6, 5)
+        now = now or self._et(2024, 6, 5, 15, 50)
         with patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = now
             mock_dt.fromisoformat = datetime.fromisoformat
@@ -2196,6 +2196,25 @@ class TestExitOrders:
 
         assert engine.state['SLOW']['pending_exit'] is True, "Stagnant position must be marked pending exit"
         assert ib.placeOrder.called, "Market sell must be issued"
+
+    def test_velocity_exit_waits_until_configured_eod_time(self):
+        """Held stagnant positions must not be velocity-sold before 15:50 ET."""
+        from src.config import PROFIT_MIN_THRESHOLD
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+
+        entry_price = 100.0
+        stagnant_price = entry_price * (1 + PROFIT_MIN_THRESHOLD - 0.005)
+        ib.reqTickers.return_value = [_mock_price_ticker(stagnant_price)]
+        engine.state = {'SLOW': self._make_state_entry(
+            price=entry_price,
+            entry_time=self._et(2024, 6, 3).isoformat(),
+        )}
+
+        self._run_velocity_check(engine, now=self._et(2024, 6, 5, 15, 49))
+
+        assert 'pending_exit' not in engine.state['SLOW']
+        assert not ib.placeOrder.called
 
     def test_pending_exit_blocks_duplicate_sell_on_next_cycle(self):
         """A position with an in-flight sell must not submit another market sell."""

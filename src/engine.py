@@ -27,7 +27,7 @@ from src.config import (
     TRADING_MODE, LIVE_TRADING_ACK, LIVE_TRADING_ACK_PHRASE, LIVE_IB_PORTS, PAPER_IB_PORTS,
     ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
-    VIX_THRESHOLD, HOLD_TRADING_BARS, PROFIT_MIN_THRESHOLD, BREAK_EVEN_PCT,
+    VIX_THRESHOLD, HOLD_TRADING_BARS, PROFIT_MIN_THRESHOLD, VELOCITY_EXIT_TIME, BREAK_EVEN_PCT,
     ENTRY_START, ENTRY_END, STOP_ACTIVATION_TIME, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
     POST_OPEN_AUDIT_TIME, PREMARKET_READINESS_TIME, POST_CLOSE_MAINTENANCE_TIME,
     MARKET_CLOSE_TIME, ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
@@ -2551,9 +2551,10 @@ class VelocityEngine:
         today_str       = now_et.strftime('%Y-%m-%d')
         hhmm            = (now_et.hour, now_et.minute)
         is_eod_window   = (hhmm >= EOD_EXIT_TIME and now_et.weekday() < 5)
+        is_velocity_exit_window = (hhmm >= VELOCITY_EXIT_TIME and now_et.weekday() < 5)
         eod_exit_due    = (
             is_eod_window
-            and self._last_eod_exit_date != today_str
+            and getattr(self, '_last_eod_exit_date', None) != today_str
         )
         changed          = False
         eod_exit_checked = False
@@ -2665,7 +2666,18 @@ class VelocityEngine:
                     continue
 
             # ── 4. Velocity exit — counts Mon-Fri trading sessions, not weekend hours
+            #
+            # Stagnant-trade recycling is intentionally an end-of-day decision.
+            # A valid swing position should not be liquidated just because it has
+            # not reached the profit threshold during the morning or midday.
             if trading_days_held is not None and trading_days_held >= HOLD_TRADING_BARS:
+                if not is_velocity_exit_window:
+                    logger.debug(
+                        f"VELOCITY EXIT: {sym} skipped until "
+                        f"{VELOCITY_EXIT_TIME[0]:02d}:{VELOCITY_EXIT_TIME[1]:02d} ET "
+                        f"(held={trading_days_held} trading sessions)."
+                    )
+                    continue
                 profit = (cur - entry_price) / entry_price
                 if profit < PROFIT_MIN_THRESHOLD:
                     logger.info(f"VELOCITY EXIT: {sym} stagnant. Freeing capital for T+1.")

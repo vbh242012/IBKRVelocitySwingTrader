@@ -37,6 +37,7 @@ from src.config import (
     VIX_THRESHOLD,
     HOLD_TRADING_BARS,
     PROFIT_MIN_THRESHOLD,
+    VELOCITY_EXIT_TIME,
     DASHBOARD_ALLOWED_ORIGINS,
     DASHBOARD_TOKEN,
 )
@@ -227,6 +228,7 @@ def get_state():
         "vix":               dash_data.get("vix"),
         "vix_threshold":     VIX_THRESHOLD,
         "hold_trading_bars": HOLD_TRADING_BARS,
+        "velocity_exit_time": f"{VELOCITY_EXIT_TIME[0]:02d}:{VELOCITY_EXIT_TIME[1]:02d}",
         "last_scan":         dash_data.get("last_scan"),
         "next_scan":         dash_data.get("next_scan"),
         "last_updated":      dash_data.get("last_updated"),
@@ -874,7 +876,8 @@ setInterval(refresh, 5000);
 _HTML = _HTML.replace(
     "__VELOCITY_EXIT_RULE__",
     (
-        f"After {HOLD_TRADING_BARS} trading day(s): if profit < "
+        f"After {HOLD_TRADING_BARS} trading day(s), at/after "
+        f"{VELOCITY_EXIT_TIME[0] % 12 or 12}:{VELOCITY_EXIT_TIME[1]:02d} PM ET: if profit < "
         f"{PROFIT_MIN_THRESHOLD * 100:.0f}%, force-liquidate via Market SELL; "
         "frees capital for T+1 settlement"
     ),

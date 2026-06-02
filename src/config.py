@@ -94,6 +94,7 @@ CHANDELIER_MULT   = 2.0    # ATR multiplier — kept after rule-combo sweep; 1.9
 VIX_THRESHOLD        = 35
 HOLD_TRADING_BARS    = 1       # Mon-Fri trading session before velocity exit fires; weekend days are excluded
 PROFIT_MIN_THRESHOLD = 0.05    # 5% min gain to avoid velocity exit (cross-validated: 0.05 > 0.03 on both 2023-24 and 2025-26)
+VELOCITY_EXIT_TIME   = (15, 50)  # ET — stagnant-trade velocity exits are only evaluated near the close
 GAP_MAX_PCT          = 0.10    # max allowed ORB extension; >10% = chasing, skip entry
 MAX_DAILY_LOSS_PCT   = 0.03    # 3% intraday equity drawdown halts new entries for the day
 RSI_MIN_DELTA        = 2.0     # minimum RSI point rise; full-universe sweep improved quality vs 1.0

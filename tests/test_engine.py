@@ -206,8 +206,8 @@ class TestVelocityExit:
         """Same-day Wednesday entry/check: 0 Mon-Fri sessions elapsed."""
         return self._TZ_NY.localize(datetime(2024, 6, 5, 10, 0)).isoformat()
 
-    def _run_velocity_check(self, engine):
-        check_time = self._TZ_NY.localize(datetime(2024, 6, 5, 10, 30))
+    def _run_velocity_check(self, engine, hour=15, minute=50):
+        check_time = self._TZ_NY.localize(datetime(2024, 6, 5, hour, minute))
         with patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = check_time
             mock_dt.fromisoformat = datetime.fromisoformat
@@ -259,6 +259,21 @@ class TestVelocityExit:
 
         with patch.object(engine, 'liquidate') as mock_liq:
             self._run_velocity_check(engine)
+            mock_liq.assert_not_called()
+
+    def test_stagnant_position_not_exited_before_velocity_exit_time(self):
+        ib      = _mock_ib()
+        engine  = _make_engine_patched(ib)
+
+        old_time = self._entry_after_hold_window()
+        engine.state = {'AAPL': {'price': 100.0, 'time': old_time}}
+
+        ticker = MagicMock()
+        ticker.marketPrice.return_value = 101.0
+        ib.reqTickers.return_value = [ticker]
+
+        with patch.object(engine, 'liquidate') as mock_liq:
+            self._run_velocity_check(engine, hour=15, minute=49)
             mock_liq.assert_not_called()
 
     def test_stale_close_price_does_not_trigger_exit_when_market_price_missing(self):
