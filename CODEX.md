@@ -1022,3 +1022,42 @@
    - Legacy v2 improved return, drawdown, Sharpe, win rate, and trade count.
      Profit factor declined but remained very high; net risk-adjusted result
      justified promotion.
+
+6. Live/backtest entry-rule sync, 2026-06-02
+
+   Reviewed the live entry path against the daily-bar backtester after the
+   `legacy_v2` scoring promotion. The core 8096 gates were aligned except for
+   one important mismatch:
+
+   - Backtest gap cap checked the signal day's open against `prev_high`.
+   - Live gap cap checked the current live price against ORB.
+
+   Fix:
+
+   - Live scan gate now uses `day_open <= orb_high * (1 + active_gap_cap)`.
+   - Live pre-order reprice validation uses the same opening-gap definition.
+   - Current-price extension is left to scoring/ranking quality, matching the
+     backtester where the completed close can extend beyond the opening-gap cap.
+
+   Live-only execution safeguards intentionally remain live-only:
+
+   - Bid/ask spread gate.
+   - Correlation and sector concentration gates.
+   - Friday entry cutoff and Friday liquidity multiplier.
+   - Broker/order preflight and spread-aware limit pricing.
+
+   These are not removed because daily-bar backtests cannot model them
+   reliably, and they are production safety controls rather than alpha-entry
+   rule drift.
+
+   Validation:
+
+   ```bash
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/engine.py src/config.py src/scoring.py backtest/strategy.py tests/test_engine.py tests/test_backtest.py tests/test_trailing_stop_scoring_screener.py
+   VELOCITY_BASE_DIR=/tmp/velocity_full_tests PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m pytest -q -p no:cacheprovider
+   ```
+
+   Results:
+
+   - Focused engine/backtest/scoring tests: passed.
+   - Full suite: 397 passed.

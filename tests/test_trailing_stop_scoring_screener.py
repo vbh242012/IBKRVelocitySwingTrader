@@ -135,13 +135,17 @@ def _ctx(price=100.0, orb=95.0, ma50=105.0, ma200=90.0,
          atr_chandelier=None,
          day_range_location=0.75,
          intraday_gain=0.01,
+         day_open=None,
          bid=None, ask=None):
     """Build a get_technical_context()-style dict with all production-rule fields."""
     high10 = round(price * 1.005, 4)   # retained for dashboard/context compatibility
     bid = round(price * (1 - spread_pct / 2), 4) if bid is None else bid
     ask = round(price * (1 + spread_pct / 2), 4) if ask is None else ask
+    if day_open is None:
+        day_open = price / (1 + intraday_gain) if intraday_gain > -0.99 else price
     return {
         'orb_high':       orb,
+        'day_open':       day_open,
         'ma50':           ma50,
         'ma200':          ma200,
         'rsi':            rsi,
@@ -402,7 +406,11 @@ class TestBracketOrderMath:
     def test_high_priced_stock_skipped_when_qty_would_be_zero(self):
         """price above bucket_size → int qty = 0 → skip; no placeOrder calls."""
         ib, engine, ctx = self._setup()
-        ctx['live_price']     = 1000.0
+        ctx['live_price']     = 10000.0
+        ctx['bid']            = 9990.0
+        ctx['ask']            = 10010.0
+        ctx['spread_pct']     = (ctx['ask'] - ctx['bid']) / ((ctx['ask'] + ctx['bid']) / 2)
+        ctx['day_open']       = ctx['orb_high']
         ctx['atr']            = 10.0
         ctx['atr_chandelier'] = 10.0
         _run_entry_cycle(ib, engine, ctx)
@@ -2571,15 +2579,39 @@ class TestEdgeCases:
         )
 
     def test_reprice_check_uses_regime_specific_gap_cap(self):
-        """Bear-mode reprice validation must keep the stricter bear gap cap."""
+        """Bear-mode reprice validation must keep the stricter opening-gap cap."""
         from src.config import BEAR_GAP_MAX_PCT
 
         engine = _make_engine(_mock_ib())
-        ctx = _ctx(price=101.0, orb=100.0, ma50=95.0, ma200=85.0)
+        ctx = _ctx(
+            price=101.0,
+            orb=100.0,
+            ma50=95.0,
+            ma200=85.0,
+            day_open=100.0 * (1 + BEAR_GAP_MAX_PCT + 0.005),
+        )
         ctx['high10'] = 101.0
 
         assert not engine._entry_price_is_still_valid(
             'TSLA', ctx, 104.5,
+            gap_max_pct=BEAR_GAP_MAX_PCT,
+        )
+
+    def test_reprice_check_allows_current_extension_when_open_gap_passed(self):
+        """Backtest-compatible gap check uses day open, not refreshed extension."""
+        from src.config import BEAR_GAP_MAX_PCT
+
+        engine = _make_engine(_mock_ib())
+        ctx = _ctx(
+            price=101.0,
+            orb=100.0,
+            ma50=95.0,
+            ma200=85.0,
+            day_open=100.0 * (1 + BEAR_GAP_MAX_PCT),
+        )
+
+        assert engine._entry_price_is_still_valid(
+            'TSLA', ctx, 106.0,
             gap_max_pct=BEAR_GAP_MAX_PCT,
         )
 
@@ -2773,12 +2805,14 @@ class TestEdgeCases:
 
 class TestGapFilter:
     """
-    Gap filter: price > orb_high * (1 + GAP_MAX_PCT) must block the signal.
+    Gap filter: day_open > orb_high * (1 + GAP_MAX_PCT) must block the signal.
+    This matches the daily-bar backtester, where the gap cap is checked against
+    the signal day's open rather than the completed close.
     """
 
-    def test_gap_filter_blocks_excessive_extension(self):
+    def test_gap_filter_blocks_excessive_opening_gap(self):
         """
-        Price that is >10% above ORB high must not generate a signal,
+        Day open that is >10% above ORB high must not generate a signal,
         even if all other conditions pass.
         """
         from src.config import GAP_MAX_PCT
@@ -2786,9 +2820,10 @@ class TestGapFilter:
         engine = _make_engine(ib)
 
         orb_h = 100.0
-        price = orb_h * (1 + GAP_MAX_PCT + 0.01)   # 11% above ORB — fails gap filter
+        price = orb_h * (1 + GAP_MAX_PCT + 0.02)
+        day_open = orb_h * (1 + GAP_MAX_PCT + 0.01)   # 11% opening gap — fails gap filter
         ctx = _ctx(
-            price=price, orb=orb_h,
+            price=price, orb=orb_h, day_open=day_open,
             ma50=price - 5, ma200=price - 20,       # price > MA50 > MA200 ✓
             rsi=62.0, rsi_prev=57.0,
             dollar_vol=500_000_000,
@@ -2805,19 +2840,20 @@ class TestGapFilter:
             mock_dt.fromisoformat     = datetime.fromisoformat
             engine.run_cycle()
 
-        assert ib.placeOrder.call_count == 0, "Excessive gap must block order placement"
+        assert ib.placeOrder.call_count == 0, "Excessive opening gap must block order placement"
         assert 'GAPPER' not in engine.state
 
-    def test_gap_filter_passes_at_boundary(self):
-        """Price exactly at ORB * (1 + GAP_MAX_PCT) must pass the gap filter."""
+    def test_gap_filter_passes_when_open_at_boundary(self):
+        """Day open exactly at ORB * (1 + GAP_MAX_PCT) must pass the gap filter."""
         from src.config import GAP_MAX_PCT
         ib     = _mock_ib()
         engine = _make_engine(ib)
 
         orb_h = 100.0
-        price = orb_h * (1 + GAP_MAX_PCT)           # exactly 10% — passes
+        day_open = orb_h * (1 + GAP_MAX_PCT)        # exactly 10% — passes
+        price = day_open * 1.01                     # current extension is scorer quality, not hard gap gate
         ctx = _ctx(
-            price=price, orb=orb_h,
+            price=price, orb=orb_h, day_open=day_open,
             ma50=price - 5, ma200=price - 20,
             rsi=62.0, rsi_prev=57.0,
             dollar_vol=500_000_000,
@@ -2841,7 +2877,7 @@ class TestGapFilter:
             mock_dt.fromisoformat     = datetime.fromisoformat
             engine.run_cycle()
 
-        assert ib.placeOrder.call_count == 2, "Price at gap boundary must generate 2 placeOrder calls (BUY + TRAIL)"
+        assert ib.placeOrder.call_count == 2, "Opening gap at boundary must generate 2 placeOrder calls (BUY + TRAIL)"
 
 
 class TestDailyLossCircuitBreaker:

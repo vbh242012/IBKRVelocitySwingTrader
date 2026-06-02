@@ -2869,10 +2869,11 @@ class VelocityEngine:
             )
             return False
 
-        if price > orb_h * (1 + gap_max_pct):
+        day_open = float(ctx.get('day_open', price) or price)
+        if day_open > orb_h * (1 + gap_max_pct):
             logger.warning(
-                f"SKIP {sym}: refreshed price ${price:.2f} is beyond "
-                f"{gap_max_pct*100:.0f}% gap cap from ORB ${orb_h:.2f}"
+                f"SKIP {sym}: day open ${day_open:.2f} is beyond "
+                f"{gap_max_pct*100:.0f}% opening-gap cap from ORB ${orb_h:.2f}"
             )
             return False
 
@@ -3281,6 +3282,7 @@ class VelocityEngine:
                         continue
 
                     price        = ctx['live_price']
+                    day_open     = float(ctx.get('day_open') or price)
                     orb_h        = ctx['orb_high']
                     ma50         = ctx['ma50']
                     ma200        = ctx['ma200']
@@ -3306,7 +3308,7 @@ class VelocityEngine:
                     c_spread   = spread_pct <= SPREAD_MAX_PCT
                     c_dol_vol  = dol_vol_20d >= dol_vol_threshold
                     c_orb      = price > orb_h
-                    c_gap      = price <= orb_h * (1 + gap_max_pct)
+                    c_gap      = day_open <= orb_h * (1 + gap_max_pct)
                     c_rsi_rise  = rsi > rsi_p
                     c_rsi_delta = (rsi - rsi_p) >= rsi_min_delta
                     c_rsi_lvl   = rsi > rsi_threshold
@@ -3332,6 +3334,7 @@ class VelocityEngine:
                         f"ATR5/ATR20={atr_ratio:.2f}(vcp<{vcp_ratio}) "
                         f"VolPace={rvol:.1f}(≥{rvol_min}) rawRVOL={ctx.get('rvol_raw', rvol):.1f} "
                         f"spread={spread_pct*100:.2f}%(≤{SPREAD_MAX_PCT*100:.1f}%) "
+                        f"Open=${day_open:.2f} OpenGap={(day_open/orb_h - 1) if orb_h > 0 else float('nan'):+.2%}(≤{gap_max_pct:.0%}) "
                         f"DayLoc={day_loc if day_loc is not None else float('nan'):.2f}(≥{DAY_RANGE_LOCATION_MIN:.2f}) "
                         f"OpenGain={intraday_gain if intraday_gain is not None else float('nan'):+.2%}(≥{INTRADAY_GAIN_MIN:.1%}) "
                         f"RSI={rsi:.1f}(Δ{rsi-rsi_p:+.1f}) "
@@ -3356,7 +3359,7 @@ class VelocityEngine:
                             (f'OpenGain≥{INTRADAY_GAIN_MIN:.1%}', c_open_gain),
                             (f'ATR%≤{ATR_PCT_MAX:.0%}', c_atr_pct),
                             ('price>ORB', c_orb),
-                            (f'gap≤{gap_max_pct*100:.0f}%', c_gap),
+                            (f'open gap≤{gap_max_pct*100:.0f}%', c_gap),
                             (f'RSIΔ≥{rsi_min_delta}', c_rsi_delta),
                             (f'RSI>{rsi_threshold}', c_rsi_lvl),
                         ] if not v]

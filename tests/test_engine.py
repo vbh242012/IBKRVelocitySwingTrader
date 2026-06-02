@@ -86,23 +86,29 @@ class TestExpertFilter:
     """
     The entry guard in run_cycle is:
         price > orb_high
-        price > ma50 > ma200
-        rsi > rsi_prev
-        rsi > 55
+        day_open <= orb_high * (1 + active gap cap)
+        RSI delta >= active minimum
+        RSI > active threshold
         day_range_location >= configured minimum
         intraday_gain >= configured minimum
         ATR_CHAND / price <= configured maximum
+        bid/ask spread <= configured maximum
+        20-day dollar volume >= active threshold
     """
 
     def _ctx(self, price=110, orb=100, ma50=105, ma200=90, rsi=60, rsi_prev=55,
              dollar_vol_20d=300_000_000, day_range_location=0.75,
-             intraday_gain=0.01):
+             intraday_gain=0.01, day_open=None, spread_pct=0.002):
+        if day_open is None:
+            day_open = price / (1 + intraday_gain) if intraday_gain > -0.99 else price
         return dict(orb_high=orb, ma50=ma50, ma200=ma200,
+                    day_open=day_open,
                     rsi=rsi, rsi_prev=rsi_prev, atr=2.0,
                     atr_chandelier=2.0,
                     close=price, live_price=price,
-                    bid=price * 0.999, ask=price * 1.001,
-                    spread_pct=0.002,
+                    bid=price * (1 - spread_pct / 2),
+                    ask=price * (1 + spread_pct / 2),
+                    spread_pct=spread_pct,
                     dollar_vol_20d=dollar_vol_20d,
                     day_range_location=day_range_location,
                     intraday_gain=intraday_gain,
@@ -113,17 +119,21 @@ class TestExpertFilter:
             DAY_RANGE_LOCATION_MIN,
             INTRADAY_GAIN_MIN,
             RSI_THRESHOLD,
+            RSI_MIN_DELTA,
+            GAP_MAX_PCT,
             SCAN_MIN_DOLLAR_VOL,
             ATR_PCT_MAX,
+            SPREAD_MAX_PCT,
         )
         p = ctx['live_price']
         return (p > ctx['orb_high']
-                and p > ctx['ma50'] > ctx['ma200']
-                and ctx['rsi'] > ctx['rsi_prev']
+                and ctx['day_open'] <= ctx['orb_high'] * (1 + GAP_MAX_PCT)
+                and (ctx['rsi'] - ctx['rsi_prev']) >= RSI_MIN_DELTA
                 and ctx['rsi'] > RSI_THRESHOLD
                 and ctx['day_range_location'] >= DAY_RANGE_LOCATION_MIN
                 and ctx['intraday_gain'] >= INTRADAY_GAIN_MIN
                 and ctx['atr_chandelier'] / p <= ATR_PCT_MAX
+                and ctx['spread_pct'] <= SPREAD_MAX_PCT
                 and ctx['dollar_vol_20d'] >= SCAN_MIN_DOLLAR_VOL)
 
     def test_all_conditions_met(self):
@@ -132,11 +142,11 @@ class TestExpertFilter:
     def test_fails_when_price_below_orb(self):
         assert self._passes(self._ctx(price=99, orb=100)) is False
 
-    def test_fails_when_price_below_ma50(self):
-        assert self._passes(self._ctx(price=110, ma50=115)) is False
+    def test_ignores_price_below_ma50_when_active_entry_rules_pass(self):
+        assert self._passes(self._ctx(price=110, ma50=115)) is True
 
-    def test_fails_when_ma50_below_ma200(self):
-        assert self._passes(self._ctx(ma50=85, ma200=90)) is False
+    def test_ignores_ma50_below_ma200_when_active_entry_rules_pass(self):
+        assert self._passes(self._ctx(ma50=85, ma200=90)) is True
 
     def test_fails_when_rsi_not_rising(self):
         assert self._passes(self._ctx(rsi=60, rsi_prev=65)) is False
@@ -172,6 +182,16 @@ class TestExpertFilter:
         ctx = self._ctx()
         ctx['atr_chandelier'] = ctx['live_price'] * (ATR_PCT_MAX + 0.01)
         assert self._passes(ctx) is False
+
+    def test_fails_when_opening_gap_above_threshold(self):
+        from src.config import GAP_MAX_PCT
+        assert self._passes(
+            self._ctx(day_open=100 * (1 + GAP_MAX_PCT + 0.01))
+        ) is False
+
+    def test_fails_when_spread_above_threshold(self):
+        from src.config import SPREAD_MAX_PCT
+        assert self._passes(self._ctx(spread_pct=SPREAD_MAX_PCT + 0.001)) is False
 
 
 # ── Velocity exit logic ───────────────────────────────────────────────────────
