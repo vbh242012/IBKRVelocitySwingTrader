@@ -922,11 +922,16 @@ class VelocityEngine:
             for candidate in (
                 ticker.marketPrice(),
                 getattr(ticker, 'last', None),
-                getattr(ticker, 'close', None),
             ):
                 price = self._coerce_positive_price(candidate)
                 if price is not None:
                     return price
+            bid = self._coerce_positive_price(getattr(ticker, 'bid', None))
+            ask = self._coerce_positive_price(getattr(ticker, 'ask', None))
+            if bid is not None and ask is not None and ask >= bid:
+                return (bid + ask) / 2.0
+            if bid is not None:
+                return bid
         except Exception as e:
             logger.warning(f"PRICE {sym}: fresh market price unavailable ({e})")
         return None
@@ -2534,8 +2539,13 @@ class VelocityEngine:
         }
 
     # ── Exit management ────────────────────────────────────────────────────────
-    def check_velocity_exits(self):
-        """Manages all forced exits: intraday hard stop, EOD flat, Friday close, velocity exit."""
+    def manage_position_exits(self):
+        """Manage live software exits for existing positions.
+
+        Broker-side trailing stops remain the primary protection. Software exits
+        require a fresh broker price so stale dashboard/cache values cannot
+        liquidate a valid swing position.
+        """
         now_et          = datetime.now(_TZ_NY)
         is_friday_close = (now_et.weekday() == 4 and now_et.hour >= FRIDAY_CLOSE_HOUR)
         today_str       = now_et.strftime('%Y-%m-%d')
@@ -2545,7 +2555,8 @@ class VelocityEngine:
             is_eod_window
             and self._last_eod_exit_date != today_str
         )
-        changed         = False
+        changed          = False
+        eod_exit_checked = False
 
         for sym in list(self.state.keys()):
             data        = self.state[sym]
@@ -2558,44 +2569,62 @@ class VelocityEngine:
 
             cached_cur = self._coerce_positive_price(data.get('current_price', 0))
             fresh_cur  = self._fresh_market_price(sym)
-            if fresh_cur is not None:
-                cur = fresh_cur
-                self.state[sym]['current_price'] = round(cur, 2)
-                self.state[sym]['price_checked_at'] = now_et.isoformat()
-                changed = True
-            else:
-                cur = cached_cur or 0.0
+            if fresh_cur is None:
                 logger.warning(
-                    f"EXIT: {sym} fresh price unavailable; using cached current_price "
-                    f"{cur if cur else 'unavailable'} for exit checks."
+                    f"EXIT: {sym} fresh price unavailable; skipping software exit checks "
+                    f"(cached current_price={cached_cur if cached_cur else 'unavailable'})."
+                )
+                continue
+
+            cur = fresh_cur
+            self.state[sym]['current_price'] = round(cur, 2)
+            self.state[sym]['price_checked_at'] = now_et.isoformat()
+            changed = True
+
+            raw_time = data.get('time', '')
+            trading_days_held = None
+            if raw_time:
+                try:
+                    entry_dt = datetime.fromisoformat(raw_time)
+                    if entry_dt.tzinfo is None:
+                        entry_dt = _TZ_NY.localize(entry_dt)
+                    trading_days_held = _count_trading_days(entry_dt, now_et)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        f"EXIT: {sym} — malformed entry timestamp {raw_time!r}; "
+                        "minimum-hold exits are disabled for this cycle"
+                    )
+            else:
+                logger.warning(
+                    f"EXIT: {sym} — missing entry timestamp; minimum-hold exits "
+                    "are disabled for this cycle"
                 )
 
-            # ── 1. Intraday hard stop — uses a fresh broker price whenever available
-            if cur > 0:
-                drawdown = (cur - entry_price) / entry_price
-                if drawdown <= -HARD_STOP_PCT:
-                    logger.warning(
-                        f"HARD STOP: {sym} down {drawdown*100:.1f}% from entry "
-                        f"(${cur:.2f} vs entry ${entry_price:.2f}). Forcing exit."
-                    )
-                    self.liquidate(sym)
-                    continue
+            # ── 1. Intraday hard stop — requires a fresh broker price
+            drawdown = (cur - entry_price) / entry_price
+            if drawdown <= -HARD_STOP_PCT:
+                logger.warning(
+                    f"HARD STOP: {sym} down {drawdown*100:.1f}% from entry "
+                    f"(${cur:.2f} vs entry ${entry_price:.2f}). Forcing exit."
+                )
+                self.liquidate(sym)
+                continue
 
-                peak_price = max(float(data.get('peak_price', entry_price) or entry_price), cur)
-                if peak_price != float(data.get('peak_price', entry_price) or entry_price):
-                    self.state[sym]['peak_price'] = round(peak_price, 2)
-                    changed = True
-                if peak_price >= entry_price * (1 + BREAK_EVEN_PCT) and cur <= entry_price:
-                    logger.warning(
-                        f"BREAK-EVEN EXIT: {sym} gave back a prior "
-                        f"{BREAK_EVEN_PCT*100:.0f}%+ profit "
-                        f"(peak=${peak_price:.2f}, current=${cur:.2f}, entry=${entry_price:.2f})."
-                    )
-                    self.liquidate(sym)
-                    continue
+            peak_price = max(float(data.get('peak_price', entry_price) or entry_price), cur)
+            if peak_price != float(data.get('peak_price', entry_price) or entry_price):
+                self.state[sym]['peak_price'] = round(peak_price, 2)
+                changed = True
+            if peak_price >= entry_price * (1 + BREAK_EVEN_PCT) and cur <= entry_price:
+                logger.warning(
+                    f"BREAK-EVEN EXIT: {sym} gave back a prior "
+                    f"{BREAK_EVEN_PCT*100:.0f}%+ profit "
+                    f"(peak=${peak_price:.2f}, current=${cur:.2f}, entry=${entry_price:.2f})."
+                )
+                self.liquidate(sym)
+                continue
 
-            # ── 2. Friday afternoon close — avoid carrying weekend gap risk
-            if is_friday_close and cur > 0:
+            # ── 2. Friday afternoon close — explicit weekend-risk policy
+            if is_friday_close:
                 friday_profit = (cur - entry_price) / entry_price
                 if friday_profit < FRIDAY_MIN_PROFIT_PCT:
                     logger.warning(
@@ -2605,13 +2634,26 @@ class VelocityEngine:
                     self.liquidate(sym)
                     continue
 
-            # ── 3. EOD flat — liquidate any position not in profit at end of day
+            # ── 3. EOD flat — never rejects a same-day swing entry.
             #
             # Fires once per trading day after EOD_EXIT_TIME (default 15:45 ET),
-            # after the new-entry window closes (15:30 ET) and with enough time
-            # to fill before the 16:00 close. The intent is to not carry overnight
-            # risk on a position that hasn't paid off during its session.
-            if eod_exit_due and cur > 0:
+            # but only after HOLD_TRADING_BARS has elapsed. This keeps the
+            # strategy aligned with its swing mandate while retaining an
+            # end-of-day stale-capital cleanup for older positions.
+            if eod_exit_due:
+                eod_exit_checked = True
+                if trading_days_held is None:
+                    logger.warning(
+                        f"EOD FLAT: {sym} skipped — entry timestamp is unavailable "
+                        "or malformed; cannot prove minimum hold window."
+                    )
+                    continue
+                if trading_days_held < HOLD_TRADING_BARS:
+                    logger.info(
+                        f"EOD FLAT: {sym} skipped — held {trading_days_held} "
+                        f"trading sessions (< {HOLD_TRADING_BARS}); swing hold window active."
+                    )
+                    continue
                 eod_profit = (cur - entry_price) / entry_price
                 if eod_profit <= 0:
                     logger.warning(
@@ -2623,38 +2665,22 @@ class VelocityEngine:
                     continue
 
             # ── 4. Velocity exit — counts Mon-Fri trading sessions, not weekend hours
-            raw_time = data.get('time', '')
-            if not raw_time:
-                logger.warning(f"EXIT: {sym} — missing entry timestamp; skipping velocity-exit check")
-                continue
-            try:
-                entry_dt = datetime.fromisoformat(raw_time)
-            except (ValueError, TypeError):
-                logger.warning(
-                    f"EXIT: {sym} — malformed entry timestamp {raw_time!r}; "
-                    "skipping velocity-exit check"
-                )
-                continue
-            if entry_dt.tzinfo is None:
-                entry_dt = _TZ_NY.localize(entry_dt)
-
-            if _count_trading_days(entry_dt, now_et) >= HOLD_TRADING_BARS:
-                price = cur
-                if price <= 0:
-                    logger.warning(f"No price data for {sym}, skipping exit check this cycle.")
-                    continue
-                profit = (price - entry_price) / entry_price
-
+            if trading_days_held is not None and trading_days_held >= HOLD_TRADING_BARS:
+                profit = (cur - entry_price) / entry_price
                 if profit < PROFIT_MIN_THRESHOLD:
                     logger.info(f"VELOCITY EXIT: {sym} stagnant. Freeing capital for T+1.")
                     self.liquidate(sym)
 
-        # Mark EOD exit as done for today so it doesn't re-fire on subsequent cycles.
-        if eod_exit_due:
+        # Mark EOD exit as done only after at least one live-price evaluation.
+        if eod_exit_due and eod_exit_checked:
             self._last_eod_exit_date = today_str
 
         if changed:
             self.save_state()
+
+    def check_velocity_exits(self):
+        """Backward-compatible wrapper for older callers."""
+        return self.manage_position_exits()
 
     def _active_open_trades_for_symbol(self, symbol: str) -> list:
         """Return non-terminal open trades for one symbol."""
@@ -3102,7 +3128,7 @@ class VelocityEngine:
                 "ERROR",
                 f"{e} Managing existing positions only; no scanner or new entries."
             )
-            self.check_velocity_exits()
+            self.manage_position_exits()
             self._update_position_prices()
             self._write_dashboard_data(connected=True)
             return
@@ -3139,13 +3165,13 @@ class VelocityEngine:
                 f"= {(1 - equity/self._day_start_equity)*100:.1f}% loss). "
                 f"No new entries for the rest of today."
             )
-            self.check_velocity_exits()
+            self.manage_position_exits()
             self._update_position_prices()
             return
 
         # 3. Manage Existing.  Entry-only gates such as VIX, SPY regime, scanner,
         # and slot checks must not delay software exits for positions already held.
-        self.check_velocity_exits()
+        self.manage_position_exits()
 
         if self._operator_halt_active():
             logger.warning(
@@ -3421,7 +3447,7 @@ class VelocityEngine:
                         if placed >= slots:
                             break
                         if placed > 0:
-                            self.check_velocity_exits()
+                            self.manage_position_exits()
 
                         atr   = ctx['atr']
 

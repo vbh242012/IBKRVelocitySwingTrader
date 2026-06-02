@@ -128,7 +128,7 @@
    - Filled liquidation attempts mark state `pending_exit=True`; state is removed only after IBKR sync confirms the position is flat.
    - `_sync_positions_from_ibkr()` must backfill `fill_price`, `broker_avg_cost`, and `peak_price` for positions recovered after a restart.
    - `_preflight_order()` must handle both `OrderState` and `[OrderState]` returns from IBKR `whatIfOrder()`.
-   - Live break-even protection is dual enforced: dashboard/effective stop floors at entry after the 4% threshold, and `check_velocity_exits()` market-sells if a prior 4%+ winner retraces to entry.
+   - Live break-even protection is dual enforced: dashboard/effective stop floors at entry after the 4% threshold, and `manage_position_exits()` market-sells if a prior 4%+ winner retraces to entry.
 
 11. Latest production-safety changes to preserve
 
@@ -1057,7 +1057,58 @@
    VELOCITY_BASE_DIR=/tmp/velocity_full_tests PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m pytest -q -p no:cacheprovider
    ```
 
+  Results:
+
+  - Focused engine/backtest/scoring tests: passed.
+  - Full suite: 397 passed.
+
+7. Live exit-policy cleanup, 2026-06-02
+
+   Reviewed the June 1 live logs after OXY was closed at 15:46 ET. The close
+   was not a velocity exit; it was the live `EOD FLAT` rule liquidating a
+   same-day position that was down about 1%. That behavior was too aggressive
+   for a swing system and was not aligned with the stated minimum hold policy.
+
+   Fix:
+
+   - Renamed the live exit manager to `manage_position_exits()`.
+   - Kept `check_velocity_exits()` as a backward-compatible wrapper.
+   - Updated engine call sites and tests to use `manage_position_exits()`.
+   - EOD flat no longer closes same-day swing entries.
+   - EOD flat now requires `HOLD_TRADING_BARS` to have elapsed before it can
+     liquidate a non-profitable position.
+   - Software exits now require a fresh broker price; cached `current_price`
+     and stale ticker `close` values are no longer allowed to liquidate a
+     position.
+   - `_fresh_market_price()` no longer uses `ticker.close` as an exit price
+     source. It uses market price, last, bid/ask midpoint, or bid.
+
+   Exit policy after the fix:
+
+   - Broker trailing stop: primary always-on protection.
+   - Hard stop: live software backup during the regular management window, with
+     fresh broker price only.
+   - Break-even giveback: fresh broker price only.
+   - Friday close: explicit weekend-risk policy.
+   - EOD flat: older positions only, after the minimum swing hold window.
+   - Velocity exit: after the configured trading-bar hold window, if profit is
+     still below `PROFIT_MIN_THRESHOLD`.
+
+   Validation:
+
+   ```bash
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_exit_tests .venv/bin/python -m pytest -q tests/test_engine.py::TestVelocityExit tests/test_trailing_stop_scoring_screener.py::TestExitOrders tests/test_trailing_stop_scoring_screener.py::TestHardStop tests/test_trailing_stop_scoring_screener.py::TestFridayClose tests/test_trailing_stop_scoring_screener.py::TestEodFlat -p no:cacheprovider
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache .venv/bin/python -m py_compile src/engine.py src/config.py tests/test_engine.py tests/test_trailing_stop_scoring_screener.py
+   PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_full_tests .venv/bin/python -m pytest -q -p no:cacheprovider
+   PYTHONUNBUFFERED=1 PYTHONPYCACHEPREFIX=/tmp/velocity_pycache VELOCITY_BASE_DIR=/tmp/velocity_bt_exit_policy .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 0 --scoring-model legacy_v2
+   ```
+
    Results:
 
-   - Focused engine/backtest/scoring tests: passed.
-   - Full suite: 397 passed.
+   - Focused exit-policy tests: 32 passed.
+   - Full suite: 398 passed.
+   - Full-universe backtest: 10,623 trades, +1,320,010.65%, Win 79.0%,
+     PF 10.76, MaxDD -4.93%, Sharpe 8.46.
+   - Backtest metrics stayed aligned with the promoted `legacy_v2` production
+     baseline because this was a live execution-policy fix, not a backtest alpha
+     rule change.

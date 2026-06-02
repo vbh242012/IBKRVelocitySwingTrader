@@ -211,7 +211,7 @@ class TestVelocityExit:
         with patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = check_time
             mock_dt.fromisoformat = datetime.fromisoformat
-            engine.check_velocity_exits()
+            engine.manage_position_exits()
 
     def test_stagnant_position_older_than_hold_window_triggers_exit(self):
         ib      = _mock_ib()
@@ -261,23 +261,26 @@ class TestVelocityExit:
             self._run_velocity_check(engine)
             mock_liq.assert_not_called()
 
-    def test_falls_back_to_close_price_when_market_price_nan(self):
+    def test_stale_close_price_does_not_trigger_exit_when_market_price_missing(self):
         ib      = _mock_ib()
         engine  = _make_engine_patched(ib)
 
         old_time = self._entry_after_hold_window()
-        engine.state = {'AAPL': {'price': 100.0, 'time': old_time}}
+        engine.state = {'AAPL': {'price': 100.0, 'time': old_time, 'current_price': 90.0}}
 
-        # 0.5% gain via close fallback — below PROFIT_MIN_THRESHOLD=5% → exit
+        # The ticker close can be stale/delayed, so it must not liquidate by itself.
         ticker       = MagicMock()
         ticker.marketPrice.return_value = float('nan')
-        ticker.close                    = 100.5
+        ticker.last                     = float('nan')
+        ticker.bid                      = float('nan')
+        ticker.ask                      = float('nan')
+        ticker.close                    = 90.0
         ib.reqTickers.return_value      = [ticker]
         ib.positions.return_value       = []
 
         with patch.object(engine, 'liquidate') as mock_liq:
             self._run_velocity_check(engine)
-            mock_liq.assert_called_once_with('AAPL')
+            mock_liq.assert_not_called()
 
 
 # ── Position limit ────────────────────────────────────────────────────────────
@@ -312,7 +315,7 @@ class TestPositionLimit:
 
         with patch.object(engine, 'get_institutional_scan', return_value=['NEW']), \
              patch.object(engine, 'get_technical_context') as mock_ctx, \
-             patch.object(engine, 'check_velocity_exits'), \
+             patch.object(engine, 'manage_position_exits'), \
              patch('src.engine.datetime') as mock_dt:
 
             mock_dt.now.return_value = fake_now
@@ -334,7 +337,7 @@ class TestPositionLimit:
         fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
 
         with patch.object(engine, '_maybe_run_off_hours_jobs', return_value=False), \
-             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, '_ensure_vix_contract') as mock_vix_contract, \
              patch.object(engine, '_fetch_vix_price') as mock_vix_price, \
              patch.object(engine, 'get_institutional_scan') as mock_scan, \
@@ -365,7 +368,7 @@ class TestPositionLimit:
         ))
 
         with patch.object(engine, '_maybe_run_off_hours_jobs', return_value=False), \
-             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, '_ensure_vix_contract') as mock_vix_contract, \
              patch.object(engine, '_fetch_vix_price') as mock_vix_price, \
              patch.object(engine, 'get_institutional_scan') as mock_scan, \
@@ -469,7 +472,7 @@ class TestVixHighBranch:
         tz_ny    = real_pytz.timezone('US/Eastern')
         fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
 
-        with patch.object(engine, 'check_velocity_exits') as mock_vel, \
+        with patch.object(engine, 'manage_position_exits') as mock_vel, \
              patch.object(engine, '_update_position_prices') as mock_upd, \
              patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value  = fake_now
@@ -499,7 +502,7 @@ class TestVixHighBranch:
         tz_ny    = real_pytz.timezone('US/Eastern')
         fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
 
-        with patch.object(engine, 'check_velocity_exits') as mock_vel, \
+        with patch.object(engine, 'manage_position_exits') as mock_vel, \
              patch.object(engine, '_update_position_prices') as mock_upd, \
              patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value  = fake_now
@@ -536,7 +539,7 @@ class TestOperatorHalt:
         fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
 
         with patch.object(eng_mod, 'HALT_FILE', str(halt_file)), \
-             patch.object(engine, 'check_velocity_exits') as mock_exit, \
+             patch.object(engine, 'manage_position_exits') as mock_exit, \
              patch.object(engine, '_update_position_prices') as mock_prices, \
              patch.object(engine, 'get_institutional_scan') as mock_scan, \
              patch('src.engine.datetime') as mock_dt:
@@ -638,7 +641,7 @@ class TestConnectionSafety:
         ib.isConnected.return_value = True
         ib.accountSummary.return_value = []
 
-        with patch.object(engine, 'check_velocity_exits') as mock_exits, \
+        with patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, '_update_position_prices') as mock_prices, \
              patch.object(engine, '_write_dashboard_data') as mock_dash, \
              patch.object(engine, '_alert') as mock_alert, \
@@ -717,7 +720,7 @@ class TestOffHoursMaintenance:
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
              patch.object(engine, '_update_position_prices') as mock_prices, \
              patch.object(engine, '_fetch_spy_trend', return_value=True), \
-             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, 'get_institutional_scan') as mock_scan, \
              patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
@@ -762,7 +765,7 @@ class TestOffHoursMaintenance:
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
              patch.object(engine, '_update_position_prices'), \
              patch.object(engine, '_fetch_spy_trend', return_value=False), \
-             patch.object(engine, 'check_velocity_exits') as mock_exits, \
+             patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, 'get_institutional_scan') as mock_scan, \
              patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
