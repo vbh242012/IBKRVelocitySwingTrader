@@ -1183,8 +1183,8 @@ class TestPreEntrySyncWait:
         ib = MagicMock()
         engine = _make_engine(ib)
 
-        # Simulate 'now' as 10:05 ET — past both sync time and entry window
-        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, 10, 5, 0))
+        # Simulate 'now' as 10:20 ET — past both sync time and entry window
+        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, 10, 20, 0))
         with patch('src.engine.datetime') as mock_dt:
             mock_dt.now.return_value  = fake_now
             mock_dt.fromisoformat     = datetime.fromisoformat

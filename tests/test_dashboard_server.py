@@ -39,6 +39,18 @@ def test_dashboard_bucket_uses_deployable_settled_cash(dashboard_files):
             "stop_loss": 90.0,
             "effective_stop": 95.0,
             "time": now.isoformat(),
+            "strategy_profile": "indicator_swing",
+            "relative_strength_63d": 0.067,
+            "relative_strength_126d": 0.041,
+            "return_13w": 0.12,
+            "return_26w": 0.21,
+            "weekly_uptrend": True,
+            "price_vs_52w_high": 0.93,
+            "analyst_rating_score": 0.4,
+            "analyst_rating_total": "12",
+            "analyst_rating_source": "csv",
+            "analyst_rating_period": "2026-06-01",
+            "protection_status": "confirmed",
         }
     })
     _write_json(dash_file, {
@@ -54,6 +66,14 @@ def test_dashboard_bucket_uses_deployable_settled_cash(dashboard_files):
     assert data["deployable_cash"] == pytest.approx(1000.0 * SETTLED_CASH_DEPLOYMENT_PCT)
     assert data["bucket_size"] == pytest.approx(950.0)
     assert data["eod_exit_time"] == f"{EOD_EXIT_TIME[0]:02d}:{EOD_EXIT_TIME[1]:02d}"
+    assert data["strategy"]["profile"] == "indicator_swing"
+    assert data["strategy"]["scoring_model"] == "indicator_swing"
+    assert data["strategy"]["eod_quality_cleanup"] is False
+    assert data["strategy"]["allow_bear_phase_entries"] is False
+    assert set(data["strategy"]["indicator_sleeves"]) == {"ma_cross"}
+    assert data["positions"][0]["relative_strength_63d"] == pytest.approx(0.067)
+    assert data["positions"][0]["analyst_rating_total"] == 12
+    assert data["positions"][0]["protection_status"] == "confirmed"
 
 
 def test_dashboard_blocks_bucket_when_buffer_pushes_cash_below_floor(dashboard_files):
@@ -72,6 +92,33 @@ def test_dashboard_blocks_bucket_when_buffer_pushes_cash_below_floor(dashboard_f
     assert data["bucket_size"] == pytest.approx(0.0)
 
 
+def test_dashboard_pnl_uses_et_calendar_period_baselines(dashboard_files, monkeypatch):
+    _, _, hist_file = dashboard_files
+    tz_ny = pytz.timezone("US/Eastern")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = cls(2026, 6, 4, 10, 0)
+            return tz.localize(current) if tz else current
+
+    monkeypatch.setattr(dashboard, "datetime", FixedDateTime)
+    _write_json(hist_file, [
+        {"ts": tz_ny.localize(datetime(2026, 5, 29, 12, 0)).isoformat(), "eq": 900.0},
+        {"ts": tz_ny.localize(datetime(2026, 6, 1, 0, 10)).isoformat(), "eq": 950.0},
+        {"ts": tz_ny.localize(datetime(2026, 6, 3, 9, 59)).isoformat(), "eq": 1000.0},
+        {"ts": tz_ny.localize(datetime(2026, 6, 4, 0, 5)).isoformat(), "eq": 1010.0},
+        {"ts": tz_ny.localize(datetime(2026, 6, 4, 9, 45)).isoformat(), "eq": 1020.0},
+    ])
+
+    pnl = dashboard._pnl(1030.0)
+
+    assert pnl["daily"] == {"amount": 20.0, "pct": 1.98}
+    assert pnl["weekly"] == {"amount": 80.0, "pct": 8.42}
+    assert pnl["monthly"] == {"amount": 80.0, "pct": 8.42}
+    assert pnl["overall"] == {"amount": 130.0, "pct": 14.44}
+
+
 def test_dashboard_equity_chart_uses_intraday_time_labels():
     html = dashboard._HTML
 
@@ -79,7 +126,13 @@ def test_dashboard_equity_chart_uses_intraday_time_labels():
     assert "INTRADAY TODAY" in html
     assert "toLocaleTimeString" in html
     assert "toLocaleDateString" in html
-    assert "3:50 PM ET" in html
-    assert "Same day at/after" in html
-    assert "EOD Profit Cleanup" in html
+    assert "Multi-Indicator Swing" in html
+    assert "normal positions are not churned out" in html
+    assert "EMA20 must be above SMA50" in html
+    assert "Bollinger Research" in html
+    assert "PSAR Research" in html
+    assert "No EOD Churn" in html
+    assert "Swing Time Stop" in html
+    assert "Analyst Downgrade" in html
+    assert "__SWING_" not in html
     assert "Velocity Exit" not in html

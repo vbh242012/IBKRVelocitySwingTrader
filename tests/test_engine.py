@@ -46,12 +46,27 @@ def _mock_ib():
     return ib
 
 
+def _mock_price_ticker(price: float, *, open=None, high=None, low=None, vwap=None):
+    ticker = MagicMock()
+    ticker.marketPrice.return_value = price
+    ticker.last = price
+    ticker.close = price
+    ticker.bid = price * 0.999
+    ticker.ask = price * 1.001
+    ticker.open = price if open is None else open
+    ticker.high = price if high is None else high
+    ticker.low = price if low is None else low
+    ticker.vwap = price if vwap is None else vwap
+    return ticker
+
+
 def _make_engine_patched(ib_mock):
     """Return a VelocityEngine with IB replaced and connect() bypassed."""
     with patch('src.engine.IB', return_value=ib_mock), \
          patch.object(sys.modules.get('src.engine', __import__('src.engine')),
                       'logger', MagicMock()):
         from src.engine import VelocityEngine
+        from src.strategy_profiles import get_strategy_profile
         with patch.object(VelocityEngine, 'connect', lambda self: None):
             engine = VelocityEngine.__new__(VelocityEngine)
             engine.ib                   = ib_mock
@@ -70,6 +85,11 @@ def _make_engine_patched(ib_mock):
             engine._bar_cache           = {}
             engine._vix_contract        = None
             engine._spy_cache           = {}
+            engine._prefilter_date      = None
+            engine._prefilter_status    = "not_started"
+            engine._prefilter_candidates = []
+            engine._prefilter_stats     = {}
+            engine._last_premarket_prefilter_date = None
             engine._sector_cache        = {}
             engine._daily_scan_skip     = {}
             engine._last_audit_date     = None
@@ -78,85 +98,68 @@ def _make_engine_patched(ib_mock):
             engine._last_premarket_readiness_date = None
             engine._last_post_close_maintenance_date = None
             engine._missing_position_counts = {}
+            engine._strategy_profile = get_strategy_profile("indicator_swing")
             return engine
 
 
 # ── Expert filter (entry conditions) ─────────────────────────────────────────
 class TestExpertFilter:
-    """
-    The entry guard in run_cycle is:
-        price > orb_high
-        day_open <= orb_high * (1 + active gap cap)
-        RSI delta >= active minimum
-        RSI > active threshold
-        day_range_location >= configured minimum
-        intraday_gain >= configured minimum
-        ATR_CHAND / price <= configured maximum
-        bid/ask spread <= configured maximum
-        20-day dollar volume >= active threshold
-    """
+    """Entry checks use the maintained indicator_swing profile rules."""
 
-    def _ctx(self, price=110, orb=100, ma50=105, ma200=90, rsi=60, rsi_prev=55,
-             dollar_vol_20d=300_000_000, day_range_location=0.75,
-             intraday_gain=0.01, day_open=None, spread_pct=0.002):
-        if day_open is None:
-            day_open = price / (1 + intraday_gain) if intraday_gain > -0.99 else price
-        return dict(orb_high=orb, ma50=ma50, ma200=ma200,
-                    day_open=day_open,
-                    rsi=rsi, rsi_prev=rsi_prev, atr=2.0,
-                    atr_chandelier=2.0,
-                    close=price, live_price=price,
-                    bid=price * (1 - spread_pct / 2),
-                    ask=price * (1 + spread_pct / 2),
-                    spread_pct=spread_pct,
-                    dollar_vol_20d=dollar_vol_20d,
-                    day_range_location=day_range_location,
-                    intraday_gain=intraday_gain,
-                    contract=MagicMock())
+    def _ctx(self, **updates):
+        ctx = dict(
+            live_price=110.0,
+            close=110.0,
+            ma20=104.0,
+            ma50=98.0,
+            ma200=90.0,
+            sma200_slope=0.25,
+            ema20_gt_sma50=True,
+            rsi=62.0,
+            rsi_prev=58.0,
+            atr=2.0,
+            atr_chandelier=4.0,
+            atr_pct=4.0 / 110.0,
+            spread_pct=0.002,
+            volume_pace=2.0,
+            volume=3_000_000,
+            dollar_vol_20d=150_000_000,
+            break_prev_high=True,
+            reclaim_ma20=False,
+            reclaim_ma50=False,
+            weekly_uptrend=True,
+            return_13w=0.25,
+            return_26w=0.35,
+            relative_strength_63d=0.15,
+            relative_strength_126d=0.18,
+            price_vs_52w_high=0.90,
+            high20=112.0,
+            dist_high20=110.0 / 112.0 - 1.0,
+            stoch_bull_exit_oversold=True,
+            macd_hist_delta=0.05,
+            obv_uptrend=True,
+            contract=MagicMock(),
+        )
+        ctx.update(updates)
+        return ctx
 
     def _passes(self, ctx):
-        from src.config import (
-            DAY_RANGE_LOCATION_MIN,
-            INTRADAY_GAIN_MIN,
-            RSI_THRESHOLD,
-            RSI_MIN_DELTA,
-            GAP_MAX_PCT,
-            SCAN_MIN_DOLLAR_VOL,
-            ATR_PCT_MAX,
-            SPREAD_MAX_PCT,
-        )
-        p = ctx['live_price']
-        return (p > ctx['orb_high']
-                and ctx['day_open'] <= ctx['orb_high'] * (1 + GAP_MAX_PCT)
-                and (ctx['rsi'] - ctx['rsi_prev']) >= RSI_MIN_DELTA
-                and ctx['rsi'] > RSI_THRESHOLD
-                and ctx['day_range_location'] >= DAY_RANGE_LOCATION_MIN
-                and ctx['intraday_gain'] >= INTRADAY_GAIN_MIN
-                and ctx['atr_chandelier'] / p <= ATR_PCT_MAX
-                and ctx['spread_pct'] <= SPREAD_MAX_PCT
-                and ctx['dollar_vol_20d'] >= SCAN_MIN_DOLLAR_VOL)
+        from src.strategy_profiles import evaluate_entry_rules, get_strategy_profile
+        return evaluate_entry_rules(ctx, get_strategy_profile("indicator_swing")).passed
 
     def test_all_conditions_met(self):
         assert self._passes(self._ctx()) is True
 
-    def test_fails_when_price_below_orb(self):
-        assert self._passes(self._ctx(price=99, orb=100)) is False
+    def test_fails_when_price_below_ma50(self):
+        assert self._passes(self._ctx(live_price=95.0, close=95.0)) is False
 
-    def test_ignores_price_below_ma50_when_active_entry_rules_pass(self):
-        assert self._passes(self._ctx(price=110, ma50=115)) is True
+    def test_fails_when_ma50_below_ma200(self):
+        assert self._passes(self._ctx(ma50=85, ma200=90)) is False
 
-    def test_ignores_ma50_below_ma200_when_active_entry_rules_pass(self):
-        assert self._passes(self._ctx(ma50=85, ma200=90)) is True
-
-    def test_fails_when_rsi_not_rising(self):
-        assert self._passes(self._ctx(rsi=60, rsi_prev=65)) is False
-
-    def test_fails_when_rsi_below_threshold(self):
-        assert self._passes(self._ctx(rsi=54, rsi_prev=50)) is False
-
-    def test_rsi_exactly_at_threshold_fails(self):
-        # rule is rsi > 55, so exactly 55 should fail
-        assert self._passes(self._ctx(rsi=55, rsi_prev=50)) is False
+    def test_fails_without_indicator_sleeve_signal(self):
+        assert self._passes(
+            self._ctx(ema20_gt_sma50=False, break_prev_high=False, reclaim_ma20=False, reclaim_ma50=False)
+        ) is False
 
     def test_fails_when_dollar_volume_below_threshold(self):
         assert self._passes(self._ctx(dollar_vol_20d=50_000_000)) is False
@@ -165,36 +168,21 @@ class TestExpertFilter:
         from src.config import SCAN_MIN_DOLLAR_VOL
         assert self._passes(self._ctx(dollar_vol_20d=SCAN_MIN_DOLLAR_VOL)) is True
 
-    def test_fails_when_day_range_location_below_threshold(self):
-        from src.config import DAY_RANGE_LOCATION_MIN
-        assert self._passes(
-            self._ctx(day_range_location=DAY_RANGE_LOCATION_MIN - 0.01)
-        ) is False
-
-    def test_fails_when_intraday_gain_below_threshold(self):
-        from src.config import INTRADAY_GAIN_MIN
-        assert self._passes(
-            self._ctx(intraday_gain=INTRADAY_GAIN_MIN - 0.001)
-        ) is False
-
     def test_fails_when_atr_pct_above_threshold(self):
-        from src.config import ATR_PCT_MAX
+        from src.strategy_profiles import get_strategy_profile
+        atr_cap = get_strategy_profile("indicator_swing").max_atr_pct
         ctx = self._ctx()
-        ctx['atr_chandelier'] = ctx['live_price'] * (ATR_PCT_MAX + 0.01)
+        ctx['atr_chandelier'] = ctx['live_price'] * (atr_cap + 0.01)
+        ctx['atr_pct'] = atr_cap + 0.01
         assert self._passes(ctx) is False
 
-    def test_fails_when_opening_gap_above_threshold(self):
-        from src.config import GAP_MAX_PCT
-        assert self._passes(
-            self._ctx(day_open=100 * (1 + GAP_MAX_PCT + 0.01))
-        ) is False
-
     def test_fails_when_spread_above_threshold(self):
-        from src.config import SPREAD_MAX_PCT
-        assert self._passes(self._ctx(spread_pct=SPREAD_MAX_PCT + 0.001)) is False
+        from src.strategy_profiles import get_strategy_profile
+        spread_cap = get_strategy_profile("indicator_swing").max_spread_pct
+        assert self._passes(self._ctx(spread_pct=spread_cap + 0.001)) is False
 
 
-# ── EOD profit cleanup logic ──────────────────────────────────────────────────
+# ── EOD quality cleanup logic ─────────────────────────────────────────────────
 class TestEodProfitCleanup:
     _TZ_NY = pytz.timezone('US/Eastern')
 
@@ -213,53 +201,67 @@ class TestEodProfitCleanup:
             mock_dt.fromisoformat = datetime.fromisoformat
             engine.manage_position_exits()
 
-    def test_older_position_below_profit_threshold_triggers_eod_cleanup(self):
+    def test_older_losing_position_is_not_churned_by_default_swing_profile(self):
         ib      = _mock_ib()
         engine  = _make_engine_patched(ib)
 
         old_time = self._entry_after_hold_window()
         engine.state = {'AAPL': {'price': 100.0, 'time': old_time}}
 
-        # Market price only slightly up (1% gain < PROFIT_MIN_THRESHOLD=5%)
-        ticker = MagicMock()
-        ticker.marketPrice.return_value = 101.0
-        ib.reqTickers.return_value = [ticker]
+        ib.reqTickers.return_value = [_mock_price_ticker(99.0, open=100.0, high=101.0, low=98.0)]
         ib.positions.return_value  = []
-
-        with patch.object(engine, 'liquidate') as mock_liq:
-            self._run_exit_check(engine)
-            mock_liq.assert_called_once_with('AAPL')
-
-    def test_position_above_profit_threshold_not_exited_at_eod(self):
-        ib      = _mock_ib()
-        engine  = _make_engine_patched(ib)
-
-        old_time = self._entry_after_hold_window()
-        engine.state = {'AAPL': {'price': 100.0, 'time': old_time}}
-
-        # 6% gain — above PROFIT_MIN_THRESHOLD (5%) → must NOT trigger EOD cleanup
-        ticker = MagicMock()
-        ticker.marketPrice.return_value = 106.0
-        ib.reqTickers.return_value = [ticker]
 
         with patch.object(engine, 'liquidate') as mock_liq:
             self._run_exit_check(engine)
             mock_liq.assert_not_called()
 
-    def test_same_day_position_below_profit_threshold_exits_at_eod(self):
+    def test_quality_position_not_exited_at_eod(self):
+        ib      = _mock_ib()
+        engine  = _make_engine_patched(ib)
+
+        old_time = self._entry_after_hold_window()
+        engine.state = {'AAPL': {
+            'price': 100.0,
+            'time': old_time,
+            'protection_status': 'confirmed',
+        }}
+
+        ib.reqTickers.return_value = [
+            _mock_price_ticker(106.0, open=100.0, high=107.0, low=100.0, vwap=104.0)
+        ]
+
+        with patch.object(engine, 'liquidate') as mock_liq:
+            self._run_exit_check(engine)
+            mock_liq.assert_not_called()
+
+    def test_same_day_position_below_profit_threshold_is_not_churned_at_eod(self):
         ib      = _mock_ib()
         engine  = _make_engine_patched(ib)
 
         fresh_time = self._entry_before_hold_window()
         engine.state = {'AAPL': {'price': 100.0, 'time': fresh_time}}
 
-        ticker = MagicMock()
-        ticker.marketPrice.return_value = 99.0
-        ib.reqTickers.return_value = [ticker]
+        ib.reqTickers.return_value = [_mock_price_ticker(99.0, open=100.0, high=101.0, low=98.0)]
 
         with patch.object(engine, 'liquidate') as mock_liq:
             self._run_exit_check(engine)
-            mock_liq.assert_called_once_with('AAPL')
+            mock_liq.assert_not_called()
+
+    def test_swing_profile_does_not_churn_weak_position_at_eod(self):
+        from src.strategy_profiles import get_strategy_profile
+
+        ib      = _mock_ib()
+        engine  = _make_engine_patched(ib)
+        engine._strategy_profile = get_strategy_profile("indicator_swing")
+
+        fresh_time = self._entry_before_hold_window()
+        engine.state = {'AAPL': {'price': 100.0, 'time': fresh_time}}
+
+        ib.reqTickers.return_value = [_mock_price_ticker(99.0, open=100.0, high=101.0, low=98.0)]
+
+        with patch.object(engine, 'liquidate') as mock_liq:
+            self._run_exit_check(engine)
+            mock_liq.assert_not_called()
 
     def test_older_position_below_threshold_not_exited_before_eod_cleanup_time(self):
         ib      = _mock_ib()
@@ -268,9 +270,7 @@ class TestEodProfitCleanup:
         old_time = self._entry_after_hold_window()
         engine.state = {'AAPL': {'price': 100.0, 'time': old_time}}
 
-        ticker = MagicMock()
-        ticker.marketPrice.return_value = 101.0
-        ib.reqTickers.return_value = [ticker]
+        ib.reqTickers.return_value = [_mock_price_ticker(99.0, open=100.0, high=101.0, low=98.0)]
 
         with patch.object(engine, 'liquidate') as mock_liq:
             self._run_exit_check(engine, hour=15, minute=49)
@@ -708,6 +708,36 @@ class TestHistoricalDataWarmup:
         assert engine._last_vix_source == "historical_warmup"
 
 
+class TestIbErrorLogging:
+    def test_hmds_items_retrieved_notice_is_silent(self):
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+
+        with patch.object(engine, '_metric_inc') as mock_metric, \
+             patch('src.engine.logger') as mock_logger:
+            engine._on_ib_error(
+                123,
+                165,
+                "Historical Market Data Service query message:12 items retrieved",
+                None,
+            )
+
+        mock_metric.assert_not_called()
+        mock_logger.warning.assert_not_called()
+
+    def test_other_hmds_error_165_still_warns_and_counts(self):
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+
+        with patch.object(engine, '_metric_inc') as mock_metric, \
+             patch('src.engine.logger') as mock_logger:
+            engine._on_ib_error(123, 165, "Historical data request failed", None)
+
+        mock_metric.assert_any_call('ib_errors')
+        mock_metric.assert_any_call('ib_error_codes', subkey='165')
+        mock_logger.warning.assert_called_once()
+
+
 class TestOffHoursMaintenance:
     _TZ_NY = pytz.timezone('US/Eastern')
 
@@ -717,6 +747,7 @@ class TestOffHoursMaintenance:
 
         ib = _mock_ib()
         engine = _make_engine_patched(ib)
+        engine._last_premarket_prefilter_date = '2024-06-05'
         engine.state = {
             'AAPL': {
                 'fill_price': 100.0,
@@ -803,6 +834,7 @@ class TestOffHoursMaintenance:
         from src.config import PREMARKET_READINESS_TIME
 
         engine = _make_engine_patched(_mock_ib())
+        engine._last_premarket_prefilter_date = '2024-06-05'
         engine._last_premarket_readiness_date = '2024-06-05'
         h, m = PREMARKET_READINESS_TIME
         fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m + 5, 0))
@@ -814,6 +846,24 @@ class TestOffHoursMaintenance:
             assert engine._maybe_run_off_hours_jobs() is False
 
         mock_job.assert_not_called()
+
+    def test_premarket_prefilter_starts_at_configured_time(self):
+        from src.config import APP_PREFILTER_START_TIME
+
+        engine = _make_engine_patched(_mock_ib())
+        h, m = APP_PREFILTER_START_TIME
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m, 0))
+
+        with patch.object(engine, '_run_premarket_universe_prefilter', return_value={}) as mock_prefilter, \
+             patch.object(engine, '_run_operational_maintenance') as mock_maintenance, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            assert engine._maybe_run_off_hours_jobs() is True
+
+        mock_prefilter.assert_called_once()
+        mock_maintenance.assert_not_called()
+        assert engine._last_premarket_prefilter_date == '2024-06-05'
 
 
 # ── Logger handler guard ──────────────────────────────────────────────────────

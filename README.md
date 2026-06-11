@@ -1,6 +1,76 @@
 # IBKRVelocitySwingTrader
 Automated Swing Trading For Small Cash Account With T+1 Settlement Days Using Interactive Broker
 
+## Strategy
+
+The default profile is now `indicator_swing`.
+
+The bot is a short swing system. The old ORB/legacy strategy profiles have
+been removed; `indicator_swing` is the only maintained strategy profile:
+
+- The default profile is relative-strength first. A stock must pass trend,
+  liquidity, relative-strength, weekly-uptrend, MA50/MA200, 52-week-high
+  proximity, ATR, spread, and volume gates before an indicator sleeve can buy.
+- EMA20 above SMA50 is the default trend state; fresh crosses, MA reclaims, or
+  prior-high breaks can time entries after the RS gate passes. Bollinger lower
+  band reclaim and PSAR flip are optional `indicator_swing` sleeves, but they
+  are not enabled by default because multi-year validation did not justify
+  using them as primary live triggers.
+- RSI momentum/recovery plus at least two of MACD, stochastic, OBV, PSAR, and
+  volume pace must confirm. Analyst ratings can adjust score, but cannot create
+  a buy by themselves. The default minimum entry score is 50.
+- Each position stores the sleeve that opened it and exits on that same sleeve's
+  sell rule.
+- Swing exits avoid same-day EOD churn: winners trim nearest whole-share
+  cumulative profit tiers at +1R, +1.5R, and +2R so roughly 20%, 40%, and 60%
+  of the original position has been sold. `R` is the original per-share
+  Chandelier risk distance captured at entry. The remaining runner is protected
+  by the broker Chandelier stop; software hard stop, break-even protection,
+  analyst downgrade, and a 10-bar no-progress time stop remain active safety
+  exits. Position size is based on the broker-protected Chandelier distance.
+
+Analyst ratings are optional confirmation. With `VELOCITY_FINNHUB_API_KEY`, live
+and paper trading can fetch Finnhub recommendation trends and apply a bounded
+score bonus/penalty. Backtests do not fetch current analyst ratings; they only
+use a dated local CSV snapshot from `VELOCITY_ANALYST_RATINGS_FILE` so historical
+research does not cheat with future information.
+
+## Application Scanner
+
+The live/paper application scanner can now use `VELOCITY_APP_SCANNER_SOURCE`:
+
+- `ibkr`: only IBKR scanner subscription results.
+- `universe`: a rotating batch from the full US common-stock universe.
+- `hybrid`: IBKR scanner results plus the rotating universe batch.
+
+`hybrid` is the default. The universe is loaded from
+`VELOCITY_APP_SCANNER_UNIVERSE_FILE` when provided, otherwise from cached NASDAQ
+Trader listing files. `VELOCITY_APP_SCANNER_BATCH_SIZE` controls how many
+universe symbols are added per scan cycle. Final buy decisions still come from
+the same local screener/profile rules inside the live engine.
+
+At `VELOCITY_APP_PREFILTER_START_TIME` (`08:00 ET` by default), the app runs a
+premarket historical universe sieve. It scans the full configured universe once,
+rejects symbols that cannot satisfy static daily rules during the session
+(history length, daily liquidity, MA structure, SMA200 slope, stable daily
+momentum confirmations, and stable sleeve feasibility), and writes the surviving
+candidate list to `premarket_universe_prefilter.json` in the runtime folder.
+During the entry window, the scanner uses that candidate list and only checks
+rules that can still change intraday, such as live price, spread, volume pace,
+reclaims, prior-high breaks, and orderability.
+If IBKR historical pacing has not finished the full universe by `ENTRY_START`,
+`VELOCITY_APP_PREFILTER_STOP_AT_ENTRY_START=1` saves a partial cache with
+`stopped_reason=entry_window_open` and the entry scanner trades only from those
+screened candidates for the day. For manual diagnostics after the entry window,
+run `scripts/run_premarket_prefilter.py --ignore-entry-cutoff`.
+
+CSV format:
+
+```csv
+symbol,period,strongBuy,buy,hold,sell,strongSell
+AAPL,2026-06-01,12,20,8,1,0
+```
+
 ## Paper Trading Soak Run
 
 This project is profile-based:

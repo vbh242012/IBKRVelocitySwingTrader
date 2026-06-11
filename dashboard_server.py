@@ -16,6 +16,7 @@ Closing/restarting this server never affects the running AutoTrader.
 """
 
 import json
+import math
 import os
 from datetime import datetime, timedelta
 from typing import Optional
@@ -34,13 +35,32 @@ from src.config import (
     MAX_POSITIONS_CAP,
     MIN_BUCKET_SIZE,
     SETTLED_CASH_DEPLOYMENT_PCT,
+    STRATEGY_PROFILE,
     VIX_THRESHOLD,
-    HOLD_TRADING_BARS,
-    PROFIT_MIN_THRESHOLD,
     EOD_EXIT_TIME,
+    EOD_HOLD_MIN_PROFIT_PCT,
+    EOD_HOLD_DAY_RANGE_LOCATION_MIN,
+    EOD_HOLD_RELATIVE_STRENGTH_MIN,
+    EOD_HOLD_REQUIRE_STOP_CONFIRMED,
+    TIERED_PROFIT_EXIT_ENABLED,
+    TIERED_PROFIT_EXIT_R_LEVELS,
+    SWING_RS_MIN_63D,
+    SWING_RS_MIN_126D,
+    SWING_MIN_13W_RETURN,
+    SWING_MIN_26W_RETURN,
+    SWING_MIN_PRICE_VS_52W_HIGH,
+    SWING_MAX_MA20_EXTENSION,
+    SWING_MIN_VOLUME_PACE,
+    SWING_TIME_STOP_BARS,
+    INDICATOR_SWING_MIN_SCORE,
+    ANALYST_RATINGS_ENABLED,
+    ANALYST_RATING_SCORE_WEIGHT,
+    ANALYST_RATING_SELL_THRESHOLD,
+    ANALYST_RATING_EXIT_ENABLED,
     DASHBOARD_ALLOWED_ORIGINS,
     DASHBOARD_TOKEN,
 )
+from src.strategy_profiles import get_strategy_profile
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="VelocityEngine Dashboard", docs_url=None, redoc_url=None)
@@ -90,22 +110,64 @@ def _read_history() -> list:
     return []
 
 
+def _finite_float_or_none(value) -> Optional[float]:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) else None
+
+
+def _int_or_none(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _pnl(equity_now: float) -> dict:
-    """Compute daily / weekly / monthly / overall P&L from equity history."""
+    """Compute calendar daily / weekly / monthly / overall P&L in ET."""
     history = _read_history()
     tz_ny   = pytz.timezone('US/Eastern')
     now     = datetime.now(tz_ny)
 
-    def _parse_ts(ts: str) -> datetime:
-        dt = datetime.fromisoformat(ts)
-        return dt if dt.tzinfo is not None else tz_ny.localize(dt)
+    def _parse_ts(ts: str) -> Optional[datetime]:
+        try:
+            dt = datetime.fromisoformat(ts)
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            return tz_ny.localize(dt)
+        return dt.astimezone(tz_ny)
 
-    def _find_base(days_ago: int) -> Optional[float]:
-        cutoff = now - timedelta(days=days_ago)
-        past   = [e for e in history if _parse_ts(e["ts"]) <= cutoff]
-        if past:
-            return float(past[-1]["eq"])
-        # No snapshot older than the lookback — not enough history yet
+    parsed_history = []
+    for entry in history:
+        ts = _parse_ts(entry.get("ts"))
+        if ts is None:
+            continue
+        try:
+            parsed_history.append((ts, float(entry["eq"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    parsed_history.sort(key=lambda item: item[0])
+
+    def _period_start(year: int, month: int, day: int) -> datetime:
+        return tz_ny.localize(datetime(year, month, day))
+
+    today_start = _period_start(now.year, now.month, now.day)
+    week_date   = now.date() - timedelta(days=now.weekday())
+    week_start  = _period_start(week_date.year, week_date.month, week_date.day)
+    month_start = _period_start(now.year, now.month, 1)
+
+    def _find_calendar_base(period_start: datetime) -> Optional[float]:
+        current_period = [eq for ts, eq in parsed_history if ts >= period_start]
+        if current_period:
+            return current_period[0]
+        # If the engine has not written a snapshot yet today, use the most
+        # recent prior value as the closest available start-of-period baseline.
+        prior = [eq for ts, eq in parsed_history if ts < period_start]
+        if prior:
+            return prior[-1]
         return None
 
     def _entry(base: Optional[float]) -> dict:
@@ -115,13 +177,13 @@ def _pnl(equity_now: float) -> dict:
         pct    = round(amount / base * 100, 2)
         return {"amount": amount, "pct": pct}
 
-    # Overall: oldest snapshot in history (first real IBKR reading)
-    overall_base = float(history[0]["eq"]) if history else None
+    # Overall: oldest valid snapshot in history (first real IBKR reading)
+    overall_base = parsed_history[0][1] if parsed_history else None
 
     return {
-        "daily":   _entry(_find_base(1)),
-        "weekly":  _entry(_find_base(7)),
-        "monthly": _entry(_find_base(30)),
+        "daily":   _entry(_find_calendar_base(today_start)),
+        "weekly":  _entry(_find_calendar_base(week_start)),
+        "monthly": _entry(_find_calendar_base(month_start)),
         "overall": _entry(overall_base),
     }
 
@@ -139,6 +201,8 @@ def _market_open() -> bool:
 def get_state():
     state     = _read_json(STATE_FILE)
     dash_data = _read_json(DASHBOARD_FILE)
+    profile   = get_strategy_profile(STRATEGY_PROFILE)
+    scoring_model = profile.scoring_model
 
     equity         = float(dash_data.get("equity") or 0)
     # settled_cash is written by the engine from IBKR accountSummary().  It is
@@ -183,10 +247,15 @@ def get_state():
         total_unrealized += unreal
         positions.append({
             "symbol":          sym,
+            "strategy_profile": d.get("strategy_profile") or profile.name,
+            "entry_strategy":  d.get("entry_strategy"),
+            "entry_strategy_label": d.get("entry_strategy_label") or d.get("entry_strategy"),
+            "regime":          d.get("regime"),
             "entry_price":     ep,
             "unit_price":      unit_price,
             "current_price":   cur,
             "qty":             qty,
+            "entry_qty":       _finite_float_or_none(d.get("entry_qty")),
             "total_amount":    round(ep * qty, 2),
             "unrealized":      unreal,
             "unrealized_pct":  unreal_pct,
@@ -196,6 +265,20 @@ def get_state():
             "hold_hours":      round(hold_h, 2),
             "entry_time":      entry_ts,
             "score":           d.get("score"),
+            "relative_strength_63d":  _finite_float_or_none(d.get("relative_strength_63d")),
+            "relative_strength_126d": _finite_float_or_none(d.get("relative_strength_126d")),
+            "return_13w":             _finite_float_or_none(d.get("return_13w")),
+            "return_26w":             _finite_float_or_none(d.get("return_26w")),
+            "weekly_uptrend":         bool(d.get("weekly_uptrend", False)),
+            "price_vs_52w_high":      _finite_float_or_none(d.get("price_vs_52w_high")),
+            "analyst_rating_score":   _finite_float_or_none(d.get("analyst_rating_score")),
+            "analyst_rating_total":   _int_or_none(d.get("analyst_rating_total")),
+            "analyst_rating_source":  d.get("analyst_rating_source"),
+            "analyst_rating_period":  d.get("analyst_rating_period"),
+            "profit_tiers_fired":     d.get("profit_tiers_fired") or [],
+            "profit_tier_exits":      d.get("profit_tier_exits") or [],
+            "protection_status":      d.get("protection_status"),
+            "protection_reason":      d.get("protection_reason"),
         })
 
     max_positions = (
@@ -227,10 +310,49 @@ def get_state():
         "market_open":       _market_open(),
         "vix":               dash_data.get("vix"),
         "vix_threshold":     VIX_THRESHOLD,
-        "hold_trading_bars": HOLD_TRADING_BARS,
+        "hold_trading_bars": profile.time_stop_bars,
         "eod_exit_time":     f"{EOD_EXIT_TIME[0]:02d}:{EOD_EXIT_TIME[1]:02d}",
+        "strategy_profile":  profile.name,
+        "strategy":          {
+            "profile":                       profile.name,
+            "label":                         profile.label,
+            "description":                   profile.description,
+            "scoring_model":                 scoring_model,
+            "min_rs_63d":                    profile.min_rs_63d,
+            "min_rs_126d":                   profile.min_rs_126d,
+            "min_13w_return":                profile.min_13w_return,
+            "min_26w_return":                profile.min_26w_return,
+            "min_price_vs_52w_high":         profile.min_price_vs_52w_high,
+            "min_volume_pace":               profile.min_volume_pace,
+            "max_ma20_extension":            profile.max_ma20_extension,
+            "min_score":                     profile.min_score,
+            "eod_quality_cleanup":           profile.eod_quality_cleanup,
+            "friday_close_enabled":          profile.friday_close_enabled,
+            "time_stop_bars":                profile.time_stop_bars,
+            "allow_bear_phase_entries":      profile.allow_bear_phase_entries,
+            "indicator_sleeves":             list(getattr(profile, "indicator_sleeves", ()) or ()),
+            "max_atr_pct":                   profile.max_atr_pct,
+            "max_spread_pct":                profile.max_spread_pct,
+            "analyst_ratings_enabled":       ANALYST_RATINGS_ENABLED,
+            "analyst_rating_score_weight":   ANALYST_RATING_SCORE_WEIGHT,
+            "analyst_rating_sell_threshold": ANALYST_RATING_SELL_THRESHOLD,
+            "analyst_rating_exit_enabled":   ANALYST_RATING_EXIT_ENABLED,
+            "tiered_profit_exit_enabled":    TIERED_PROFIT_EXIT_ENABLED,
+            "tiered_profit_exit_levels": [
+                {"target_r": target_r, "cumulative_fraction": fraction}
+                for target_r, fraction in TIERED_PROFIT_EXIT_R_LEVELS
+            ],
+        },
         "last_scan":         dash_data.get("last_scan"),
         "next_scan":         dash_data.get("next_scan"),
+        "scanner_source":    dash_data.get("scanner_source"),
+        "scanner_universe_size": dash_data.get("scanner_universe_size"),
+        "scanner_universe_offset": dash_data.get("scanner_universe_offset"),
+        "scanner_universe_batch_size": dash_data.get("scanner_universe_batch_size"),
+        "scanner_prefilter_date": dash_data.get("scanner_prefilter_date"),
+        "scanner_prefilter_status": dash_data.get("scanner_prefilter_status"),
+        "scanner_prefilter_candidates": dash_data.get("scanner_prefilter_candidates"),
+        "scanner_prefilter_stats": dash_data.get("scanner_prefilter_stats", {}),
         "last_updated":      dash_data.get("last_updated"),
         "blocked_today":     dash_data.get("blocked_today", []),
     })
@@ -455,8 +577,8 @@ footer a{color:var(--dim);text-decoration:none;}
 <!-- HEADER -->
 <div class="header">
   <h1>⚡ &nbsp; V E L O C I T Y &nbsp; E N G I N E &nbsp; · &nbsp; L I V E &nbsp; T R A D I N G &nbsp; D A S H B O A R D &nbsp; ⚡</h1>
-  <div class="sub">INTERACTIVE BROKERS &nbsp;·&nbsp; MOMENTUM STRATEGY &nbsp;·&nbsp; REAL-TIME</div>
-  <div class="badge">localhost:8080 &nbsp;·&nbsp; auto-refresh 5 s</div>
+  <div class="sub">INTERACTIVE BROKERS &nbsp;·&nbsp; RELATIVE-STRENGTH SWING MOMENTUM &nbsp;·&nbsp; REAL-TIME</div>
+  <div class="badge"><span id="strategy-badge">__PROFILE_LABEL__ &nbsp;·&nbsp; __SCORING_MODEL__ score</span> &nbsp;·&nbsp; auto-refresh 5 s</div>
 </div>
 
 <!-- MIDDLE ROW -->
@@ -500,6 +622,8 @@ footer a{color:var(--dim);text-decoration:none;}
       <div class="srow"><span class="slabel">MARKET</span>       <span class="sval" id="mkt">—</span></div>
       <div class="srow"><span class="slabel">TIME&nbsp;(ET)</span>  <span class="sval c" id="clock">—</span></div>
       <div class="srow"><span class="slabel">VIX</span>          <span class="sval" id="vix">—</span></div>
+      <div class="srow"><span class="slabel">STRATEGY</span>     <span class="sval c" id="strategy">—</span></div>
+      <div class="srow"><span class="slabel">ANALYST DATA</span> <span class="sval" id="analyst-state">—</span></div>
       <div class="srow"><span class="slabel">LAST&nbsp;SCAN</span>  <span class="sval d" id="lscan">—</span></div>
       <div class="srow"><span class="slabel">NEXT&nbsp;SCAN&nbsp;IN</span><span class="sval" id="nscan">—</span></div>
     </div>
@@ -547,20 +671,24 @@ footer a{color:var(--dim);text-decoration:none;}
       <thead>
         <tr>
           <th>SYMBOL</th>
+          <th>STRATEGY</th>
           <th>SCORE</th>
           <th>ENTRY PRICE</th>
           <th>UNIT PRICE</th>
           <th>CURRENT PRICE</th>
           <th>QTY</th>
+          <th>PROFIT TIERS</th>
           <th>TOTAL COST</th>
           <th>UNREALIZED P&amp;L</th>
           <th>STOP (TRAIL)</th>
-          <th>VOLUME</th>
+          <th>RS 63D</th>
+          <th>ANALYST</th>
+          <th>PROTECTION</th>
           <th>HOLD TIME</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr class="empty"><td colspan="11">Waiting for data…</td></tr>
+        <tr class="empty"><td colspan="15">Waiting for data…</td></tr>
       </tbody>
     </table>
   </div>
@@ -574,13 +702,13 @@ footer a{color:var(--dim);text-decoration:none;}
 
 <!-- ENTRY CONDITIONS -->
 <div class="panel">
-  <div class="ptitle entry-title"><span class="icon">✅</span> ENTRY CONDITIONS &nbsp;—&nbsp; ALL MUST BE MET SIMULTANEOUSLY FOR A BUY SIGNAL</div>
+  <div class="ptitle entry-title"><span class="icon">✅</span> ENTRY RULES &nbsp;—&nbsp; SETUP GATES MUST PASS BEFORE SCORE, RANK, AND LIVE RECHECK</div>
   <div class="cond-grid" id="entry-conds"></div>
 </div>
 
 <!-- EXIT CONDITIONS -->
 <div class="panel">
-  <div class="ptitle exit-title"><span class="icon">🚪</span> EXIT CONDITIONS &nbsp;—&nbsp; ANY ONE TRIGGERS POSITION CLOSE</div>
+  <div class="ptitle exit-title"><span class="icon">🚪</span> EXIT / RISK CONTROLS &nbsp;—&nbsp; TRUE EXITS CAN CLOSE; HALTS BLOCK FRESH BUYING</div>
   <div class="cond-grid" id="exit-conds"></div>
 </div>
 
@@ -592,28 +720,30 @@ footer a{color:var(--dim);text-decoration:none;}
 <script>
 // ── Entry / Exit conditions ─────────────────────────────────────────────────
 const ENTRY_CONDITIONS = [
-  ["1",  "ORB Breakout",    "en", "Live price above the 15-min Opening Range High established by 09:45 ET"],
-  ["2",  "RSI Acceleration","en", "RSI(14) must be above threshold and rising by the configured minimum delta"],
-  ["3",  "Close Location",  "en", "Price must be closing in the upper part of today's range"],
-  ["4",  "Universe Filter", "en", "IB scan: broad active corporate stocks | Price > $20 | Vol > 2M | Avg dollar volume ≥ threshold | Spread ≤ 0.5%"],
-  ["5",  "SPY Regime",      "en", "SPY uptrend uses normal rules; SPY weakness requires stricter bear-phase rules and smaller risk"],
-  ["6",  "Gap / ATR Risk",  "en", "Skip overextended breakouts and names with ATR too large relative to price"],
-  ["7",  "VIX Filter",      "en", "Live or delayed VIX regime data required; VIX > 35 or missing VIX data blocks new entries (Risk-Off)"],
-  ["8",  "Session Window",  "en", "Entries only 10:00–15:30 ET, Monday–Friday (30-min post-open buffer to avoid ORB noise)"],
-  ["9",  "Position Limit",  "en", "Max position capacity compounds with total equity; new entries still require settled cash; max 2 in same sector; correlation ≤ 0.70 with any open position"],
-  ["10", "Score Ranking",   "en", "All IBKR scanner results are evaluated; scored: Trend 30pts + Rel.Volume 25pts + Momentum 25pts + Liquidity 20pts = 100"],
-  ["11", "Friday Filter",   "en", "Dollar-volume threshold doubled to 2× on Fridays for higher conviction"],
-  ["12", "Day Strength",    "en", "Price must be in the upper part of today's range and at least 1.0% above today's open"],
-  ["13", "Chandelier Stop", "en", "Chandelier trailing stop = ATR(22) × 2 from peak; bucket = settled cash ÷ open slots, recalculated every 60-sec cycle"],
+  ["1",  "RS Trend Gate",     "en", "Stock must pass weekly uptrend, 3/6-month relative strength, 13/26-week return, 52-week-high proximity, MA50>MA200, and rising SMA200 checks before any sleeve can buy"],
+  ["2",  "MA Timing",         "en", "Default timing sleeve: EMA20 must be above SMA50; a fresh cross, MA reclaim, or prior-high break can time entry only after the RS trend gate passes"],
+  ["3",  "Bollinger Research","en", "Bollinger lower-band reclaim remains available as a standalone research profile, but it is not enabled in the default live profile"],
+  ["4",  "PSAR Research",     "en", "PSAR three-dot bull state remains available as a standalone research profile and confirmation input, but it is not a default primary buy trigger"],
+  ["5",  "Momentum Confirm",  "en", "RSI must show momentum or recovery, and at least two confirmations must agree: MACD, OBV, PSAR, stochastic, or volume pace"],
+  ["6",  "Volume Confirm",    "en", "Volume pace must meet the profile floor; OBV and volume acceleration improve score but do not override weak price action"],
+  ["7",  "Analyst Weight",    "en", "Analyst consensus can add or subtract up to __ANALYST_WEIGHT__ score points, but it cannot create a buy by itself"],
+  ["8",  "Risk / Liquidity",  "en", "ATR%, spread, price, share volume, and 20-day dollar volume must pass the selected profile limits"],
+  ["9",  "Market Regime",     "en", "VIX must be available and ≤ threshold; SPY weakness blocks fresh swing entries"],
+  ["10", "Portfolio Fit",     "en", "Settled-cash bucket required; max 2 names per sector; daily-return correlation must stay ≤ 0.70 versus open positions"],
+  ["11", "Score Threshold",   "en", "Eligible candidates need an indicator-swing score of at least __ACTIVE_MIN_SCORE__ before execution"],
+  ["12", "Ranked Execution",  "en", "Only passing candidates are ranked highest-first, then rechecked at live price before order placement"],
 ];
 const EXIT_CONDITIONS = [
-  ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(22)×2.0 from peak price; IB raises stop automatically as price climbs — only stop type used"],
-  ["2", "EOD Profit Cleanup", "ex", "__EOD_PROFIT_CLEANUP_RULE__"],
-  ["3", "Hard Stop",        "ex", "7% drawdown from fill price triggers immediate Market SELL regardless of ATR distance"],
-  ["4", "Break-Even Floor", "ex", "Once profit exceeds 4%, chandelier stop floored at fill price — eliminates risk of turning a winner into a loser"],
-  ["5", "Friday Close",     "ex", "After 3 PM ET on Fridays, positions with < 3% profit are liquidated to avoid weekend gap risk"],
-  ["6", "VIX Risk-Off",     "ex", "VIX > 35 blocks new entries; existing positions exit via chandelier stop, EOD cleanup, or hard stop"],
-  ["7", "Daily Loss Halt",  "ex", "3% intraday equity drawdown halts all new entries for the remainder of the trading day"],
+  ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(22) × 2.0 from peak price; IB raises the protective stop as price climbs"],
+  ["2", "Profit Tiers",     "ex", "__TIERED_PROFIT_RULE__"],
+  ["3", "Hard Stop",        "ex", "Software exit: 7% drawdown from fill price triggers immediate Market SELL regardless of ATR distance"],
+  ["4", "Break-Even Floor", "ex", "Software exit: once profit exceeds 4%, a retrace to fill price triggers a Market SELL"],
+  ["5", "Strategy Exit",    "ex", "Positions exit on the matching sleeve rule that opened them: MA bearish cross for the default profile, or the standalone research profile's own reversal rule"],
+  ["6", "Swing Time Stop",  "ex", "__SWING_TIME_STOP_RULE__"],
+  ["7", "Analyst Downgrade","ex", "__ANALYST_EXIT_RULE__"],
+  ["8", "No EOD Churn",     "ex", "__EOD_PROFIT_CLEANUP_RULE__"],
+  ["9", "Entry Halts",      "ex", "VIX risk-off, SPY bear regime, and 3% daily equity drawdown halt fresh swing buys; open positions still exit through stops"],
+  ["10", "Manual Controls",  "ex", "HALT_TRADING blocks new entries; FORCE_EXIT_ALL requests a full market-exit pass"],
 ];
 function renderConds(arr, containerId) {
   document.getElementById(containerId).innerHTML = arr.map(([n,name,cls,desc]) =>
@@ -652,6 +782,17 @@ setInterval(countdown, 1000);
 // ── Formatters ───────────────────────────────────────────────────────────────
 const $f = v => '$' + (+v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
 const vol = v => v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':String(v|0);
+const pct = (v, digits=1, signed=false) => {
+  if (v == null || !isFinite(+v)) return '—';
+  const val = +v * 100;
+  return (signed && val > 0 ? '+' : '') + val.toFixed(digits) + '%';
+};
+const holdLabel = h => {
+  if (h == null || !isFinite(+h)) return '—';
+  const hours = +h;
+  return hours >= 24 ? (hours / 24).toFixed(1) + 'd' : hours.toFixed(1) + 'h';
+};
+const cleanLabel = v => (v || '—').toString().replace(/_/g, ' ').toUpperCase();
 
 // ── Progress bar ─────────────────────────────────────────────────────────────
 function flash() {
@@ -674,6 +815,19 @@ function render(d) {
   document.getElementById('bucket').textContent    = $f(d.bucket_size||0);
   document.getElementById('alloc').textContent    = (d.allocation_pct||0).toFixed(1)+'%';
   document.getElementById('poscount').textContent = `${d.position_count||0} / ${d.max_positions||3}`;
+
+  const strat = d.strategy || {};
+  const strategyBadge = document.getElementById('strategy-badge');
+  const scoring = (strat.scoring_model || 'indicator_swing').toUpperCase();
+  const label = strat.label || 'Multi-Indicator Swing';
+  if (strategyBadge) strategyBadge.textContent = `${label} · ${scoring} score`;
+  document.getElementById('strategy').textContent = label;
+  const analystState = document.getElementById('analyst-state');
+  const analystOn = !!strat.analyst_ratings_enabled;
+  analystState.textContent = analystOn
+    ? `ON · ±${(+strat.analyst_rating_score_weight || 0).toFixed(0)} pts`
+    : 'OFF';
+  analystState.className = 'sval ' + (analystOn ? 'g' : 'd');
 
   // Gateway
   const gw = document.getElementById('gw');
@@ -748,29 +902,45 @@ function render(d) {
   // Portfolio
   const tb = document.getElementById('tbody');
   if (!d.positions || d.positions.length === 0) {
-    tb.innerHTML = '<tr class="empty"><td colspan="11">No open positions</td></tr>';
+    tb.innerHTML = '<tr class="empty"><td colspan="15">No open positions</td></tr>';
     return;
   }
   tb.innerHTML = d.positions.map(p => {
-    const warn  = p.hold_hours >= (d.hold_trading_bars ?? 2) * 24 * 0.875;
     const unr   = p.unrealized ?? 0;
     const unrP  = p.unrealized_pct ?? 0;
     const ucls  = unr > 0 ? 'up' : unr < 0 ? 'un' : 'uz';
     const usign = unr >= 0 ? '+' : '';
     const sc    = p.score != null ? p.score.toFixed(1) : '—';
     const scCls = p.score != null ? (p.score >= 70 ? 'g' : p.score >= 45 ? 'y' : 'r') : 'd';
+    const rs63  = p.relative_strength_63d;
+    const rsCls = rs63 == null ? 'd' : rs63 >= 0.05 ? 'g' : rs63 >= 0 ? 'y' : 'r';
+    const ar    = p.analyst_rating_score;
+    const arCls = ar == null ? 'd' : ar > 0.15 ? 'g' : ar < -0.15 ? 'r' : 'y';
+    const arTxt = ar == null
+      ? '—'
+      : `${ar > 0 ? '+' : ''}${(+ar).toFixed(2)}${p.analyst_rating_total != null ? '/' + p.analyst_rating_total : ''}`;
+    const prot = cleanLabel(p.protection_status || 'unknown');
+    const protCls = p.protection_status === 'confirmed' ? 'g' : p.protection_status === 'pending' ? 'y' : 'd';
+    const tierRecords = Array.isArray(p.profit_tier_exits) ? p.profit_tier_exits : [];
+    const tierTxt = tierRecords.length
+      ? tierRecords.map(t => `${(+t.target_r || 0).toFixed(1)}R:${(+t.sold_qty || 0).toFixed(0)}`).join(' ')
+      : '—';
     return `<tr>
       <td>${p.symbol}</td>
+      <td style="font-size:10px">${cleanLabel(p.entry_strategy_label || p.entry_strategy || p.strategy_profile || '—')}</td>
       <td class="${scCls}" style="font-weight:700">${sc}</td>
       <td>${$f(p.entry_price)}</td>
       <td class="c" style="font-size:11px">${p.unit_price != null ? $f(p.unit_price) : '<span style="color:var(--dim)">pending</span>'}</td>
       <td>${$f(p.current_price)}</td>
       <td>${(+p.qty).toFixed(4)}</td>
+      <td class="c" style="font-size:10px">${tierTxt}</td>
       <td>${$f(p.total_amount)}</td>
       <td class="${ucls}">${usign}${$f(unr)}<br><span style="font-size:10px;opacity:.8">${usign}${unrP.toFixed(2)}%</span></td>
       <td class="sl">${$f(p.effective_stop ?? p.stop_loss)}${p.effective_stop > p.stop_loss ? ' ↑' : ''}</td>
-      <td>${vol(p.volume)}</td>
-      <td class="${warn?'hw':'hn'}">${(+p.hold_hours).toFixed(1)}h${warn?' ⚠':''}</td>
+      <td class="${rsCls}">${pct(rs63, 1, true)}</td>
+      <td class="${arCls}">${arTxt}</td>
+      <td class="${protCls}" style="font-size:10px">${prot}</td>
+      <td class="hn">${holdLabel(p.hold_hours)}</td>
     </tr>`;
   }).join('');
 }
@@ -873,14 +1043,72 @@ setInterval(refresh, 5000);
 </body>
 </html>"""
 
-_HTML = _HTML.replace(
-    "__EOD_PROFIT_CLEANUP_RULE__",
+_ACTIVE_PROFILE = get_strategy_profile(STRATEGY_PROFILE)
+_ACTIVE_SCORING_MODEL = _ACTIVE_PROFILE.scoring_model.upper()
+
+
+def _pct_text(value: float, digits: int = 0, *, signed: bool = False) -> str:
+    pct_value = float(value) * 100.0
+    sign = "+" if signed and pct_value > 0 else ""
+    return f"{sign}{pct_value:.{digits}f}%"
+
+
+_eod_stop_text = (
+    "the protective stop is confirmed"
+    if EOD_HOLD_REQUIRE_STOP_CONFIRMED
+    else "protective stop confirmation is not required"
+)
+_analyst_exit_rule = (
+    f"Enabled: rating score <= {ANALYST_RATING_SELL_THRESHOLD:+.2f} triggers a Market SELL on the next risk pass"
+    if ANALYST_RATING_EXIT_ENABLED
+    else "Disabled: analyst ratings adjust entry ranking only; downgrade exits are not active"
+)
+_tiered_profit_rule = (
+    "Enabled: sell nearest whole-share cumulative trims at "
+    + ", ".join(
+        f"+{target_r:.1f}R -> {fraction * 100:.0f}% sold"
+        for target_r, fraction in TIERED_PROFIT_EXIT_R_LEVELS
+    )
+    + "; R is the original per-share Chandelier risk distance and the remaining runner stays protected by the broker trailing stop"
+    if TIERED_PROFIT_EXIT_ENABLED
+    else "Disabled: winners remain fully sized until the normal exit stack closes them"
+)
+_eod_rule = (
     (
-        f"Same day at/after "
-        f"{EOD_EXIT_TIME[0] % 12 or 12}:{EOD_EXIT_TIME[1]:02d} PM ET: if profit < "
-        f"{PROFIT_MIN_THRESHOLD * 100:.0f}%, force-liquidate via Market SELL; "
-        "frees capital for T+1 settlement"
-    ),
+        f"Enabled for this profile: same-day at/after "
+        f"{EOD_EXIT_TIME[0] % 12 or 12}:{EOD_EXIT_TIME[1]:02d} PM ET: carry only if "
+        f"profit >= {EOD_HOLD_MIN_PROFIT_PCT * 100:.0f}%, price is above VWAP or entry, "
+        f"close is in the top {(1 - EOD_HOLD_DAY_RANGE_LOCATION_MIN) * 100:.0f}% of the day range, "
+        f"relative strength is >= {EOD_HOLD_RELATIVE_STRENGTH_MIN * 100:.0f}%, "
+        f"and {_eod_stop_text}; otherwise Market SELL before the close"
+    )
+    if _ACTIVE_PROFILE.eod_quality_cleanup
+    else "Disabled for the swing profile: normal positions are not churned out by same-day EOD quality cleanup"
+)
+_time_stop_rule = (
+    f"After {_ACTIVE_PROFILE.time_stop_bars or SWING_TIME_STOP_BARS} trading bars, "
+    "close positions that are not above breakeven"
+    if _ACTIVE_PROFILE.time_stop_bars is not None
+    else "Disabled for this profile"
+)
+
+_HTML = (
+    _HTML
+    .replace("__PROFILE_LABEL__", _ACTIVE_PROFILE.label)
+    .replace("__SCORING_MODEL__", _ACTIVE_SCORING_MODEL)
+    .replace("__SWING_RS_63D__", _pct_text(SWING_RS_MIN_63D, signed=True))
+    .replace("__SWING_RS_126D__", _pct_text(SWING_RS_MIN_126D, signed=True))
+    .replace("__SWING_RET_13W__", _pct_text(SWING_MIN_13W_RETURN))
+    .replace("__SWING_RET_26W__", _pct_text(SWING_MIN_26W_RETURN))
+    .replace("__SWING_52W__", _pct_text(SWING_MIN_PRICE_VS_52W_HIGH))
+    .replace("__SWING_MA20_EXT__", _pct_text(SWING_MAX_MA20_EXTENSION))
+    .replace("__SWING_VOL_PACE__", f"{SWING_MIN_VOLUME_PACE:.2f}x")
+    .replace("__ACTIVE_MIN_SCORE__", f"{(_ACTIVE_PROFILE.min_score or INDICATOR_SWING_MIN_SCORE):.0f}")
+    .replace("__ANALYST_WEIGHT__", f"{ANALYST_RATING_SCORE_WEIGHT:.0f}")
+    .replace("__EOD_PROFIT_CLEANUP_RULE__", _eod_rule)
+    .replace("__TIERED_PROFIT_RULE__", _tiered_profit_rule)
+    .replace("__SWING_TIME_STOP_RULE__", _time_stop_rule)
+    .replace("__ANALYST_EXIT_RULE__", _analyst_exit_rule)
 )
 
 

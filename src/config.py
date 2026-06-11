@@ -1,5 +1,17 @@
 import os
 
+
+def _parse_hhmm(value: str, default: tuple[int, int]) -> tuple[int, int]:
+    try:
+        hour_s, minute_s = str(value or "").strip().split(":", 1)
+        hour = int(hour_s)
+        minute = int(minute_s)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return (hour, minute)
+    except (TypeError, ValueError):
+        pass
+    return default
+
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR         = os.getenv(
     "VELOCITY_BASE_DIR",
@@ -92,43 +104,43 @@ CHANDELIER_MULT   = 2.0    # ATR multiplier — kept after rule-combo sweep; 1.9
 
 # ── Risk rules ────────────────────────────────────────────────────────────────
 VIX_THRESHOLD        = 35
-HOLD_TRADING_BARS    = 1       # Backtest/optimizer compatibility; live EOD cleanup is same-day at the close
-PROFIT_MIN_THRESHOLD = 0.05    # 5% min gain required to keep a position overnight after EOD cleanup
-GAP_MAX_PCT          = 0.10    # max allowed ORB extension; >10% = chasing, skip entry
 MAX_DAILY_LOSS_PCT   = 0.03    # 3% intraday equity drawdown halts new entries for the day
-RSI_MIN_DELTA        = 2.0     # minimum RSI point rise; full-universe sweep improved quality vs 1.0
-DAY_RANGE_LOCATION_MIN = 0.55  # current price must close in upper 45% of range; improves DD/Sharpe after combo validation
-INTRADAY_GAIN_MIN   = 0.010    # current price must be at least +1.0% above today's open; improves signal quality
 ATR_PCT_MAX         = 0.07     # ATR_CHAND / price cap; filters excessively noisy names while preserving enough trade count
 HARD_STOP_PCT        = 0.07    # 7% drawdown from entry triggers forced market exit regardless of ATR
 RISK_PER_TRADE_PCT   = 0.02    # risk 2% of current equity per trade (ATR-based position sizing)
 BREAK_EVEN_PCT       = 0.04    # once profit exceeds 4%, floor stop at entry — improves WR +4pp vs 3% threshold
+TIERED_PROFIT_EXIT_ENABLED = os.getenv(
+    "VELOCITY_TIERED_PROFIT_EXIT_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+# Each tuple is (R-multiple target, cumulative position fraction that should be sold).
+# R is the original per-share risk distance captured from the entry Chandelier stop.
+# Example: a 6-share entry trims 1 share at +1R, 1 more at +1.5R, and 2 more at +2R.
+TIERED_PROFIT_EXIT_R_LEVELS = (
+    (1.0, 0.20),
+    (1.5, 0.40),
+    (2.0, 0.60),
+)
 FRIDAY_CLOSE_HOUR    = 15      # ET hour after which Friday positions are evaluated for early close
 FRIDAY_MIN_PROFIT_PCT = 0.03   # Friday close: exit if profit < 3% to avoid carrying weekend gap risk
-EOD_EXIT_TIME        = (15, 50)  # ET — same-day EOD profit cleanup; positions below profit threshold are closed
+EOD_EXIT_TIME        = (15, 50)  # ET — same-day EOD quality cleanup before overnight carry
+EOD_HOLD_MIN_PROFIT_PCT = float(os.getenv("VELOCITY_EOD_HOLD_MIN_PROFIT_PCT", "0.0"))
+EOD_HOLD_DAY_RANGE_LOCATION_MIN = float(os.getenv("VELOCITY_EOD_HOLD_DAY_RANGE_LOCATION_MIN", "0.70"))
+EOD_HOLD_RELATIVE_STRENGTH_MIN = float(os.getenv("VELOCITY_EOD_HOLD_RELATIVE_STRENGTH_MIN", "0.0"))
+EOD_HOLD_REQUIRE_STOP_CONFIRMED = os.getenv(
+    "VELOCITY_EOD_HOLD_REQUIRE_STOP_CONFIRMED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 FRIDAY_ENTRY_CUTOFF_TIME = (12, 0)  # ET — avoid opening new swing positions that will be force-reviewed hours later
 
 # ── Bear-phase participation ──────────────────────────────────────────────────
-# Broad-market bear tape must not be treated like normal risk.  These settings
-# keep the engine active when SPY fails its regime check, but only for exceptional
-# relative-strength breakouts and at reduced dollars-at-risk.  RVOL/VCP values
-# remain available for diagnostics and ranking, but 8096 does not gate entries
-# on them.
+# Broad-market bear tape must not be treated like normal risk.
 BEAR_PHASE_TRADING_ENABLED = os.getenv(
     "VELOCITY_BEAR_PHASE_TRADING_ENABLED", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
 BEAR_PHASE_RISK_MULT       = 0.35   # 2% base risk → 0.7% risk in hostile tape
 BEAR_PHASE_DOLLAR_VOL_MULT = 1.50   # require deeper liquidity in bear tape
-BEAR_RVOL_MIN              = 4.0    # legacy/ranking reference; not an active 8096 entry gate
-BEAR_BACKTEST_RVOL_MIN     = 2.0    # legacy daily-volume proxy; not an active 8096 entry gate
-BEAR_VCP_RATIO             = 0.80   # legacy/diagnostic reference; not an active 8096 entry gate
-BEAR_BREAKOUT_PCT          = 0.02   # legacy optimizer parameter; 10-day-high proximity is not an active entry gate
-BEAR_RSI_THRESHOLD         = 65     # stronger momentum floor
-BEAR_RSI_MIN_DELTA         = 3.0    # clearer RSI acceleration
-BEAR_GAP_MAX_PCT           = 0.04   # less chasing when broad liquidity is poor
 
 # ── Session timing ────────────────────────────────────────────────────────────
-ENTRY_START          = (9, 45)   # first valid entry time — 15 min after market open
+ENTRY_START          = (10, 15)  # first valid new-entry time — wait past the noisy opening rotation
 ENTRY_END            = (15, 30)
 STOP_ACTIVATION_TIME = (9, 32)   # protective TRAIL stops activate after the first 2 opening minutes
 VOL_MULT_FRIDAY      = 2.0   # Friday liquidity gate: 2× normal dollar-volume threshold
@@ -147,27 +159,34 @@ RSI_PERIOD    = 14
 ATR_PERIOD    = 14
 MA_FAST       = 50
 MA_SLOW       = 200
-RSI_THRESHOLD = 55
 
 # ── Historical data requests ──────────────────────────────────────────────────
-ORB_LOOKBACK   = '3600 S'   # 1-hour window ending at 9:45 AM → only the 9:30 bar falls inside
-ORB_BAR_SIZE   = '15 mins'
 DAILY_LOOKBACK = '1 Y'
 DAILY_BAR_SIZE = '1 day'
 
 # ── Scanner filters (shared by live engine and backtester) ───────────────────
-SCAN_MIN_PRICE      = 20.0
-SCAN_MIN_VOLUME     = 2_000_000
-SCAN_MIN_MKTCAP     = 2_000_000_000
-IB_SCANNER_SCAN_CODE = (
-    os.getenv("VELOCITY_IB_SCANNER_SCAN_CODE", "MOST_ACTIVE").strip()
-    or "MOST_ACTIVE"
-)
+STRATEGY_PROFILE = os.getenv("VELOCITY_STRATEGY_PROFILE", "indicator_swing").strip().lower()
+SCAN_MIN_PRICE      = float(os.getenv("VELOCITY_SCAN_MIN_PRICE", "5.0"))
+SCAN_MIN_VOLUME     = int(os.getenv("VELOCITY_SCAN_MIN_VOLUME", "2000000"))
+SCAN_MIN_MKTCAP     = float(os.getenv("VELOCITY_SCAN_MIN_MKTCAP", "2000000000"))
 IB_SCANNER_SCAN_CODES: list = [
     c.strip()
     for c in os.getenv(
         "VELOCITY_IB_SCANNER_SCAN_CODES",
-        "MOST_ACTIVE,TOP_PERC_GAIN,HOT_BY_VOLUME",
+        (
+            "MOST_ACTIVE,"
+            "MOST_ACTIVE_USD,"
+            "MOST_ACTIVE_AVG_USD,"
+            "HOT_BY_VOLUME,"
+            "TOP_VOLUME_RATE,"
+            "HIGH_STVOLUME_5MIN,"
+            "HIGH_STVOLUME_10MIN,"
+            "TOP_OPEN_PERC_GAIN,"
+            "HIGH_OPEN_GAP,"
+            "BULLISH_MACD_DIST_VS_LAST,"
+            "HIGH_LAST_VS_EMA20,"
+            "HIGH_LAST_VS_EMA50"
+        ),
     ).split(",")
     if c.strip()
 ] or ["MOST_ACTIVE"]
@@ -176,6 +195,69 @@ IB_SCANNER_LOCATION_CODE = (
     or "STK.US.MAJOR"
 )
 IB_SCANNER_ROWS = int(os.getenv("VELOCITY_IB_SCANNER_ROWS", "-1"))  # -1 lets IBKR use its scanner default/maximum
+IB_SCANNER_FILTERS_ENABLED = os.getenv(
+    "VELOCITY_IB_SCANNER_FILTERS_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+# Application candidate source.  IBKR's scanner does not expose one clean
+# "all US common stocks" response, so the app can combine IBKR scanner hits
+# with a rotating full-symbol universe loaded from NASDAQ Trader listings or a
+# local file.  Final buy/no-buy decisions still come from the local screener.
+APP_SCANNER_SOURCE = os.getenv(
+    "VELOCITY_APP_SCANNER_SOURCE", "hybrid"
+).strip().lower()  # ibkr | universe | hybrid
+APP_SCANNER_BATCH_SIZE = int(os.getenv("VELOCITY_APP_SCANNER_BATCH_SIZE", "25"))
+APP_SCANNER_MAX_SYMBOLS = int(os.getenv("VELOCITY_APP_SCANNER_MAX_SYMBOLS", "0"))  # 0 = no cap
+APP_SCANNER_UNIVERSE_FILE = os.getenv("VELOCITY_APP_SCANNER_UNIVERSE_FILE", "").strip()
+APP_SCANNER_UNIVERSE_CACHE_FILE = os.getenv(
+    "VELOCITY_APP_SCANNER_UNIVERSE_CACHE_FILE",
+    os.path.join(BASE_DIR, "symbol_universe_cache.json"),
+)
+APP_SCANNER_UNIVERSE_TTL_SEC = float(os.getenv(
+    "VELOCITY_APP_SCANNER_UNIVERSE_TTL_SEC", str(24 * 3600)
+))
+APP_PREFILTER_ENABLED = os.getenv(
+    "VELOCITY_APP_PREFILTER_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+APP_PREFILTER_START_TIME = _parse_hhmm(
+    os.getenv("VELOCITY_APP_PREFILTER_START_TIME", "08:00"),
+    (8, 0),
+)
+APP_PREFILTER_CACHE_FILE = os.getenv(
+    "VELOCITY_APP_PREFILTER_CACHE_FILE",
+    os.path.join(BASE_DIR, "premarket_universe_prefilter.json"),
+)
+APP_PREFILTER_HISTORY_SLEEP_SEC = float(os.getenv(
+    "VELOCITY_APP_PREFILTER_HISTORY_SLEEP_SEC", "0.05"
+))
+APP_PREFILTER_PROGRESS_EVERY = int(os.getenv(
+    "VELOCITY_APP_PREFILTER_PROGRESS_EVERY", "100"
+))
+APP_PREFILTER_STOP_AT_ENTRY_START = os.getenv(
+    "VELOCITY_APP_PREFILTER_STOP_AT_ENTRY_START", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+# IBKR scanner-side generic filters.  These are upstream copies of filters the
+# live screener still validates locally.  They reduce noisy IBKR candidates, but
+# they are not trusted as final risk checks because broker scanner metadata can
+# lag or behave differently by venue/session.
+IB_SCANNER_CHANGE_OPEN_PCT_ABOVE = float(os.getenv(
+    "VELOCITY_IB_SCANNER_CHANGE_OPEN_PCT_ABOVE",
+    "0",
+))
+IB_SCANNER_OPEN_GAP_PCT_BELOW = float(os.getenv(
+    "VELOCITY_IB_SCANNER_OPEN_GAP_PCT_BELOW",
+    "15",
+))
+IB_SCANNER_LAST_VS_EMA20_PCT_ABOVE = float(os.getenv(
+    "VELOCITY_IB_SCANNER_LAST_VS_EMA20_PCT_ABOVE", "0"
+))
+IB_SCANNER_LAST_VS_EMA50_PCT_ABOVE = float(os.getenv(
+    "VELOCITY_IB_SCANNER_LAST_VS_EMA50_PCT_ABOVE", "0"
+))
+IB_SCANNER_MACD_HISTOGRAM_ABOVE = float(os.getenv(
+    "VELOCITY_IB_SCANNER_MACD_HISTOGRAM_ABOVE", "0"
+))
 # 20-day average dollar volume proxy for market cap — mirrors the IB $2B
 # market-cap gate.  Using a rolling average (not the single day's value)
 # prevents micro-cap news/pump spikes from passing the filter.
@@ -207,12 +289,7 @@ TICKER_BLOCKLIST: set = {
 
 # ── Screener production rules ─────────────────────────────────────────────────
 MIN_CANDLES          = 210     # minimum daily bars (SMA200 needs 200 + slope buffer)
-VCP_RATIO            = 1.00    # legacy/diagnostic ATR5 / ATR20 reference; not an active 8096 entry gate
-BREAKOUT_PCT         = 0.10    # legacy optimizer parameter; 10-day-high proximity is not an active entry gate
-RVOL_MIN             = 2.5     # live scoring/ranking reference; not an active 8096 entry gate
-BACKTEST_RVOL_MIN    = 1.1     # legacy daily close RVOL proxy; scanner ranking only in 8096 backtests
 SPREAD_MAX_PCT       = 0.005   # maximum bid-ask spread (0.5%)
-SCORING_MODEL        = os.getenv("VELOCITY_SCORING_MODEL", "legacy_v2").strip().lower()
 CORR_MAX             = 0.7     # max daily-return correlation with any current position
 MAX_SECTOR_COUNT     = 2       # max simultaneous positions in the same sector
 SMA200_SLOPE_LOOKBACK   = 5     # days over which SMA200 slope is measured
@@ -221,6 +298,58 @@ ENTRY_MAX_PRICE_DRIFT_PCT = 0.02 # max allowed scan-to-order price drift after r
 ENTRY_LIMIT_ASK_CUSHION_PCT = float(os.getenv("VELOCITY_ENTRY_LIMIT_ASK_CUSHION_PCT", "0.0005"))  # add 5 bps over ask for marketable limit
 ENTRY_LIMIT_MIN_TICK = float(os.getenv("VELOCITY_ENTRY_LIMIT_MIN_TICK", "0.01"))  # at least one cent above ask
 ENTRY_LIMIT_MAX_OVER_MARKET_PCT = float(os.getenv("VELOCITY_ENTRY_LIMIT_MAX_OVER_MARKET_PCT", "0.002"))  # retain old 0.2% max cap
+
+# ── Indicator swing system ───────────────────────────────────────────────────
+# Primary edge: daily/weekly momentum, relative strength, and indicator timing.
+SWING_RS_MIN_63D = float(os.getenv("VELOCITY_SWING_RS_MIN_63D", "0.08"))
+SWING_RS_MIN_126D = float(os.getenv("VELOCITY_SWING_RS_MIN_126D", "0.10"))
+SWING_MIN_13W_RETURN = float(os.getenv("VELOCITY_SWING_MIN_13W_RETURN", "0.12"))
+SWING_MIN_26W_RETURN = float(os.getenv("VELOCITY_SWING_MIN_26W_RETURN", "0.18"))
+SWING_MIN_PRICE_VS_52W_HIGH = float(os.getenv("VELOCITY_SWING_MIN_PRICE_VS_52W_HIGH", "0.85"))
+SWING_MAX_PULLBACK_FROM_HIGH20 = float(os.getenv("VELOCITY_SWING_MAX_PULLBACK_FROM_HIGH20", "0.12"))
+SWING_MAX_MA20_EXTENSION = float(os.getenv("VELOCITY_SWING_MAX_MA20_EXTENSION", "0.12"))
+SWING_MIN_VOLUME_PACE = float(os.getenv("VELOCITY_SWING_MIN_VOLUME_PACE", "1.20"))
+SWING_MIN_SCORE = float(os.getenv("VELOCITY_SWING_MIN_SCORE", "50.0"))
+SWING_TIME_STOP_BARS = int(os.getenv("VELOCITY_SWING_TIME_STOP_BARS", "10"))
+SWING_TIME_STOP_MIN_PROFIT_PCT = float(os.getenv("VELOCITY_SWING_TIME_STOP_MIN_PROFIT_PCT", "0.0"))
+
+# ── Multi-indicator swing profile ────────────────────────────────────────────
+INDICATOR_SWING_MIN_SCORE = float(os.getenv("VELOCITY_INDICATOR_SWING_MIN_SCORE", "50.0"))
+INDICATOR_SWING_TIME_STOP_BARS = int(os.getenv("VELOCITY_INDICATOR_SWING_TIME_STOP_BARS", "10"))
+INDICATOR_SWING_TIME_STOP_MIN_PROFIT_PCT = float(os.getenv("VELOCITY_INDICATOR_SWING_TIME_STOP_MIN_PROFIT_PCT", "0.0"))
+INDICATOR_SWING_MIN_VOLUME_PACE = float(os.getenv("VELOCITY_INDICATOR_SWING_MIN_VOLUME_PACE", "1.2"))
+INDICATOR_SWING_RSI_OVERSOLD = float(os.getenv("VELOCITY_INDICATOR_SWING_RSI_OVERSOLD", "35.0"))
+INDICATOR_SWING_RSI_OVERBOUGHT = float(os.getenv("VELOCITY_INDICATOR_SWING_RSI_OVERBOUGHT", "70.0"))
+INDICATOR_SWING_STOCH_OVERSOLD = float(os.getenv("VELOCITY_INDICATOR_SWING_STOCH_OVERSOLD", "20.0"))
+INDICATOR_SWING_STOCH_OVERBOUGHT = float(os.getenv("VELOCITY_INDICATOR_SWING_STOCH_OVERBOUGHT", "80.0"))
+INDICATOR_SWING_STRATEGIES = tuple(
+    s.strip().lower()
+    for s in os.getenv(
+        "VELOCITY_INDICATOR_SWING_STRATEGIES",
+        "ma_cross",
+    ).split(",")
+    if s.strip()
+)
+
+# ── Analyst rating integration ───────────────────────────────────────────────
+# Live ratings use Finnhub's recommendation-trends endpoint when an API key is
+# configured. Backtests use only local dated snapshots to avoid look-ahead bias.
+ANALYST_RATINGS_ENABLED = os.getenv(
+    "VELOCITY_ANALYST_RATINGS_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+FINNHUB_API_KEY = os.getenv("VELOCITY_FINNHUB_API_KEY", "").strip()
+ANALYST_RATINGS_FILE = os.getenv("VELOCITY_ANALYST_RATINGS_FILE", "").strip()
+ANALYST_RATINGS_CACHE_FILE = os.getenv(
+    "VELOCITY_ANALYST_RATINGS_CACHE_FILE",
+    os.path.join(BASE_DIR, "analyst_ratings_cache.json"),
+)
+ANALYST_RATINGS_TTL_SEC = float(os.getenv("VELOCITY_ANALYST_RATINGS_TTL_SEC", str(6 * 3600)))
+ANALYST_RATING_MIN_ANALYSTS = int(os.getenv("VELOCITY_ANALYST_RATING_MIN_ANALYSTS", "5"))
+ANALYST_RATING_SCORE_WEIGHT = float(os.getenv("VELOCITY_ANALYST_RATING_SCORE_WEIGHT", "8.0"))
+ANALYST_RATING_SELL_THRESHOLD = float(os.getenv("VELOCITY_ANALYST_RATING_SELL_THRESHOLD", "-0.35"))
+ANALYST_RATING_EXIT_ENABLED = os.getenv(
+    "VELOCITY_ANALYST_RATING_EXIT_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 
 # ── Loop timing ───────────────────────────────────────────────────────────────
 SCAN_INTERVAL          = 60    # seconds between cycles (1 minute)

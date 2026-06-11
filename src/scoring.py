@@ -1,26 +1,26 @@
-"""Shared candidate scoring for live trading and forward backtests.
+"""Shared candidate scoring for the maintained indicator swing strategy.
 
-The entry gates decide whether a setup is allowed.  This module only ranks
+Entry gates decide whether a setup is allowed.  This module only ranks
 already-eligible candidates so scarce cash/slots go to the best names first.
 """
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, time as dt_time
 from typing import Mapping, Optional
 
-import math
-
 from src.config import (
+    ANALYST_RATING_MIN_ANALYSTS,
+    ANALYST_RATING_SCORE_WEIGHT,
     ATR_PCT_MAX,
-    GAP_MAX_PCT,
-    RVOL_MIN,
+    INDICATOR_SWING_STOCH_OVERSOLD,
     SCAN_MIN_DOLLAR_VOL,
     SPREAD_MAX_PCT,
 )
 
 
-VALID_SCORING_MODELS = {"legacy", "legacy_v2", "enhanced"}
+VALID_SCORING_MODELS = {"indicator_swing"}
 REGULAR_SESSION_MINUTES = 390.0
 
 
@@ -33,13 +33,7 @@ def _finite_float(value, default: float = 0.0) -> float:
 
 
 def regular_session_elapsed_fraction(now: Optional[datetime]) -> float:
-    """Return elapsed US regular-session fraction for live volume pacing.
-
-    Before the open, return a small non-zero fraction so the calculation is
-    bounded.  After the close, return 1.0.  The live engine only enters after
-    the opening range is available, but this helper stays defensive for tests
-    and operational edge cases.
-    """
+    """Return elapsed US regular-session fraction for live volume pacing."""
     if now is None:
         return 1.0
     current = now.time()
@@ -62,13 +56,7 @@ def volume_pace_from_intraday(
     average_daily_volume: float,
     now: Optional[datetime],
 ) -> float:
-    """Normalize live intraday volume to a full-day volume pace.
-
-    Raw intraday volume makes a 10:00 ET stock look artificially quiet because
-    only a small part of the session has elapsed.  Volume pace estimates the
-    full-day run-rate: current volume divided by expected volume through this
-    point in the day.
-    """
+    """Normalize live intraday volume to a full-day volume pace."""
     intraday_volume = _finite_float(intraday_volume)
     average_daily_volume = _finite_float(average_daily_volume)
     if intraday_volume <= 0 or average_daily_volume <= 0:
@@ -77,251 +65,156 @@ def volume_pace_from_intraday(
     return intraday_volume / (average_daily_volume * elapsed)
 
 
-def legacy_candidate_score(
-    ctx: Mapping,
-    *,
-    volume_floor: float = RVOL_MIN,
-    spread_max_pct: float = SPREAD_MAX_PCT,
-) -> float:
-    """Original live score: trend, raw RVOL, RSI momentum, spread quality."""
-    ma50 = _finite_float(ctx.get("ma50"))
-    ma200 = _finite_float(ctx.get("ma200"))
-    rsi = _finite_float(ctx.get("rsi"))
-    rsi_prev = _finite_float(ctx.get("rsi_prev"))
-    volume_pace = _finite_float(
-        ctx.get("volume_pace", ctx.get("rvol", ctx.get("rvol_raw", volume_floor)))
-    )
-    spread_pct = _finite_float(ctx.get("spread_pct"))
-
-    sep = (ma50 - ma200) / ma200 * 100.0 if ma200 else 0.0
-    trend = max(0.0, min(sep * 5.0, 30.0))
-
-    floor = max(float(volume_floor), 0.01)
-    volume_score = min(max(volume_pace - floor, 0.0) / floor * 25.0, 25.0)
-
-    rsi_delta = rsi - rsi_prev
-    accel = min(max(rsi_delta * 1.5, 0.0), 15.0)
-    if rsi <= 70:
-        level = 10.0
-    elif rsi <= 75:
-        level = 5.0
+def analyst_rating_adjustment(ctx: Mapping) -> float:
+    """Bounded score boost/penalty from analyst consensus."""
+    if "analyst_rating_raw_score" in ctx:
+        raw = max(-1.0, min(1.0, _finite_float(ctx.get("analyst_rating_raw_score"), 0.0)))
     else:
-        level = max(0.0, 10.0 - (rsi - 75.0) * 2.0)
-    momentum = accel + level
-
-    spread_max = max(float(spread_max_pct), 0.000001)
-    liquidity = max(0.0, (spread_max - spread_pct) / spread_max * 20.0)
-
-    return round(max(0.0, min(trend + volume_score + momentum + liquidity, 100.0)), 2)
+        raw = max(-1.0, min(1.0, _finite_float(ctx.get("analyst_rating_score"), 0.0)))
+    total = _finite_float(ctx.get("analyst_rating_total"), 0.0)
+    min_analysts = max(float(ANALYST_RATING_MIN_ANALYSTS), 1.0)
+    confidence = max(0.0, min(total / min_analysts, 1.0)) if total > 0 else 1.0
+    return raw * confidence * float(ANALYST_RATING_SCORE_WEIGHT)
 
 
-def legacy_v2_candidate_score(
+def indicator_swing_score(
     ctx: Mapping,
     *,
-    volume_floor: float = RVOL_MIN,
+    volume_floor: float = 1.0,
     spread_max_pct: float = SPREAD_MAX_PCT,
     atr_pct_max: float = ATR_PCT_MAX,
-    gap_max_pct: float = GAP_MAX_PCT,
-    dollar_vol_floor: float = SCAN_MIN_DOLLAR_VOL,
 ) -> float:
-    """Legacy score plus small quality tie-breakers.
+    """Score RS-first indicator swing candidates after hard profile gates."""
+    sleeve = str(ctx.get("entry_strategy") or "")
+    trigger_score = {
+        "ma_cross": 20.0,
+        "bollinger_reversion": 18.0,
+        "psar_flip": 12.0,
+    }.get(sleeve, 12.0)
 
-    The base legacy model remains dominant.  These adjustments are intentionally
-    bounded so they can reorder close candidates without turning the scorer into
-    a new strategy:
-      - volume pace follow-through
-      - dollar liquidity depth
-      - clean but not stretched ORB extension
-      - ATR risk cleanliness
-      - mild relief for high RSI when RSI is still rising
-    """
-    base = legacy_candidate_score(
-        ctx,
-        volume_floor=volume_floor,
-        spread_max_pct=spread_max_pct,
+    rsi = _finite_float(ctx.get("rsi"), float("nan"))
+    rsi_prev = _finite_float(ctx.get("rsi_prev", ctx.get("prev_rsi")), float("nan"))
+    stoch_k = _finite_float(ctx.get("stoch_k"), float("nan"))
+    stoch_d = _finite_float(ctx.get("stoch_d"), float("nan"))
+    macd_hist = _finite_float(ctx.get("macd_hist"), 0.0)
+    macd_delta = _finite_float(ctx.get("macd_hist_delta"), 0.0)
+    volume_pace = _finite_float(ctx.get("volume_pace", ctx.get("rvol")), 0.0)
+    spread_pct = _finite_float(ctx.get("spread_pct"), spread_max_pct)
+    dollar_vol = _finite_float(ctx.get("dollar_vol_20d", ctx.get("avg_dollar_vol_20")), 0.0)
+    price = _finite_float(ctx.get("live_price", ctx.get("close")), 0.0)
+    ma20 = _finite_float(ctx.get("ma20", ctx.get("MA20")), float("nan"))
+    ma50 = _finite_float(ctx.get("ma50", ctx.get("MA50")), float("nan"))
+    ma200 = _finite_float(ctx.get("ma200", ctx.get("MA200")), float("nan"))
+    sma200_slope = _finite_float(ctx.get("sma200_slope", ctx.get("SMA200_SLOPE")), float("nan"))
+    rs_63d = _finite_float(ctx.get("relative_strength_63d", ctx.get("rs_63d")), 0.0)
+    rs_126d = _finite_float(ctx.get("relative_strength_126d", ctx.get("rs_126d")), 0.0)
+    ret_13w = _finite_float(ctx.get("return_13w", ctx.get("ret_13w")), 0.0)
+    ret_26w = _finite_float(ctx.get("return_26w", ctx.get("ret_26w")), 0.0)
+    price_vs_52w_high = _finite_float(ctx.get("price_vs_52w_high"), 0.0)
+    atr_chand = _finite_float(ctx.get("atr_chandelier", ctx.get("ATR_CHAND", ctx.get("atr"))), 0.0)
+    atr_pct = _finite_float(ctx.get("atr_pct"), float("nan"))
+    if not math.isfinite(atr_pct):
+        atr_pct = atr_chand / price if price > 0 and atr_chand > 0 else float("inf")
+
+    leadership = 0.0
+    leadership += min(max(rs_63d / 0.20, 0.0), 1.0) * 5.0
+    leadership += min(max(rs_126d / 0.25, 0.0), 1.0) * 5.0
+    leadership += min(max(ret_13w / 0.30, 0.0), 1.0) * 4.0
+    leadership += min(max(ret_26w / 0.40, 0.0), 1.0) * 4.0
+    if price_vs_52w_high >= 0.90:
+        leadership += 4.0
+    elif price_vs_52w_high >= 0.85:
+        leadership += 2.0
+    if ctx.get("weekly_uptrend"):
+        leadership += 3.0
+    if price > 0 and math.isfinite(ma50) and price > ma50:
+        leadership += 2.0
+    if math.isfinite(ma50) and math.isfinite(ma200) and ma50 > ma200:
+        leadership += 2.0
+    if math.isfinite(sma200_slope) and sma200_slope > 0:
+        leadership += 1.0
+
+    momentum = 0.0
+    if math.isfinite(rsi):
+        if 50.0 <= rsi <= 68.0:
+            momentum += 8.0
+        elif 40.0 <= rsi < 50.0 and sleeve == "bollinger_reversion":
+            momentum += 5.0
+        elif rsi > 68.0:
+            momentum += 3.0
+    if math.isfinite(rsi) and math.isfinite(rsi_prev) and rsi > rsi_prev:
+        momentum += 3.0
+    if ctx.get("stoch_bull_exit_oversold"):
+        momentum += 5.0
+    elif (
+        math.isfinite(stoch_k)
+        and math.isfinite(stoch_d)
+        and stoch_k > stoch_d
+        and stoch_k <= INDICATOR_SWING_STOCH_OVERSOLD + 15
+    ):
+        momentum += 3.0
+    if ctx.get("macd_bull_divergence"):
+        momentum += 6.0
+    elif macd_delta > 0:
+        momentum += min(macd_delta / max(abs(macd_hist), 0.01), 1.0) * 5.0
+    if ctx.get("psar_bull_3"):
+        momentum += 3.0
+    if price > 0 and math.isfinite(ma20) and ma20 > 0 and price <= ma20 * 1.08:
+        momentum += 2.0
+
+    volume = 0.0
+    if ctx.get("obv_bull_divergence"):
+        volume += 6.0
+    elif ctx.get("obv_uptrend") or _finite_float(ctx.get("obv_slope_5"), 0.0) > 0:
+        volume += 4.0
+    floor = max(float(volume_floor or 1.0), 0.01)
+    volume += min(max((volume_pace / floor - 1.0) / 1.5, 0.0), 1.0) * 6.0
+
+    liquidity = (
+        min(max(math.log10(max(dollar_vol, 1.0) / max(SCAN_MIN_DOLLAR_VOL, 1.0)), 0.0), 1.0)
+        * 4.0
     )
-    price = _finite_float(ctx.get("live_price", ctx.get("close")))
-    orb_high = _finite_float(ctx.get("orb_high", ctx.get("prev_high")))
-    rsi = _finite_float(ctx.get("rsi"))
-    rsi_prev = _finite_float(ctx.get("rsi_prev"))
-    volume_pace = _finite_float(
-        ctx.get("volume_pace", ctx.get("rvol", ctx.get("rvol_raw", volume_floor)))
+    spread_score = (
+        max(0.0, (max(spread_max_pct, 0.000001) - spread_pct) / max(spread_max_pct, 0.000001))
+        * 3.0
     )
-    atr_chand = _finite_float(ctx.get("atr_chandelier", ctx.get("ATR_CHAND", ctx.get("atr"))))
-    dollar_vol = _finite_float(ctx.get("dollar_vol_20d", ctx.get("avg_dollar_vol_20")))
 
-    floor = max(float(volume_floor), 0.01)
-    volume_ratio = volume_pace / floor
-    volume_bonus = min(max((volume_ratio - 1.0) / 2.0, 0.0), 1.0) * 1.0
-
-    liquidity_bonus = 0.0
-    dollar_floor = max(float(dollar_vol_floor), 1.0)
-    if dollar_vol > dollar_floor:
-        # 10x the minimum dollar-liquidity floor earns the full 1.25 points.
-        liquidity_bonus = min(max(math.log10(dollar_vol / dollar_floor), 0.0), 1.0) * 1.25
-
-    gap_cap = max(float(gap_max_pct), 0.005)
-    extension_bonus = 0.0
-    extension = (price - orb_high) / orb_high if price > 0 and orb_high > 0 else 0.0
-    if extension > 0:
-        sweet_low = 0.002
-        sweet_high = min(0.04, gap_cap * 0.60)
-        if extension < sweet_low:
-            extension_bonus = 0.50
-        elif extension <= sweet_high:
-            extension_bonus = 1.50
-        elif extension <= gap_cap and gap_cap > sweet_high:
-            extension_bonus = 1.50 * (gap_cap - extension) / (gap_cap - sweet_high)
-            if extension >= gap_cap * 0.80:
-                extension_bonus -= 0.75
-        else:
-            extension_bonus = -2.00
-
-    atr_bonus = 0.0
-    atr_pct = atr_chand / price if price > 0 and atr_chand > 0 else float("inf")
     atr_cap = max(float(atr_pct_max), 0.001)
-    clean_zone = min(0.025, atr_cap * 0.40)
-    if atr_pct <= 0 or not math.isfinite(atr_pct):
-        atr_bonus = 0.0
-    elif atr_pct <= clean_zone:
-        atr_bonus = 1.25
-    elif atr_pct <= atr_cap:
-        atr_bonus = 1.25 * (atr_cap - atr_pct) / (atr_cap - clean_zone)
+    if not math.isfinite(atr_pct) or atr_pct <= 0 or atr_pct > atr_cap:
+        risk = 0.0
+    elif atr_pct <= 0.06:
+        risk = 10.0
     else:
-        atr_bonus = -1.50
+        risk = 10.0 * max((atr_cap - atr_pct) / max(atr_cap - 0.06, 0.001), 0.0)
 
-    rsi_delta = rsi - rsi_prev
-    high_rsi_adjustment = 0.0
-    if 75.0 < rsi <= 85.0 and rsi_delta >= 2.0:
-        high_rsi_adjustment = min((rsi_delta - 2.0) / 4.0, 1.0) * 1.00
-    elif rsi > 90.0:
-        high_rsi_adjustment = -1.00
-
-    adjustment = (
-        volume_bonus
-        + liquidity_bonus
-        + extension_bonus
-        + atr_bonus
-        + high_rsi_adjustment
+    total = (
+        trigger_score
+        + min(leadership, 30.0)
+        + min(momentum, 25.0)
+        + min(volume, 12.0)
+        + liquidity
+        + spread_score
+        + risk
     )
-    return round(max(0.0, min(base + adjustment, 100.0)), 2)
-
-
-def enhanced_candidate_score(
-    ctx: Mapping,
-    *,
-    volume_floor: float = RVOL_MIN,
-    spread_max_pct: float = SPREAD_MAX_PCT,
-    atr_pct_max: float = ATR_PCT_MAX,
-    gap_max_pct: float = GAP_MAX_PCT,
-) -> float:
-    """Enhanced ranking score tuned for quality momentum breakouts.
-
-    Components sum to 100:
-      trend              22
-      volume pace        18
-      momentum           20
-      liquidity          15
-      extension quality  15
-      ATR risk quality   10
-    """
-    ma50 = _finite_float(ctx.get("ma50"))
-    ma200 = _finite_float(ctx.get("ma200"))
-    price = _finite_float(ctx.get("live_price", ctx.get("close")))
-    orb_high = _finite_float(ctx.get("orb_high", ctx.get("prev_high")))
-    rsi = _finite_float(ctx.get("rsi"))
-    rsi_prev = _finite_float(ctx.get("rsi_prev"))
-    volume_pace = _finite_float(
-        ctx.get("volume_pace", ctx.get("rvol", ctx.get("rvol_raw", volume_floor)))
-    )
-    spread_pct = _finite_float(ctx.get("spread_pct"))
-    atr_chand = _finite_float(ctx.get("atr_chandelier", ctx.get("ATR_CHAND", ctx.get("atr"))))
-
-    sep = (ma50 - ma200) / ma200 if ma200 else 0.0
-    trend = max(0.0, min(sep / 0.08 * 22.0, 22.0))
-
-    floor = max(float(volume_floor), 0.01)
-    volume_score = min(max(volume_pace - floor, 0.0) / floor * 18.0, 18.0)
-
-    rsi_delta = rsi - rsi_prev
-    accel = min(max(rsi_delta * 1.2, 0.0), 12.0)
-    if rsi < 55:
-        level = 0.0
-    elif rsi <= 72:
-        level = 8.0
-    elif rsi <= 82:
-        level = 7.0
-    elif rsi <= 90:
-        level = 5.0
-    else:
-        level = max(2.0, 5.0 - (rsi - 90.0) * 0.5)
-    momentum = accel + level
-
-    spread_max = max(float(spread_max_pct), 0.000001)
-    liquidity = max(0.0, (spread_max - spread_pct) / spread_max * 15.0)
-
-    extension = (price - orb_high) / orb_high if price > 0 and orb_high > 0 else 0.0
-    gap_cap = max(float(gap_max_pct), 0.005)
-    sweet_low = 0.002
-    sweet_high = min(0.04, gap_cap * 0.60)
-    if extension <= 0:
-        extension_quality = 0.0
-    elif extension < sweet_low:
-        extension_quality = 8.0 + (extension / sweet_low) * 4.0
-    elif extension <= sweet_high:
-        extension_quality = 15.0
-    elif extension <= gap_cap and gap_cap > sweet_high:
-        extension_quality = 15.0 * (gap_cap - extension) / (gap_cap - sweet_high)
-    else:
-        extension_quality = 0.0
-
-    atr_pct = atr_chand / price if price > 0 and atr_chand > 0 else float("inf")
-    atr_cap = max(float(atr_pct_max), 0.001)
-    clean_zone = min(0.03, atr_cap * 0.50)
-    if atr_pct <= 0 or not math.isfinite(atr_pct):
-        atr_quality = 0.0
-    elif atr_pct <= clean_zone:
-        atr_quality = 10.0
-    elif atr_pct <= atr_cap:
-        atr_quality = 10.0 * (atr_cap - atr_pct) / (atr_cap - clean_zone)
-    else:
-        atr_quality = 0.0
-
-    total = trend + volume_score + momentum + liquidity + extension_quality + atr_quality
     return round(max(0.0, min(total, 100.0)), 2)
 
 
 def score_candidate(
     ctx: Mapping,
     *,
-    model: str = "legacy",
-    volume_floor: float = RVOL_MIN,
+    model: str = "indicator_swing",
+    volume_floor: float = 1.0,
     spread_max_pct: float = SPREAD_MAX_PCT,
     atr_pct_max: float = ATR_PCT_MAX,
-    gap_max_pct: float = GAP_MAX_PCT,
 ) -> float:
-    """Score one candidate using the requested production/research model."""
-    model = (model or "legacy").strip().lower()
+    """Score one candidate using the maintained production model."""
+    model = (model or "indicator_swing").strip().lower()
     if model not in VALID_SCORING_MODELS:
-        raise ValueError(f"Unknown scoring model: {model!r}")
-    if model == "legacy_v2":
-        return legacy_v2_candidate_score(
-            ctx,
-            volume_floor=volume_floor,
-            spread_max_pct=spread_max_pct,
-            atr_pct_max=atr_pct_max,
-            gap_max_pct=gap_max_pct,
-        )
-    if model == "enhanced":
-        return enhanced_candidate_score(
-            ctx,
-            volume_floor=volume_floor,
-            spread_max_pct=spread_max_pct,
-            atr_pct_max=atr_pct_max,
-            gap_max_pct=gap_max_pct,
-        )
-    return legacy_candidate_score(
+        raise ValueError(f"Unknown scoring model: {model!r}. Valid model: indicator_swing")
+    base = indicator_swing_score(
         ctx,
         volume_floor=volume_floor,
         spread_max_pct=spread_max_pct,
+        atr_pct_max=atr_pct_max,
     )
+    return round(max(0.0, min(base + analyst_rating_adjustment(ctx), 100.0)), 2)

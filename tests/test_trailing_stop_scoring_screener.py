@@ -3,14 +3,14 @@ Comprehensive validation of three critical VelocityEngine subsystems:
 
   1. Chandelier trailing stop order construction (standalone BUY + post-fill TRAIL)
      - chandelier_dist = ATR_CHAND × CHANDELIER_MULT (2.0)
-     - goodAfterTime is omitted after 10:00 ET so IBKR cannot reject a past activation time
+     - goodAfterTime is omitted after the configured entry start so IBKR cannot reject a past activation time
      - BUY order: transmit=True; TRAIL stop: standalone GTC transmit=True after fill
      - state.stop_loss  = fill - chandelier_dist
      - No take-profit order or state key
 
   2. Screener (IB ScannerSubscription parameters)
-     - scanCode from config, instrument='STK', location='STK.US.MAJOR'
-     - abovePrice=20.0, aboveVolume=2_000_000 (int), marketCapAbove=2000
+     - scanCode from active profile/config, instrument='STK', location='STK.US.MAJOR'
+     - price, volume, and market-cap floors mirror the active strategy profile
      - symbol extraction from contractDetails.contract.symbol
      - all unique scanner symbols are returned
 
@@ -45,7 +45,7 @@ def _mock_fill(commission=1.0):
     return fill
 
 
-def _mock_price_ticker(price: float, bid=None, ask=None):
+def _mock_price_ticker(price: float, bid=None, ask=None, open=None, high=None, low=None, vwap=None):
     """Build a ticker mock with deterministic quote fields."""
     ticker = MagicMock()
     ticker.marketPrice.return_value = price
@@ -53,6 +53,10 @@ def _mock_price_ticker(price: float, bid=None, ask=None):
     ticker.close = price
     ticker.bid = price * 0.999 if bid is None else bid
     ticker.ask = price * 1.001 if ask is None else ask
+    ticker.open = price if open is None else open
+    ticker.high = price if high is None else high
+    ticker.low = price if low is None else low
+    ticker.vwap = price if vwap is None else vwap
     return ticker
 
 
@@ -98,6 +102,7 @@ def _mock_ib():
 def _make_engine(ib_mock):
     """Build a VelocityEngine instance without __init__ (no IB connection)."""
     from src.engine import VelocityEngine
+    from src.strategy_profiles import get_strategy_profile
     engine = VelocityEngine.__new__(VelocityEngine)
     engine.ib                  = ib_mock
     engine.state               = {}
@@ -108,6 +113,11 @@ def _make_engine(ib_mock):
     engine._last_vix_ts        = 0.0
     engine._last_scan_ts       = None
     engine._next_scan_dt       = None
+    engine._prefilter_date     = None
+    engine._prefilter_status   = "not_started"
+    engine._prefilter_candidates = []
+    engine._prefilter_stats    = {}
+    engine._last_premarket_prefilter_date = None
     engine._day_start_equity   = None
     engine._day_start_date     = None
     engine._bar_cache          = {}
@@ -123,6 +133,7 @@ def _make_engine(ib_mock):
     engine._last_post_close_maintenance_date = None
     engine._last_eod_exit_date = None
     engine._missing_position_counts = {}
+    engine._strategy_profile = get_strategy_profile("indicator_swing")
     return engine
 
 
@@ -136,16 +147,20 @@ def _ctx(price=100.0, orb=95.0, ma50=105.0, ma200=90.0,
          day_range_location=0.75,
          intraday_gain=0.01,
          day_open=None,
-         bid=None, ask=None):
+         bid=None, ask=None,
+         **updates):
     """Build a get_technical_context()-style dict with all production-rule fields."""
     high10 = round(price * 1.005, 4)   # retained for dashboard/context compatibility
     bid = round(price * (1 - spread_pct / 2), 4) if bid is None else bid
     ask = round(price * (1 + spread_pct / 2), 4) if ask is None else ask
     if day_open is None:
         day_open = price / (1 + intraday_gain) if intraday_gain > -0.99 else price
-    return {
+    ctx = {
         'orb_high':       orb,
         'day_open':       day_open,
+        'prev_high':      price - 1.0,
+        'prev_daily_high': price - 1.0,
+        'ma20':           price * 0.96,
         'ma50':           ma50,
         'ma200':          ma200,
         'rsi':            rsi,
@@ -156,7 +171,10 @@ def _ctx(price=100.0, orb=95.0, ma50=105.0, ma200=90.0,
         'atr_chandelier': atr_chandelier if atr_chandelier is not None else atr,
         'sma200_slope':   sma200_slope,
         'high10':         high10,
+        'high20':         price * 1.02,
+        'dist_high20':    price / (price * 1.02) - 1.0,
         'rvol':           rvol,
+        'volume_pace':    rvol,
         'day_range_location': day_range_location,
         'intraday_gain':  intraday_gain,
         'spread_pct':     spread_pct,
@@ -164,10 +182,30 @@ def _ctx(price=100.0, orb=95.0, ma50=105.0, ma200=90.0,
         'ask':            ask,
         'close':          price - 0.5,
         'live_price':     price,
+        'ema20_gt_sma50': True,
+        'ma_bull_cross':  False,
+        'reclaim_ma20':   False,
+        'reclaim_ma50':   False,
+        'break_prev_high': True,
+        'weekly_uptrend': True,
+        'return_13w':     0.25,
+        'return_26w':     0.35,
+        'relative_strength_63d': 0.15,
+        'relative_strength_126d': 0.18,
+        'price_vs_52w_high': 0.90,
+        'stoch_bull_exit_oversold': True,
+        'macd_hist':      0.20,
+        'macd_hist_delta': 0.05,
+        'macd_bull_divergence': False,
+        'obv_slope_5':    100_000.0,
+        'obv_uptrend':    True,
+        'psar_bull_3':    False,
         'volume':         5_000_000,
         'dollar_vol_20d': dollar_vol,
         'contract':       MagicMock(),
     }
+    ctx.update(updates)
+    return ctx
 
 
 def _run_entry_cycle(ib, engine, ctx, sym='TSLA'):
@@ -179,17 +217,14 @@ def _run_entry_cycle(ib, engine, ctx, sym='TSLA'):
     fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))   # Wed 10:30 — inside window
 
     fill_price = ctx['live_price']
-    from src.config import CHANDELIER_MULT, HARD_STOP_PCT, RISK_PER_TRADE_PCT
+    from src.config import CHANDELIER_MULT, RISK_PER_TRADE_PCT
 
     summary = {item.tag: float(item.value) for item in ib.accountSummary.return_value}
     equity = summary.get('NetLiquidation', 1400.0)
     settled = summary.get('SettledCash', 5000.0)
     limit_price = engine._calc_entry_limit_price(ctx['live_price'], ctx['bid'], ctx['ask'])
     allocation = engine._calc_entry_allocation(equity, settled, len(engine.state))
-    risk_dist = min(
-        round(ctx.get('atr_chandelier', ctx['atr']) * CHANDELIER_MULT, 2),
-        round(ctx['live_price'] * HARD_STOP_PCT, 2),
-    )
+    risk_dist = round(ctx.get('atr_chandelier', ctx['atr']) * CHANDELIER_MULT, 2)
     expected_qty = 0
     if limit_price and risk_dist > 0:
         expected_qty = min(
@@ -288,7 +323,7 @@ class TestBracketOrderMath:
         buy_order = ib.placeOrder.call_args_list[0][0][1]
         assert buy_order.action == 'BUY'
 
-    def test_spy_bear_regime_can_enter_with_stricter_bear_rules(self):
+    def test_spy_bear_regime_blocks_entries_by_default_profile(self):
         ib, engine, ctx = self._setup()
         engine._spy_cache = {'date': '2024-06-05', 'trend': False}
         ctx.update({
@@ -302,23 +337,23 @@ class TestBracketOrderMath:
 
         _run_entry_cycle(ib, engine, ctx)
 
-        assert ib.placeOrder.call_count == 2
-        assert engine.state['TSLA']['regime'] == 'bear'
+        assert ib.placeOrder.call_count == 0
+        assert 'TSLA' not in engine.state
 
-    def test_spy_bear_regime_does_not_gate_on_rvol_under_8096(self):
+    def test_spy_bear_regime_blocks_entries_regardless_of_volume_pace_by_default(self):
         ib, engine, ctx = self._setup()
         engine._spy_cache = {'date': '2024-06-05', 'trend': False}
         ctx.update({
             'orb_high': 98.0,
-            'rvol': 2.7,  # below old BEAR_RVOL_MIN, but RVOL is ranking-only in 8096
+            'rvol': 2.7,
             'rsi': 72.0,
             'rsi_prev': 68.0,
         })
 
         _run_entry_cycle(ib, engine, ctx)
 
-        assert ib.placeOrder.call_count == 2
-        assert engine.state['TSLA']['regime'] == 'bear'
+        assert ib.placeOrder.call_count == 0
+        assert 'TSLA' not in engine.state
 
     def test_buy_order_tif_is_day(self):
         ib, engine, ctx = self._setup()
@@ -378,25 +413,23 @@ class TestBracketOrderMath:
         assert stop_order.transmit == True
 
     def test_buy_order_qty_uses_dynamic_cash_bucket_and_risk_cap(self):
-        """qty is whole shares sized by settled-cash bucket and ATR risk cap."""
+        """qty is whole shares sized by settled-cash bucket and broker Chandelier risk."""
         from src.config import (
             CHANDELIER_MULT,
-            HARD_STOP_PCT,
             MAX_POSITIONS_CAP,
             MIN_BUCKET_SIZE,
             RISK_PER_TRADE_PCT,
             SETTLED_CASH_DEPLOYMENT_PCT,
         )
         ib, engine, ctx = self._setup()
+        ctx['atr_chandelier'] = 5.0  # Chandelier risk > 7% hard stop; broker risk must win.
         _run_entry_cycle(ib, engine, ctx)
         buy_order = ib.placeOrder.call_args_list[0][0][1]
         equity = 1400.0
         settled = 5000.0
         max_pos = min(int(equity / MIN_BUCKET_SIZE), MAX_POSITIONS_CAP)
         bucket_size = (settled * SETTLED_CASH_DEPLOYMENT_PCT) / max_pos
-        chandelier_dist = ctx['atr_chandelier'] * CHANDELIER_MULT
-        hard_stop_dist = self.ENTRY * HARD_STOP_PCT
-        risk_stop_dist = min(chandelier_dist, hard_stop_dist)
+        risk_stop_dist = round(ctx['atr_chandelier'] * CHANDELIER_MULT, 2)
         bucket_qty = int(bucket_size / self.LIMIT)
         risk_qty = int((equity * RISK_PER_TRADE_PCT) / risk_stop_dist)
         expected_qty = min(bucket_qty, risk_qty)
@@ -598,21 +631,28 @@ class TestEntryLimitPricing:
 
 class TestScannerSubscription:
     """
-    build_momentum_scanner() must produce a ScannerSubscription whose fields
-    exactly match the strategy spec.  All assertions are on the returned object,
+    build_momentum_scanners() must produce ScannerSubscription objects whose
+    fields exactly match the strategy spec.  All assertions are on the objects,
     no IB connection needed.
     """
 
     def setup_method(self):
-        from src.scanner import build_momentum_scanner
-        self.sub = build_momentum_scanner()
+        from src.config import STRATEGY_PROFILE
+        from src.scanner import (
+            build_momentum_scanner_filter_options,
+            build_momentum_scanners,
+        )
+        from src.strategy_profiles import get_strategy_profile
+        self.profile = get_strategy_profile(STRATEGY_PROFILE)
+        self.filter_options = build_momentum_scanner_filter_options()
+        self.subscriptions = build_momentum_scanners()
+        self.sub = self.subscriptions[0]
 
     # ── Subscription fields ───────────────────────────────────────────────────
 
     def test_scan_code_matches_config(self):
-        from src.config import IB_SCANNER_SCAN_CODE
-        assert self.sub.scanCode == IB_SCANNER_SCAN_CODE
-        assert self.sub.scanCode == 'MOST_ACTIVE'
+        assert [sub.scanCode for sub in self.subscriptions] == list(self.profile.scan_codes)
+        assert self.sub.scanCode == self.profile.scan_codes[0]
 
     def test_instrument_is_stk(self):
         assert self.sub.instrument == 'STK'
@@ -627,14 +667,10 @@ class TestScannerSubscription:
         assert self.sub.numberOfRows == IB_SCANNER_ROWS
 
     def test_min_price_matches_config(self):
-        from src.config import SCAN_MIN_PRICE
-        assert self.sub.abovePrice == SCAN_MIN_PRICE
-        assert self.sub.abovePrice == 20.0
+        assert self.sub.abovePrice == self.profile.min_price
 
     def test_min_volume_matches_config(self):
-        from src.config import SCAN_MIN_VOLUME
-        assert self.sub.aboveVolume == SCAN_MIN_VOLUME
-        assert self.sub.aboveVolume == 2_000_000
+        assert self.sub.aboveVolume == self.profile.min_volume
 
     def test_min_volume_is_integer(self):
         """IB rejects float for aboveVolume; must be int."""
@@ -642,16 +678,61 @@ class TestScannerSubscription:
 
     def test_market_cap_converted_to_millions(self):
         """
-        SCAN_MIN_MKTCAP = 2_000_000_000 (2 billion).
-        IB's marketCapAbove field is in millions → must be 2000.
+        IB's marketCapAbove field is in millions.
         """
-        from src.config import SCAN_MIN_MKTCAP
-        assert self.sub.marketCapAbove == SCAN_MIN_MKTCAP / 1_000_000
-        assert self.sub.marketCapAbove == 2000
+        assert self.sub.marketCapAbove == self.profile.min_market_cap / 1_000_000
 
     def test_stock_type_filter_is_corp(self):
         """stockTypeFilter='CORP' excludes ETFs at scanner level."""
         assert self.sub.stockTypeFilter == 'CORP'
+
+    def test_scanner_side_filter_options_copy_direct_screener_filters(self):
+        from src.config import IB_SCANNER_FILTERS_ENABLED
+        if not IB_SCANNER_FILTERS_ENABLED:
+            assert self.filter_options == []
+            return
+
+        filters = {tv.tag: tv.value for tv in self.filter_options}
+        expected = {
+            "changeOpenPercAbove": self.profile.scanner_change_open_pct_above,
+            "openGapPercBelow": self.profile.scanner_open_gap_pct_below,
+            "lastVsEMAChangeRatio20Above": self.profile.scanner_last_vs_ema20_pct_above,
+            "lastVsEMAChangeRatio50Above": self.profile.scanner_last_vs_ema50_pct_above,
+            "curMACDDistAbove": self.profile.scanner_macd_histogram_above,
+        }
+        for tag, value in expected.items():
+            if value is None:
+                assert tag not in filters
+            else:
+                assert filters[tag] == f"{float(value):g}"
+
+
+class TestApplicationSymbolUniverse:
+    def test_loads_symbols_from_configured_file(self, tmp_path, monkeypatch):
+        import src.scanner as scanner
+
+        universe_file = tmp_path / "symbols.csv"
+        universe_file.write_text("symbol,name\nAAPL,Apple\nmsft,Microsoft\nAAPL,Duplicate\n")
+        monkeypatch.setattr(scanner, "APP_SCANNER_UNIVERSE_FILE", str(universe_file))
+
+        assert scanner.load_application_symbol_universe() == ["AAPL", "MSFT"]
+
+    def test_uses_stale_cache_when_listing_fetch_fails(self, tmp_path, monkeypatch):
+        import json
+        import src.scanner as scanner
+
+        cache_file = tmp_path / "universe_cache.json"
+        cache_file.write_text(json.dumps({"fetched_at": 1.0, "symbols": ["AAPL", "NVDA"]}))
+        monkeypatch.setattr(scanner, "APP_SCANNER_UNIVERSE_FILE", "")
+        monkeypatch.setattr(scanner, "APP_SCANNER_UNIVERSE_CACHE_FILE", str(cache_file))
+        monkeypatch.setattr(scanner, "APP_SCANNER_UNIVERSE_TTL_SEC", 0.0)
+        monkeypatch.setattr(
+            scanner,
+            "fetch_common_stock_universe",
+            lambda: (_ for _ in ()).throw(RuntimeError("network unavailable")),
+        )
+
+        assert scanner.load_application_symbol_universe(force_refresh=True) == ["AAPL", "NVDA"]
 
 
 class TestGetInstitutionalScan:
@@ -659,6 +740,13 @@ class TestGetInstitutionalScan:
     get_institutional_scan() must extract symbols from IB scan results
     via the correct attribute path and return every unique symbol.
     """
+
+    def setup_method(self):
+        self._source_patch = patch("src.engine.APP_SCANNER_SOURCE", "ibkr")
+        self._source_patch.start()
+
+    def teardown_method(self):
+        self._source_patch.stop()
 
     def _make_scan_item(self, symbol):
         item = MagicMock()
@@ -724,24 +812,42 @@ class TestGetInstitutionalScan:
 
     def test_scanner_subscription_passed_to_ib(self):
         """reqScannerData must be called once per configured scan code."""
-        from src.config import IB_SCANNER_SCAN_CODES
+        from src.config import STRATEGY_PROFILE
+        from src.strategy_profiles import get_strategy_profile
         from ib_async import ScannerSubscription
+        profile = get_strategy_profile(STRATEGY_PROFILE)
         ib     = _mock_ib()
         engine = _make_engine(ib)
         ib.reqScannerData.return_value = []
 
         engine.get_institutional_scan()
 
-        assert ib.reqScannerData.call_count == len(IB_SCANNER_SCAN_CODES)
+        assert ib.reqScannerData.call_count == len(profile.scan_codes)
         for call in ib.reqScannerData.call_args_list:
             assert isinstance(call.args[0], ScannerSubscription)
+            assert call.args[1] == []
+            filter_options = call.args[2]
+            filter_tags = {tv.tag for tv in filter_options}
+            expected_filters = {
+                "changeOpenPercAbove": profile.scanner_change_open_pct_above,
+                "openGapPercBelow": profile.scanner_open_gap_pct_below,
+                "lastVsEMAChangeRatio20Above": profile.scanner_last_vs_ema20_pct_above,
+                "lastVsEMAChangeRatio50Above": profile.scanner_last_vs_ema50_pct_above,
+                "curMACDDistAbove": profile.scanner_macd_histogram_above,
+            }
+            for tag, value in expected_filters.items():
+                if value is None:
+                    assert tag not in filter_tags
+                else:
+                    assert tag in filter_tags
         used_codes = {call.args[0].scanCode for call in ib.reqScannerData.call_args_list}
-        assert used_codes == set(IB_SCANNER_SCAN_CODES)
+        assert used_codes == set(profile.scan_codes)
 
     def test_symbols_from_multiple_scanners_are_deduped(self):
         """Symbols appearing in more than one scanner are only returned once."""
-        from src.config import IB_SCANNER_SCAN_CODES
-        n  = len(IB_SCANNER_SCAN_CODES)
+        from src.config import STRATEGY_PROFILE
+        from src.strategy_profiles import get_strategy_profile
+        n  = len(get_strategy_profile(STRATEGY_PROFILE).scan_codes)
         ib = _mock_ib()
         engine = _make_engine(ib)
         # Each scanner returns AAPL (shared) plus one unique symbol
@@ -757,8 +863,9 @@ class TestGetInstitutionalScan:
 
     def test_failed_scanner_is_skipped_others_still_run(self):
         """One failing scanner should not stop the remaining scanners."""
-        from src.config import IB_SCANNER_SCAN_CODES
-        n  = len(IB_SCANNER_SCAN_CODES)
+        from src.config import STRATEGY_PROFILE
+        from src.strategy_profiles import get_strategy_profile
+        n  = len(get_strategy_profile(STRATEGY_PROFILE).scan_codes)
         if n < 2:
             return  # test only meaningful with multiple scan codes
         ib = _mock_ib()
@@ -771,6 +878,167 @@ class TestGetInstitutionalScan:
         result = engine.get_institutional_scan()
 
         assert 'NVDA' in result
+
+    def test_universe_source_returns_rotating_application_batch(self, monkeypatch):
+        """Application scanner can source candidates from the full-symbol universe."""
+        import src.engine as engine_module
+
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        monkeypatch.setattr(engine_module, "APP_SCANNER_SOURCE", "universe")
+        monkeypatch.setattr(engine_module, "APP_SCANNER_BATCH_SIZE", 2)
+        monkeypatch.setattr(engine_module, "APP_SCANNER_MAX_SYMBOLS", 0)
+        monkeypatch.setattr(
+            engine_module,
+            "load_application_symbol_universe",
+            lambda: ["AAPL", "MSFT", "NVDA"],
+        )
+
+        assert engine.get_institutional_scan() == ["AAPL", "MSFT"]
+        assert engine.get_institutional_scan() == ["NVDA", "AAPL"]
+        ib.reqScannerData.assert_not_called()
+
+    def test_hybrid_source_dedupes_ibkr_and_universe_candidates(self, monkeypatch):
+        """Hybrid source keeps IBKR scanner hits and walks the broader universe."""
+        import src.engine as engine_module
+
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        ib.reqScannerData.return_value = [
+            self._make_scan_item("AAPL"),
+            self._make_scan_item("MSFT"),
+        ]
+        monkeypatch.setattr(engine_module, "APP_SCANNER_SOURCE", "hybrid")
+        monkeypatch.setattr(engine_module, "APP_SCANNER_BATCH_SIZE", 3)
+        monkeypatch.setattr(engine_module, "APP_SCANNER_MAX_SYMBOLS", 0)
+        monkeypatch.setattr(
+            engine_module,
+            "load_application_symbol_universe",
+            lambda: ["MSFT", "NVDA", "ASML"],
+        )
+
+        assert engine.get_institutional_scan() == ["AAPL", "MSFT", "NVDA", "ASML"]
+
+    def test_prefiltered_cache_becomes_the_day_watchlist(self, monkeypatch):
+        """Once the premarket sieve exists, do not re-add raw IBKR/universe symbols."""
+        import src.engine as engine_module
+
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._prefilter_date = "2024-06-05"
+        engine._prefilter_status = "complete"
+        engine._prefilter_candidates = ["AAPL", "MSFT"]
+        monkeypatch.setattr(engine_module, "APP_SCANNER_SOURCE", "hybrid")
+        fake_now = pytz.timezone('US/Eastern').localize(datetime(2024, 6, 5, 10, 30))
+
+        with patch("src.engine.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            result = engine.get_institutional_scan()
+
+        assert result == ["AAPL", "MSFT"]
+        ib.reqScannerData.assert_not_called()
+
+    def test_indicator_swing_static_prefilter_rejects_impossible_ma_sleeve(self):
+        from src.engine import VelocityEngine
+        from src.strategy_profiles import get_strategy_profile
+
+        profile = get_strategy_profile("indicator_swing")
+        ctx = {
+            "volume": 2_000_000,
+            "dollar_vol_20d": 150_000_000,
+            "ma50": 120.0,
+            "ma200": 100.0,
+            "sma200_slope": 1.0,
+            "weekly_ma10_gt_ma30": True,
+            "ema20_gt_sma50": False,
+            "ma_bull_cross": False,
+            "rsi": 58.0,
+            "rsi_prev": 55.0,
+            "macd_hist_delta": 0.1,
+            "obv_uptrend": True,
+            "stoch_bull_exit_oversold": False,
+            "psar_bull_3": False,
+        }
+
+        failures = VelocityEngine._prefilter_static_failures(ctx, profile)
+
+        assert "no_possible_indicator_sleeve" in failures
+
+    def test_premarket_prefilter_writes_candidate_cache(self, tmp_path, monkeypatch):
+        import json
+        import src.engine as engine_module
+
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        cache_file = tmp_path / "prefilter.json"
+        monkeypatch.setattr(engine_module, "APP_PREFILTER_CACHE_FILE", str(cache_file))
+        monkeypatch.setattr(engine_module, "APP_SCANNER_MAX_SYMBOLS", 0)
+        monkeypatch.setattr(engine_module, "APP_PREFILTER_HISTORY_SLEEP_SEC", 0.0)
+        monkeypatch.setattr(engine_module, "APP_PREFILTER_PROGRESS_EVERY", 100)
+        monkeypatch.setattr(engine_module, "APP_PREFILTER_STOP_AT_ENTRY_START", False)
+        monkeypatch.setattr(
+            engine_module,
+            "load_application_symbol_universe",
+            lambda: ["PASS", "FAIL", "PASS"],
+        )
+
+        def fake_prefilter(sym, _profile, _today):
+            if sym == "PASS":
+                return True, (), ("volume_pace>=1.2x",)
+            return False, ("MA50<=MA200",), ()
+
+        with patch.object(engine, "_prefilter_symbol", side_effect=fake_prefilter), \
+             patch.object(engine, "_write_dashboard_data"):
+            payload = engine._run_premarket_universe_prefilter()
+
+        assert payload["status"] == "complete"
+        assert payload["candidates"] == ["PASS"]
+        assert payload["stats"]["processed"] == 2
+        assert payload["stats"]["candidates"] == 1
+        saved = json.loads(cache_file.read_text())
+        assert saved["candidates"] == ["PASS"]
+        assert saved["deferred_rules"]["PASS"] == ["volume_pace>=1.2x"]
+        assert saved["rejections_by_symbol"]["FAIL"] == ["MA50<=MA200"]
+
+    def test_premarket_prefilter_stops_with_partial_cache_at_entry_window(self, tmp_path, monkeypatch):
+        import json
+        import src.engine as engine_module
+
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        cache_file = tmp_path / "prefilter.json"
+        monkeypatch.setattr(engine_module, "APP_PREFILTER_CACHE_FILE", str(cache_file))
+        monkeypatch.setattr(engine_module, "APP_SCANNER_MAX_SYMBOLS", 0)
+        monkeypatch.setattr(engine_module, "APP_PREFILTER_HISTORY_SLEEP_SEC", 0.0)
+        monkeypatch.setattr(engine_module, "APP_PREFILTER_PROGRESS_EVERY", 100)
+        monkeypatch.setattr(engine_module, "APP_PREFILTER_STOP_AT_ENTRY_START", True)
+        monkeypatch.setattr(
+            engine_module,
+            "load_application_symbol_universe",
+            lambda: ["PASS", "LATE"],
+        )
+
+        entry_h, entry_m = engine_module.ENTRY_START
+        fake_now = engine_module._TZ_NY.localize(datetime(2024, 6, 5, entry_h, entry_m, 0))
+
+        def fake_prefilter(sym, _profile, _today):
+            return True, (), ("volume_pace>=1.2x",)
+
+        with patch.object(engine, "_prefilter_symbol", side_effect=fake_prefilter), \
+             patch.object(engine, "_write_dashboard_data"), \
+             patch.object(engine_module, "datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            payload = engine._run_premarket_universe_prefilter()
+
+        assert payload["status"] == "partial"
+        assert payload["stopped_reason"] == "entry_window_open"
+        assert payload["candidates"] == ["PASS"]
+        assert payload["stats"]["processed"] == 1
+        assert engine._last_premarket_prefilter_date == "2024-06-05"
+        saved = json.loads(cache_file.read_text())
+        assert saved["status"] == "partial"
+        assert saved["processed_symbols"] == ["PASS"]
 
 
 class TestCashBucketBuffer:
@@ -802,248 +1070,11 @@ class TestCashBucketBuffer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. SCORING SYSTEM — _score_candidate()
-#    Four components summing to 100:
-#      Trend (30 pts) · RVOL (25 pts) · Momentum (25 pts) · Liquidity (20 pts)
+# 3. SCORING SYSTEM — indicator_swing only
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestScoringTrendStrength:
-    """
-    Trend strength component (0-30 pts):
-      sep   = (MA50 - MA200) / MA200 × 100
-      trend = max(0, min(sep × 5, 30))
-
-      sep ≥ 6% → 30 pts (saturated)
-      sep = 5% → 25 pts
-      sep = 3% → 15 pts
-      sep = 1% → 5 pts
-      Bearish (MA50 < MA200) → 0 pts (floored)
-    """
-
-    def _trend_score(self, ma50, ma200):
-        """
-        Isolate trend component.
-        Zero-out other components:
-          rvol=RVOL_MIN → rvol_score=0; rsi delta=0 + rsi≤70 → momentum=10;
-          spread=0 → liquidity=20  →  subtract 0+10+20=30 from total.
-        """
-        ctx = _ctx(price=100.5, orb=100.0,
-                   rsi=65.0, rsi_prev=65.0,
-                   ma50=ma50, ma200=ma200,
-                   rvol=2.5, spread_pct=0.0)
-        return score_candidate(ctx, model="legacy") - 30
-
-    def test_6pct_separation_gives_30_pts(self):
-        assert self._trend_score(106.0, 100.0) == pytest.approx(30.0, abs=0.1)
-
-    def test_above_6pct_capped_at_30(self):
-        assert self._trend_score(120.0, 100.0) == pytest.approx(30.0, abs=0.1)
-
-    def test_5pct_separation_gives_25_pts(self):
-        assert self._trend_score(105.0, 100.0) == pytest.approx(25.0, abs=0.1)
-
-    def test_3pct_separation_gives_15_pts(self):
-        assert self._trend_score(103.0, 100.0) == pytest.approx(15.0, abs=0.1)
-
-    def test_1pct_separation_gives_5_pts(self):
-        assert self._trend_score(101.0, 100.0) == pytest.approx(5.0, abs=0.1)
-
-    def test_bearish_trend_floored_at_zero(self):
-        assert self._trend_score(95.0, 100.0) == pytest.approx(0.0, abs=0.1)
-
-    def test_equal_mas_gives_zero_trend(self):
-        assert self._trend_score(100.0, 100.0) == pytest.approx(0.0, abs=0.1)
-
-
-class TestScoringRVOL:
-    """
-    RVOL component (0-25 pts):
-      rvol_score = min(max(rvol - RVOL_MIN, 0) / RVOL_MIN × 25, 25)
-
-      rvol = RVOL_MIN (2.5×) → 0 pts (at floor)
-      rvol = 3.75×           → 12.5 pts
-      rvol = 5.0× (2×floor)  → 25 pts (saturated)
-      rvol > 5.0×            → capped at 25
-      rvol < floor           → 0 pts
-    """
-
-    def _rvol_score(self, rvol):
-        """
-        Isolate RVOL component.
-        Zero-out others: ma50=ma200 → trend=0; rsi delta=0 → accel=0;
-        rsi≤70 → level=10; spread=0 → liquidity=20  →  subtract 0+10+20=30.
-        """
-        ctx = _ctx(price=100.5, orb=100.0,
-                   rsi=65.0, rsi_prev=65.0,
-                   ma50=100.0, ma200=100.0,
-                   rvol=rvol, spread_pct=0.0)
-        return score_candidate(ctx, model="legacy") - 30
-
-    def test_rvol_at_floor_gives_zero(self):
-        from src.config import RVOL_MIN
-        assert self._rvol_score(RVOL_MIN) == pytest.approx(0.0, abs=0.1)
-
-    def test_rvol_at_midpoint_gives_12_5(self):
-        # rvol=3.75 = 2.5 + 1.25 (half of 2×floor - floor) → 12.5 pts
-        assert self._rvol_score(3.75) == pytest.approx(12.5, abs=0.1)
-
-    def test_rvol_at_2x_floor_gives_25(self):
-        assert self._rvol_score(5.0) == pytest.approx(25.0, abs=0.1)
-
-    def test_rvol_above_2x_floor_capped_at_25(self):
-        assert self._rvol_score(7.0) == pytest.approx(25.0, abs=0.1)
-
-    def test_rvol_below_floor_gives_zero(self):
-        assert self._rvol_score(1.0) == pytest.approx(0.0, abs=0.1)
-
-
-class TestScoringMomentum:
-    """
-    Momentum component (0-25 pts):
-      accel = min(max(delta × 1.5, 0), 15)
-      level: RSI ≤ 70 → 10; RSI ≤ 75 → 5; RSI > 75 → max(0, 10-(RSI-75)×2)
-      momentum = accel + level
-    """
-
-    def _momentum_score(self, rsi, rsi_prev):
-        """
-        Isolate momentum component.
-        Zero-out others: ma50=ma200 → trend=0; rvol=floor → rvol_score=0;
-        spread=0 → liquidity=20  →  subtract 0+0+20=20.
-        """
-        ctx = _ctx(price=100.5, orb=100.0,
-                   rsi=rsi, rsi_prev=rsi_prev,
-                   ma50=100.0, ma200=100.0,
-                   rvol=2.5, spread_pct=0.0)
-        return score_candidate(ctx, model="legacy") - 20
-
-    # ── RSI level tiers ───────────────────────────────────────────────────────
-
-    def test_rsi_65_delta_0_gives_10_pts(self):
-        # accel=0, level=10 → 10
-        assert self._momentum_score(65.0, 65.0) == pytest.approx(10.0, abs=0.1)
-
-    def test_rsi_72_delta_0_gives_5_pts(self):
-        # 70 < 72 ≤ 75 → level=5, accel=0 → 5
-        assert self._momentum_score(72.0, 72.0) == pytest.approx(5.0, abs=0.1)
-
-    def test_rsi_78_delta_0_gives_4_pts(self):
-        # rsi=78 > 75 → level = max(0, 10-(78-75)×2) = max(0, 4) = 4
-        assert self._momentum_score(78.0, 78.0) == pytest.approx(4.0, abs=0.1)
-
-    def test_rsi_80_delta_0_gives_0_pts(self):
-        # rsi=80 → level = max(0, 10-5×2) = 0
-        assert self._momentum_score(80.0, 80.0) == pytest.approx(0.0, abs=0.1)
-
-    def test_rsi_82_delta_0_gives_0_pts(self):
-        # rsi=82 → level = max(0, 10-7×2) = max(0, -4) = 0
-        assert self._momentum_score(82.0, 82.0) == pytest.approx(0.0, abs=0.1)
-
-    # ── RSI acceleration ──────────────────────────────────────────────────────
-
-    def test_delta_5_gives_7_5_acceleration(self):
-        # delta=5: accel=min(7.5,15)=7.5; level=10; total=17.5
-        assert self._momentum_score(65.0, 60.0) == pytest.approx(17.5, abs=0.1)
-
-    def test_delta_10_gives_full_15_acceleration(self):
-        # delta=10: accel=min(15,15)=15; level=10; total=25
-        assert self._momentum_score(65.0, 55.0) == pytest.approx(25.0, abs=0.1)
-
-    def test_delta_above_10_capped(self):
-        # delta=20: accel=min(30,15)=15; level=10; total=25 (same as delta=10)
-        assert self._momentum_score(65.0, 45.0) == pytest.approx(25.0, abs=0.1)
-
-    def test_negative_delta_gives_zero_acceleration(self):
-        # delta=-5: accel=max(-7.5,0)=0; level=10; total=10
-        assert self._momentum_score(60.0, 65.0) == pytest.approx(10.0, abs=0.1)
-
-    def test_max_momentum_score_is_25(self):
-        assert self._momentum_score(65.0, 55.0) == pytest.approx(25.0, abs=0.1)
-
-
-class TestScoringLiquidity:
-    """
-    Liquidity component (0-20 pts):
-      liquidity = max(0, (SPREAD_MAX_PCT - spread_pct) / SPREAD_MAX_PCT × 20)
-
-      spread = 0%    → 20 pts
-      spread = 0.25% → 10 pts
-      spread = 0.5%  → 0 pts
-      spread > 0.5%  → clamped to 0
-    """
-
-    def _liquidity_score(self, spread_pct):
-        """
-        Isolate liquidity component.
-        Zero-out others: ma50=ma200 → trend=0; rvol=floor → rvol_score=0;
-        rsi delta=0 + rsi≤70 → momentum=10  →  subtract 0+0+10=10.
-        """
-        ctx = _ctx(price=100.5, orb=100.0,
-                   rsi=65.0, rsi_prev=65.0,
-                   ma50=100.0, ma200=100.0,
-                   rvol=2.5, spread_pct=spread_pct)
-        return score_candidate(ctx, model="legacy") - 10
-
-    def test_zero_spread_gives_20_pts(self):
-        assert self._liquidity_score(0.0) == pytest.approx(20.0, abs=0.1)
-
-    def test_half_spread_gives_10_pts(self):
-        # spread = SPREAD_MAX_PCT / 2 = 0.0025 → 10 pts
-        assert self._liquidity_score(0.0025) == pytest.approx(10.0, abs=0.1)
-
-    def test_max_spread_gives_zero(self):
-        from src.config import SPREAD_MAX_PCT
-        assert self._liquidity_score(SPREAD_MAX_PCT) == pytest.approx(0.0, abs=0.1)
-
-    def test_above_max_spread_clamped_at_zero(self):
-        assert self._liquidity_score(0.01) == pytest.approx(0.0, abs=0.1)
-
-
-class TestScoringMaxAndTotal:
-    """Integration: verify total score = trend + rvol_score + momentum + liquidity."""
-
-    def test_maximum_achievable_score_is_100(self):
-        """
-        Perfect conditions:
-          ma50=106, ma200=100 → sep=6% → trend=30
-          rvol=5.0            → rvol_score=25
-          rsi=65, rsi_prev=55 → delta=10, accel=15, level=10 → momentum=25
-          spread=0            → liquidity=20
-          Total = 30 + 25 + 25 + 20 = 100
-        """
-        ctx = _ctx(price=101.0, orb=100.0,
-                   rsi=65.0, rsi_prev=55.0,
-                   ma50=106.0, ma200=100.0,
-                   rvol=5.0, spread_pct=0.0)
-        assert score_candidate(ctx, model="legacy") == pytest.approx(100.0, abs=0.1)
-
-    def test_score_never_negative(self):
-        """Even with all-bad inputs, score must be ≥ 0."""
-        ctx = _ctx(price=90.0, orb=100.0,
-                   rsi=82.0, rsi_prev=85.0,
-                   ma50=90.0, ma200=100.0,
-                   rvol=1.0, spread_pct=0.01)
-        assert score_candidate(ctx, model="legacy") >= 0.0
-
-    def test_score_never_exceeds_100(self):
-        """No combination of inputs should exceed 100."""
-        ctx = _ctx(price=101.0, orb=100.0,
-                   rsi=60.0, rsi_prev=20.0,
-                   ma50=200.0, ma200=100.0,
-                   rvol=10.0, spread_pct=0.0)
-        assert score_candidate(ctx, model="legacy") <= 100.0
-
-    def test_score_is_rounded_to_2_decimals(self):
-        ctx = _ctx(price=101.0, orb=100.0,
-                   rsi=65.0, rsi_prev=55.0,
-                   ma50=106.0, ma200=100.0,
-                   rvol=5.0, spread_pct=0.0)
-        score = score_candidate(ctx, model="legacy")
-        assert score == round(score, 2)
-
-
-class TestSharedEnhancedScoring:
-    """Shared scorer checks for the optional enhanced ranking model."""
+class TestIndicatorSwingScoring:
+    """Shared scorer checks for the maintained ranking model."""
 
     def test_live_volume_pace_normalizes_early_session_volume(self):
         tz_ny = pytz.timezone("US/Eastern")
@@ -1053,74 +1084,37 @@ class TestSharedEnhancedScoring:
         # running near a 1.3x full-day pace against a 1M-share average day.
         assert volume_pace_from_intraday(100_000, 1_000_000, now) == pytest.approx(1.3)
 
-    def test_legacy_scorer_uses_volume_pace_when_available(self):
-        ctx = _ctx(rvol=1.0)
+    def test_indicator_scorer_uses_volume_pace_when_available(self):
+        ctx = _ctx(rvol=1.0, volume_pace=1.0)
         ctx["volume_pace"] = 5.0
 
-        with_pace = score_candidate(ctx, model="legacy")
-        raw_only = score_candidate({**ctx, "volume_pace": 1.0}, model="legacy")
+        with_pace = score_candidate(ctx, model="indicator_swing", volume_floor=1.0)
+        raw_only = score_candidate({**ctx, "volume_pace": 1.0}, model="indicator_swing", volume_floor=1.0)
 
         assert with_pace > raw_only
 
-    def test_enhanced_score_softens_high_rsi_penalty(self):
-        base = _ctx(price=101.5, orb=100.0, rsi=80.0, rsi_prev=80.0,
-                    ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0)
+    def test_indicator_score_rewards_relative_strength_leader(self):
+        leader = _ctx(relative_strength_63d=0.22, relative_strength_126d=0.30)
+        laggard = _ctx(relative_strength_63d=0.02, relative_strength_126d=0.03)
 
-        assert score_candidate(base, model="enhanced") > score_candidate(base, model="legacy")
+        assert score_candidate(leader, model="indicator_swing") > score_candidate(laggard, model="indicator_swing")
 
-    def test_enhanced_score_rewards_clean_breakout_not_stretched_chase(self):
-        clean = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
-                     ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0,
-                     atr_chandelier=2.0)
-        stretched = _ctx(price=109.0, orb=100.0, rsi=68.0, rsi_prev=62.0,
-                         ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0,
-                         atr_chandelier=2.0)
+    def test_indicator_score_prefers_ma_cross_over_psar_when_other_inputs_match(self):
+        ma_cross = _ctx(entry_strategy="ma_cross")
+        psar = _ctx(entry_strategy="psar_flip")
 
-        assert score_candidate(clean, model="enhanced") > score_candidate(stretched, model="enhanced")
+        assert score_candidate(ma_cross, model="indicator_swing") > score_candidate(psar, model="indicator_swing")
 
-    def test_enhanced_score_prefers_cleaner_atr_risk(self):
-        clean = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
-                     ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0,
-                     atr_chandelier=2.0)
-        wild = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
-                    ma50=106.0, ma200=100.0, rvol=5.0, spread_pct=0.0,
-                    atr_chandelier=12.0)
+    def test_analyst_rating_adjusts_score_within_bounds(self):
+        bullish = score_candidate(_ctx(analyst_rating_raw_score=1.0, analyst_rating_total=10))
+        bearish = score_candidate(_ctx(analyst_rating_raw_score=-1.0, analyst_rating_total=10))
 
-        assert score_candidate(clean, model="enhanced") > score_candidate(wild, model="enhanced")
+        assert bullish > bearish
+        assert 0.0 <= bearish <= bullish <= 100.0
 
-
-class TestLegacyV2Scoring:
-    """Legacy v2 keeps the legacy core and adds bounded quality tie-breakers."""
-
-    def test_legacy_v2_rewards_liquid_clean_breakout(self):
-        clean = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
-                     ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
-                     atr_chandelier=2.0, dollar_vol=900_000_000)
-        weak = _ctx(price=101.5, orb=100.0, rsi=68.0, rsi_prev=62.0,
-                    ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
-                    atr_chandelier=2.0, dollar_vol=110_000_000)
-
-        assert score_candidate(clean, model="legacy_v2") > score_candidate(weak, model="legacy_v2")
-
-    def test_legacy_v2_penalizes_stretched_or_wild_candidates(self):
-        clean = _ctx(price=102.0, orb=100.0, rsi=68.0, rsi_prev=62.0,
-                     ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
-                     atr_chandelier=2.0, dollar_vol=500_000_000)
-        stretched_wild = _ctx(price=111.0, orb=100.0, rsi=68.0, rsi_prev=62.0,
-                              ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
-                              atr_chandelier=12.0, dollar_vol=500_000_000)
-
-        assert score_candidate(clean, model="legacy_v2") > score_candidate(stretched_wild, model="legacy_v2")
-
-    def test_legacy_v2_softens_high_rsi_only_when_rising(self):
-        rising = _ctx(price=101.5, orb=100.0, rsi=80.0, rsi_prev=75.0,
-                      ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
-                      atr_chandelier=2.0, dollar_vol=500_000_000)
-        flat = _ctx(price=101.5, orb=100.0, rsi=80.0, rsi_prev=80.0,
-                    ma50=103.0, ma200=100.0, rvol=3.0, spread_pct=0.001,
-                    atr_chandelier=2.0, dollar_vol=500_000_000)
-
-        assert score_candidate(rising, model="legacy_v2") > score_candidate(flat, model="legacy_v2")
+    def test_unknown_scoring_model_is_rejected(self):
+        with pytest.raises(ValueError, match="Valid model: indicator_swing"):
+            score_candidate(_ctx(), model="legacy")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1323,7 +1317,7 @@ class TestCandidateRanking:
         assert 'GHOST' not in engine.state
 
     def test_no_entry_outside_session_window(self):
-        """Outside 09:45–15:30 ET no entry must occur even if signal passes."""
+        """Outside 10:15–15:30 ET no entry must occur even if signal passes."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
         ctx    = _ctx(price=101.0, orb=100.0)
@@ -1631,14 +1625,15 @@ class TestDailyScanSkip:
             engine.run_cycle()
 
     def test_low_dollar_volume_is_cached_for_rest_of_day(self):
-        from src.config import SCAN_MIN_DOLLAR_VOL
+        from src.strategy_profiles import get_strategy_profile
 
         ib = _mock_ib()
         engine = _make_engine(ib)
+        dollar_floor = get_strategy_profile("indicator_swing").min_dollar_vol
         ctx = _ctx(
             price=101.0,
             orb=100.0,
-            dollar_vol=SCAN_MIN_DOLLAR_VOL - 1,
+            dollar_vol=dollar_floor - 1,
         )
         fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, 10, 30))
 
@@ -1710,6 +1705,48 @@ class TestDailyScanSkip:
 
         assert engine._bar_cache == cached
 
+    def test_scan_summary_reports_filter_reasons_not_non_orderable(self):
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine.state = {'HELD': {'price': 100, 'qty': 1}}
+        low_rsi_ctx = _ctx(
+            price=101.0,
+            orb=100.0,
+            rsi=50.0,
+            rsi_prev=49.0,
+        )
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, 10, 30))
+
+        def _ctx_for(sym):
+            return {
+                'NODATA': None,
+                'LOWRSI': low_rsi_ctx,
+            }.get(sym)
+
+        with patch.object(engine, 'get_institutional_scan', return_value=['HELD', 'NODATA', 'LOWRSI']), \
+             patch.object(engine, 'get_technical_context', side_effect=_ctx_for), \
+             patch.object(engine, 'manage_position_exits'), \
+             patch.object(engine, '_update_position_prices'), \
+             patch('src.engine.logger') as mock_logger, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine.run_cycle()
+
+        summary_lines = [
+            call_args.args[0]
+            for call_args in mock_logger.info.call_args_list
+            if call_args.args and str(call_args.args[0]).startswith('SCAN SUMMARY:')
+        ]
+        assert summary_lines
+        summary = summary_lines[-1]
+        assert 'eligible_signals=0' in summary
+        assert 'filtered=3' in summary
+        assert 'already_held=1' in summary
+        assert 'no_technical_data=1' in summary
+        assert 'entry_filter=1' in summary
+        assert 'non_orderable' not in summary
+
     def test_dynamic_orb_failure_is_not_cached(self):
         ib = _mock_ib()
         engine = _make_engine(ib)
@@ -1754,6 +1791,43 @@ class TestDailyScanSkip:
 
         assert 'NEWIPO' in engine._daily_scan_skip
         assert 'insufficient daily history' in engine._daily_scan_skip['NEWIPO']
+
+    def test_indicator_swing_context_skips_orb_historical_request(self):
+        from src.config import DAILY_LOOKBACK, DAILY_BAR_SIZE
+        from src.strategy_profiles import get_strategy_profile
+
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._strategy_profile = get_strategy_profile("indicator_swing")
+        daily_bars = [MagicMock()] * 260
+        ib.reqHistoricalData.return_value = daily_bars
+
+        idx = pd.date_range("2025-01-01", periods=260, freq="B")
+        close = np.linspace(100.0, 160.0, len(idx))
+        daily_df = pd.DataFrame({
+            "open": close * 0.995,
+            "high": close * 1.01,
+            "low": close * 0.99,
+            "close": close,
+            "volume": np.full(len(idx), 3_000_000),
+        }, index=idx)
+        spy_df = daily_df.copy()
+        ticker = _mock_price_ticker(161.0, open=158.0, high=162.0, low=157.0)
+        ticker.volume = 2_000_000
+        ib.reqTickers.return_value = [ticker]
+
+        with patch('src.engine.util.df', return_value=daily_df), \
+             patch.object(engine, '_fetch_spy_daily_frame', return_value=spy_df), \
+             patch.object(engine, '_analyst_context', return_value={}):
+            ctx = engine.get_technical_context('AAPL')
+
+        assert ctx is not None
+        assert ctx['day_open'] == pytest.approx(158.0)
+        assert ib.reqHistoricalData.call_count == 1
+        args = ib.reqHistoricalData.call_args[0]
+        assert args[1] == ''
+        assert args[2] == DAILY_LOOKBACK
+        assert args[3] == DAILY_BAR_SIZE
 
 
 class TestRuntimeProtectiveStopAudit:
@@ -1948,17 +2022,17 @@ class TestPortfolioRiskGates:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. EXIT ORDERS — EOD profit cleanup, liquidation
+# 9. EXIT ORDERS — EOD quality cleanup, liquidation
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestExitOrders:
     """
-    Verify EOD profit cleanup (manage_position_exits → liquidate) behaviour:
+    Verify EOD quality cleanup (manage_position_exits → liquidate) behaviour:
     - MarketOrder('SELL', position) placed with exact qty reported by IBKR
     - Open symbol orders are cancelled before the market sell
     - Cash-account exits cancel protective SELLs first to avoid oversell rejection
     - MarketOrder TIF is explicit DAY so IBKR presets cannot override it to GTC
-    - Exit fires near the close when older positions are below the profit threshold
+    - Exit fires near the close when positions fail the EOD hold-quality gate
     """
 
     def _make_position(self, symbol, qty):
@@ -1973,7 +2047,8 @@ class TestExitOrders:
             entry_time = (datetime.now(tz_ny) - timedelta(hours=hours_ago)).isoformat()
         return {'price': price, 'time': entry_time, 'qty': qty,
                 'stop_loss': price * 0.94,
-                'volume': 0, 'score': 50}
+                'volume': 0, 'score': 50,
+                'protection_status': 'confirmed'}
 
     def _et(self, year, month, day, hour=10, minute=30):
         return pytz.timezone('US/Eastern').localize(
@@ -2176,17 +2251,88 @@ class TestExitOrders:
         assert order.tif == 'DAY'
         assert order.goodAfterTime == ''
 
+    def test_tiered_profit_exit_sells_first_rounded_share_and_rebuilds_stop(self):
+        """Six shares trim one share at +1R; protection is rebuilt for the remainder."""
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        qty    = 6.0
+        entry  = 100.0
+        cur    = 102.10
+        filled = MagicMock()
+        filled.orderStatus.status = 'Filled'
+        filled.orderStatus.filled = 1.0
+        ib.placeOrder.return_value = filled
+        ib.openTrades.return_value = []
+        ib.positions.return_value = [self._make_position('TIER', qty)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=101.0, high=102.25, low=101.0)]
+        state = self._make_state_entry(price=entry, qty=qty)
+        state['entry_qty'] = qty
+        state['entry_risk_per_share'] = 2.0
+        state['initial_stop_loss'] = 98.0
+        state['profit_tiers_fired'] = []
+        state['profit_tier_exits'] = []
+        engine.state = {'TIER': state}
+
+        with patch.object(engine, '_audit_stop_orders') as mock_audit:
+            self._run_exit_check(engine, now=self._et(2024, 6, 5, 10, 30))
+
+        order = ib.placeOrder.call_args[0][1]
+        assert order.action == 'SELL'
+        assert order.orderType == 'MKT'
+        assert order.totalQuantity == pytest.approx(1.0)
+        assert engine.state['TIER']['qty'] == pytest.approx(5.0)
+        assert engine.state['TIER']['profit_tiers_fired'] == ['1.00R']
+        assert engine.state['TIER']['profit_tier_exits'][0]['target_r'] == pytest.approx(1.0)
+        assert engine.state['TIER']['profit_tier_exits'][0]['sold_qty'] == pytest.approx(1.0)
+        assert 'pending_exit' not in engine.state['TIER']
+        mock_audit.assert_called_once()
+
+    def test_tiered_profit_exit_uses_cumulative_rounding_for_final_trim(self):
+        """Six original shares sell two more at +2R, leaving the intended runner."""
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        entry  = 100.0
+        cur    = 106.10
+        filled = MagicMock()
+        filled.orderStatus.status = 'Filled'
+        filled.orderStatus.filled = 2.0
+        ib.placeOrder.return_value = filled
+        ib.openTrades.return_value = []
+        ib.positions.return_value = [self._make_position('RUN', 4.0)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=104.0, high=106.25, low=104.0)]
+        state = self._make_state_entry(price=entry, qty=4.0)
+        state['entry_qty'] = 6.0
+        state['entry_risk_per_share'] = 3.0
+        state['initial_stop_loss'] = 97.0
+        state['profit_tiers_fired'] = ['1.00R', '1.50R']
+        state['profit_tier_exits'] = [
+            {'tier_id': '1.00R', 'target_r': 1.0, 'sold_qty': 1.0},
+            {'tier_id': '1.50R', 'target_r': 1.5, 'sold_qty': 1.0},
+        ]
+        engine.state = {'RUN': state}
+
+        with patch.object(engine, '_audit_stop_orders'):
+            self._run_exit_check(engine, now=self._et(2024, 6, 5, 10, 30))
+
+        order = ib.placeOrder.call_args[0][1]
+        assert order.totalQuantity == pytest.approx(2.0)
+        assert engine.state['RUN']['qty'] == pytest.approx(2.0)
+        assert engine.state['RUN']['profit_tiers_fired'] == ['1.00R', '1.50R', '2.00R']
+        assert engine.state['RUN']['profit_tier_exits'][-1]['target_r'] == pytest.approx(2.0)
+        assert engine.state['RUN']['profit_tier_exits'][-1]['sold_qty'] == pytest.approx(2.0)
+
     # ── manage_position_exits() ──────────────────────────────────────────────
 
-    def test_eod_profit_cleanup_triggers_when_below_threshold_after_hold_window(self):
-        """Older position below the profit threshold near the close → liquidated."""
-        from src.config import PROFIT_MIN_THRESHOLD
+    def test_eod_quality_cleanup_is_disabled_for_indicator_swing_profile(self):
+        """Default indicator_swing positions are not churned by EOD quality cleanup."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
 
         entry_price   = 100.0
-        stagnant_price = entry_price * (1 + PROFIT_MIN_THRESHOLD - 0.005)
-        ib.reqTickers.return_value = [_mock_price_ticker(stagnant_price)]
+        stagnant_price = 102.0
+        ib.reqTickers.return_value = [
+            _mock_price_ticker(stagnant_price, open=100.0, high=110.0, low=100.0, vwap=101.0)
+        ]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('SLOW', 5.0)]
         engine.state = {'SLOW': self._make_state_entry(price=entry_price,
@@ -2194,18 +2340,19 @@ class TestExitOrders:
 
         self._run_exit_check(engine)
 
-        assert engine.state['SLOW']['pending_exit'] is True, "Stagnant position must be marked pending exit"
-        assert ib.placeOrder.called, "Market sell must be issued"
+        assert 'pending_exit' not in engine.state['SLOW']
+        assert not ib.placeOrder.called
 
-    def test_eod_profit_cleanup_waits_until_configured_eod_time(self):
+    def test_eod_quality_cleanup_waits_until_configured_eod_time(self):
         """Held weak positions must not be sold before 15:50 ET."""
-        from src.config import PROFIT_MIN_THRESHOLD
         ib     = _mock_ib()
         engine = _make_engine(ib)
 
         entry_price = 100.0
-        stagnant_price = entry_price * (1 + PROFIT_MIN_THRESHOLD - 0.005)
-        ib.reqTickers.return_value = [_mock_price_ticker(stagnant_price)]
+        stagnant_price = 102.0
+        ib.reqTickers.return_value = [
+            _mock_price_ticker(stagnant_price, open=100.0, high=110.0, low=100.0, vwap=101.0)
+        ]
         engine.state = {'SLOW': self._make_state_entry(
             price=entry_price,
             entry_time=self._et(2024, 6, 3).isoformat(),
@@ -2218,13 +2365,14 @@ class TestExitOrders:
 
     def test_pending_exit_blocks_duplicate_sell_on_next_cycle(self):
         """A position with an in-flight sell must not submit another market sell."""
-        from src.config import PROFIT_MIN_THRESHOLD
         ib     = _mock_ib()
         engine = _make_engine(ib)
 
         entry_price = 100.0
-        stagnant_price = entry_price * (1 + PROFIT_MIN_THRESHOLD - 0.005)
-        ib.reqTickers.return_value = [_mock_price_ticker(stagnant_price)]
+        stagnant_price = 102.0
+        ib.reqTickers.return_value = [
+            _mock_price_ticker(stagnant_price, open=100.0, high=110.0, low=100.0, vwap=101.0)
+        ]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('SLOW', 5.0)]
         entry = self._make_state_entry(
@@ -2239,15 +2387,16 @@ class TestExitOrders:
         assert not ib.placeOrder.called
         assert engine.state['SLOW']['pending_exit'] is True
 
-    def test_eod_profit_cleanup_does_not_trigger_when_profit_threshold_met(self):
-        """Position held through the window but profit ≥ threshold → kept."""
-        from src.config import PROFIT_MIN_THRESHOLD
+    def test_eod_quality_cleanup_does_not_trigger_when_hold_quality_passes(self):
+        """Position held through the window with strong EOD quality → kept."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
 
         entry_price    = 100.0
-        profit_price   = entry_price * (1 + PROFIT_MIN_THRESHOLD + 0.01)
-        ib.reqTickers.return_value = [_mock_price_ticker(profit_price)]
+        profit_price   = 106.0
+        ib.reqTickers.return_value = [
+            _mock_price_ticker(profit_price, open=100.0, high=107.0, low=100.0, vwap=104.0)
+        ]
         engine.state = {'WINNER': self._make_state_entry(price=entry_price,
                                                           entry_time=self._et(2024, 6, 3).isoformat())}
 
@@ -2256,21 +2405,21 @@ class TestExitOrders:
         assert 'WINNER' in engine.state, "Profitable position must NOT be liquidated"
         assert not ib.placeOrder.called
 
-    def test_eod_profit_cleanup_triggers_same_day_when_below_threshold(self):
-        """Same-day weak positions are closed by the 15:50 ET cleanup."""
+    def test_eod_quality_cleanup_does_not_churn_same_day_weak_position(self):
+        """Same-day weak positions are left to swing exits and broker stops."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
         engine.state = {'NEW': self._make_state_entry(
             entry_time=self._et(2024, 6, 5, 10, 0).isoformat()
         )}
-        ib.reqTickers.return_value = [_mock_price_ticker(100.0)]
+        ib.reqTickers.return_value = [_mock_price_ticker(99.0, open=100.0, high=101.0, low=98.0)]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('NEW', 1.0)]
 
         self._run_exit_check(engine, now=self._et(2024, 6, 5, 15, 50))
 
-        assert engine.state['NEW']['pending_exit'] is True
-        assert ib.placeOrder.called
+        assert 'pending_exit' not in engine.state['NEW']
+        assert not ib.placeOrder.called
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2357,8 +2506,8 @@ class TestEdgeCases:
         assert isinstance(score, float), "Score must be a float even with ma200=0"
         assert 0.0 <= score <= 100.0
 
-    def test_score_candidate_trend_is_zero_when_ma200_is_zero(self):
-        """Trend component must return 0 (not NaN or inf) when MA200=0."""
+    def test_score_candidate_with_ma200_zero_stays_bounded(self):
+        """The indicator scorer must stay finite and bounded when MA200=0."""
         from src.engine import VelocityEngine
         engine = VelocityEngine.__new__(VelocityEngine)
         ctx_zero_ma = _ctx(price=110.0, orb=100.0, rsi=65.0, rsi_prev=60.0,
@@ -2367,7 +2516,8 @@ class TestEdgeCases:
                            ma50=105.0, ma200=105.0)   # equal MAs → trend_sep=0 → trend=0
         score_zero  = engine._score_candidate(ctx_zero_ma)
         score_flat  = engine._score_candidate(ctx_normal)
-        assert score_zero == score_flat, "MA200=0 must give same trend=0 as equal MAs"
+        assert 0.0 <= score_zero <= 100.0
+        assert 0.0 <= score_flat <= 100.0
 
     # ── VIX threshold boundary ────────────────────────────────────────────────
 
@@ -2539,54 +2689,6 @@ class TestEdgeCases:
 
     # ── Strict comparison boundaries ─────────────────────────────────────────
 
-    def test_price_exactly_at_orb_high_does_not_enter(self):
-        """price == orb_h fails c_orb (requires strict >). No entry."""
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        ctx    = _ctx(price=100.0, orb=100.0, rsi=65.0, rsi_prev=55.0,
-                      ma50=95.0, ma200=85.0)
-
-        _run_entry_cycle(ib, engine, ctx)
-
-        assert ib.placeOrder.call_count == 0, "price==orb_h must not trigger entry"
-
-    def test_rsi_equal_to_prev_does_not_enter(self):
-        """rsi == rsi_prev fails the 8096 minimum RSI-delta gate. No entry."""
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        ctx    = _ctx(price=101.0, orb=100.0, rsi=65.0, rsi_prev=65.0,
-                      ma50=95.0, ma200=85.0)
-
-        _run_entry_cycle(ib, engine, ctx)
-
-        assert ib.placeOrder.call_count == 0, "flat RSI (equal to prev) must not trigger entry"
-
-    def test_low_day_range_location_does_not_enter(self):
-        """Current price in lower half of today's range fails the day-location rule."""
-        from src.config import DAY_RANGE_LOCATION_MIN
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        ctx    = _ctx(price=101.0, orb=100.0, rsi=65.0, rsi_prev=55.0,
-                      ma50=95.0, ma200=85.0,
-                      day_range_location=DAY_RANGE_LOCATION_MIN - 0.01)
-
-        _run_entry_cycle(ib, engine, ctx)
-
-        assert ib.placeOrder.call_count == 0, "low day-range location must not trigger entry"
-
-    def test_low_intraday_gain_does_not_enter(self):
-        """Price not sufficiently above today's open fails the intraday-gain rule."""
-        from src.config import INTRADAY_GAIN_MIN
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        ctx    = _ctx(price=101.0, orb=100.0, rsi=65.0, rsi_prev=55.0,
-                      ma50=95.0, ma200=85.0,
-                      intraday_gain=INTRADAY_GAIN_MIN - 0.001)
-
-        _run_entry_cycle(ib, engine, ctx)
-
-        assert ib.placeOrder.call_count == 0, "weak intraday gain must not trigger entry"
-
     def test_reprice_check_blocks_below_minimum_price(self):
         """Live reprice must still enforce the production minimum price."""
         from src.config import SCAN_MIN_PRICE
@@ -2597,43 +2699,6 @@ class TestEdgeCases:
 
         assert not engine._entry_price_is_still_valid(
             "LOWP", ctx, SCAN_MIN_PRICE - 0.50,
-        )
-
-    def test_reprice_check_uses_regime_specific_gap_cap(self):
-        """Bear-mode reprice validation must keep the stricter opening-gap cap."""
-        from src.config import BEAR_GAP_MAX_PCT
-
-        engine = _make_engine(_mock_ib())
-        ctx = _ctx(
-            price=101.0,
-            orb=100.0,
-            ma50=95.0,
-            ma200=85.0,
-            day_open=100.0 * (1 + BEAR_GAP_MAX_PCT + 0.005),
-        )
-        ctx['high10'] = 101.0
-
-        assert not engine._entry_price_is_still_valid(
-            'TSLA', ctx, 104.5,
-            gap_max_pct=BEAR_GAP_MAX_PCT,
-        )
-
-    def test_reprice_check_allows_current_extension_when_open_gap_passed(self):
-        """Backtest-compatible gap check uses day open, not refreshed extension."""
-        from src.config import BEAR_GAP_MAX_PCT
-
-        engine = _make_engine(_mock_ib())
-        ctx = _ctx(
-            price=101.0,
-            orb=100.0,
-            ma50=95.0,
-            ma200=85.0,
-            day_open=100.0 * (1 + BEAR_GAP_MAX_PCT),
-        )
-
-        assert engine._entry_price_is_still_valid(
-            'TSLA', ctx, 106.0,
-            gap_max_pct=BEAR_GAP_MAX_PCT,
         )
 
     # ── Friday dollar-volume multiplier ───────────────────────────────────────
@@ -2823,83 +2888,6 @@ class TestEdgeCases:
 # ─────────────────────────────────────────────────────────────────────────────
 # New feature tests
 # ─────────────────────────────────────────────────────────────────────────────
-
-class TestGapFilter:
-    """
-    Gap filter: day_open > orb_high * (1 + GAP_MAX_PCT) must block the signal.
-    This matches the daily-bar backtester, where the gap cap is checked against
-    the signal day's open rather than the completed close.
-    """
-
-    def test_gap_filter_blocks_excessive_opening_gap(self):
-        """
-        Day open that is >10% above ORB high must not generate a signal,
-        even if all other conditions pass.
-        """
-        from src.config import GAP_MAX_PCT
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-
-        orb_h = 100.0
-        price = orb_h * (1 + GAP_MAX_PCT + 0.02)
-        day_open = orb_h * (1 + GAP_MAX_PCT + 0.01)   # 11% opening gap — fails gap filter
-        ctx = _ctx(
-            price=price, orb=orb_h, day_open=day_open,
-            ma50=price - 5, ma200=price - 20,       # price > MA50 > MA200 ✓
-            rsi=62.0, rsi_prev=57.0,
-            dollar_vol=500_000_000,
-        )
-
-        tz_ny    = pytz.timezone('US/Eastern')
-        fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
-
-        with patch.object(engine, 'get_institutional_scan', return_value=['GAPPER']), \
-             patch.object(engine, 'get_technical_context', return_value=ctx), \
-             patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
-            engine.run_cycle()
-
-        assert ib.placeOrder.call_count == 0, "Excessive opening gap must block order placement"
-        assert 'GAPPER' not in engine.state
-
-    def test_gap_filter_passes_when_open_at_boundary(self):
-        """Day open exactly at ORB * (1 + GAP_MAX_PCT) must pass the gap filter."""
-        from src.config import GAP_MAX_PCT
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-
-        orb_h = 100.0
-        day_open = orb_h * (1 + GAP_MAX_PCT)        # exactly 10% — passes
-        price = day_open * 1.01                     # current extension is scorer quality, not hard gap gate
-        ctx = _ctx(
-            price=price, orb=orb_h, day_open=day_open,
-            ma50=price - 5, ma200=price - 20,
-            rsi=62.0, rsi_prev=57.0,
-            dollar_vol=500_000_000,
-        )
-
-        mock_trade = MagicMock()
-        mock_trade.order.orderId             = 1
-        mock_trade.orderStatus.status        = 'Filled'
-        mock_trade.orderStatus.avgFillPrice  = price
-        mock_trade.fills = [_mock_fill(1.0)]
-        ib.placeOrder.return_value = mock_trade
-
-        tz_ny    = pytz.timezone('US/Eastern')
-        fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
-
-        with patch.object(engine, 'get_institutional_scan', return_value=['ATEDGE']), \
-             patch.object(engine, 'get_technical_context', return_value=ctx), \
-             patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
-            engine.run_cycle()
-
-        assert ib.placeOrder.call_count == 2, "Opening gap at boundary must generate 2 placeOrder calls (BUY + TRAIL)"
-
 
 class TestDailyLossCircuitBreaker:
     """
@@ -3100,40 +3088,6 @@ class TestInitializeSafeStartup:
 # 11. RSI DELTA GATE — minimum acceleration required
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestRsiDeltaGate:
-    """
-    c_rsi_delta = (rsi - rsi_prev) >= RSI_MIN_DELTA must block entries where
-    RSI is technically rising but by a trivially small amount (noise).
-    """
-
-    def test_tiny_rsi_rise_blocks_entry(self):
-        """RSI delta below RSI_MIN_DELTA must not generate a signal."""
-        from src.config import RSI_MIN_DELTA
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        # delta = 0.5 < RSI_MIN_DELTA → c_rsi_delta fails
-        ctx = _ctx(price=101.0, orb=100.0, rsi=55.5, rsi_prev=55.0,
-                   ma50=95.0, ma200=85.0)
-        _run_entry_cycle(ib, engine, ctx)
-        assert ib.placeOrder.call_count == 0, \
-            f"RSI delta {55.5-55.0:.1f} < {RSI_MIN_DELTA} must block entry"
-        assert 'TSLA' not in engine.state
-
-    def test_rsi_delta_at_minimum_allows_entry(self):
-        """RSI delta exactly at RSI_MIN_DELTA must pass the gate."""
-        from src.config import RSI_MIN_DELTA
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        rsi_prev = 60.0
-        rsi      = rsi_prev + RSI_MIN_DELTA   # delta == RSI_MIN_DELTA exactly
-        ctx = _ctx(price=101.0, orb=100.0, rsi=rsi, rsi_prev=rsi_prev,
-                   ma50=95.0, ma200=85.0)
-
-        _run_entry_cycle(ib, engine, ctx)
-        assert ib.placeOrder.call_count == 2, \
-            f"RSI delta exactly at {RSI_MIN_DELTA} must allow entry (2 calls: BUY + TRAIL)"
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 12. SCANNER OPTIMIZATION — skip scan when all slots are full
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3304,6 +3258,30 @@ class TestHardStop:
         assert 'pending_exit' not in engine.state['POS']
         assert not ib.placeOrder.called
 
+    def test_analyst_downgrade_exit_triggers_for_swing_without_eod_cleanup(self):
+        """Swing profile disables EOD churn, but analyst sell threshold is an independent exit."""
+        from src.strategy_profiles import get_strategy_profile
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        engine._strategy_profile = get_strategy_profile("indicator_swing")
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 101.0
+        engine.state = {'DOWN': self._state_entry(entry, cur, tz_ny)}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('DOWN', 5.0)]
+
+        with patch.object(engine, '_analyst_context', return_value={
+            'analyst_rating_score': -0.50,
+            'analyst_rating_total': 12,
+        }):
+            self._run_exit_check(engine)
+
+        assert engine.state['DOWN']['pending_exit'] is True
+        assert ib.placeOrder.called
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 14. FRIDAY CLOSE — close under-performing positions before weekend
@@ -3319,17 +3297,19 @@ class TestFridayClose:
     def _state_entry(self, price, cur, tz_ny):
         return {'price': price, 'qty': 5.0, 'current_price': cur,
                 'stop_loss': price * 0.90,
-                'volume': 0, 'score': 60, 'time': datetime.now(tz_ny).isoformat()}
+                'volume': 0, 'score': 60,
+                'protection_status': 'confirmed',
+                'time': datetime.now(tz_ny).isoformat()}
 
-    def test_friday_close_triggers_below_profit_threshold(self):
-        """On Friday after close hour, profit < threshold must force-liquidate."""
+    def test_friday_close_disabled_for_indicator_swing_profile(self):
+        """The maintained profile does not force Friday liquidation by default."""
         from src.config import FRIDAY_CLOSE_HOUR, FRIDAY_MIN_PROFIT_PCT
         ib     = _mock_ib()
         engine = _make_engine(ib)
         tz_ny  = pytz.timezone('US/Eastern')
 
         entry = 100.0
-        cur   = round(entry * (1 + FRIDAY_MIN_PROFIT_PCT - 0.01), 2)   # just below threshold
+        cur   = round(entry * (1 + min(FRIDAY_MIN_PROFIT_PCT, 0.02) - 0.005), 2)
         engine.state = {'FRI': self._state_entry(entry, cur, tz_ny)}
         ib.reqTickers.return_value = [_mock_price_ticker(cur)]
         ib.openTrades.return_value = []
@@ -3342,19 +3322,22 @@ class TestFridayClose:
             mock_dt.fromisoformat     = datetime.fromisoformat
             engine.manage_position_exits()
 
-        assert engine.state['FRI']['pending_exit'] is True, "Friday close must mark below-threshold position pending exit"
+        assert 'pending_exit' not in engine.state['FRI']
+        assert not ib.placeOrder.called
 
     def test_friday_close_does_not_trigger_above_threshold(self):
-        """Profit above Friday and EOD thresholds on Friday must keep position open."""
-        from src.config import FRIDAY_CLOSE_HOUR, FRIDAY_MIN_PROFIT_PCT, PROFIT_MIN_THRESHOLD
+        """Profit above Friday threshold plus EOD quality must keep position open."""
+        from src.config import FRIDAY_CLOSE_HOUR
         ib     = _mock_ib()
         engine = _make_engine(ib)
         tz_ny  = pytz.timezone('US/Eastern')
 
         entry = 100.0
-        cur   = round(entry * (1 + max(FRIDAY_MIN_PROFIT_PCT, PROFIT_MIN_THRESHOLD) + 0.01), 2)
+        cur   = 106.0
         engine.state = {'FRI': self._state_entry(entry, cur, tz_ny)}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [
+            _mock_price_ticker(cur, open=100.0, high=107.0, low=100.0, vwap=104.0)
+        ]
 
         friday_after = tz_ny.localize(datetime(2024, 6, 7, FRIDAY_CLOSE_HOUR + 1, 0))
 
@@ -3390,14 +3373,14 @@ class TestFridayClose:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 15. EOD PROFIT CLEANUP — liquidate weak positions near the close
+# 15. EOD QUALITY CLEANUP — liquidate weak positions near the close
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestEodFlat:
     """
-    After EOD_EXIT_TIME (default 15:50 ET) on any trading day, positions below
-    the profit threshold may be liquidated, including same-day entries. The rule
-    fires at most once per calendar trading day.
+    After EOD_EXIT_TIME (default 15:50 ET) on any trading day, positions that
+    fail the hold-quality gate may be liquidated, including same-day entries.
+    The rule fires at most once per calendar trading day.
     """
 
     def _state_entry(self, entry, cur, tz_ny, entry_time=None):
@@ -3405,6 +3388,7 @@ class TestEodFlat:
             'price': entry, 'qty': 5.0, 'current_price': cur,
             'stop_loss': entry * 0.93,
             'volume': 0, 'score': 60,
+            'protection_status': 'confirmed',
             'time': (entry_time or datetime.now(tz_ny)).isoformat(),
         }
 
@@ -3414,8 +3398,8 @@ class TestEodFlat:
         pos.position        = qty
         return pos
 
-    def test_eod_flat_triggers_when_older_position_at_loss(self):
-        """After EOD_EXIT_TIME an older losing position must be liquidated."""
+    def test_eod_flat_does_not_churn_older_position_at_loss(self):
+        """Default profile leaves older losing positions to swing exits/stops."""
         from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -3425,7 +3409,7 @@ class TestEodFlat:
         cur   = 98.0   # -2%, not in profit
         old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 30))
         engine.state = {'LOSS': self._state_entry(entry, cur, tz_ny, old_entry)}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=100.0, high=101.0, low=98.0)]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('LOSS', 5.0)]
 
@@ -3438,21 +3422,21 @@ class TestEodFlat:
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
 
-        assert engine.state['LOSS']['pending_exit'] is True, \
-            "EOD cleanup must liquidate weak losing position"
+        assert 'pending_exit' not in engine.state['LOSS']
+        assert not ib.placeOrder.called
 
-    def test_eod_flat_triggers_when_older_position_below_profit_threshold(self):
-        """After EOD_EXIT_TIME an older weak winner below 5% must be liquidated."""
-        from src.config import EOD_EXIT_TIME, PROFIT_MIN_THRESHOLD
+    def test_eod_flat_does_not_churn_older_profitable_position_closing_weak(self):
+        """Default profile does not use EOD quality cleanup."""
+        from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
         tz_ny  = pytz.timezone('US/Eastern')
 
         entry = 100.0
-        cur   = entry * (1 + PROFIT_MIN_THRESHOLD - 0.01)
+        cur   = 101.0
         old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 30))
         engine.state = {'WEAK': self._state_entry(entry, cur, tz_ny, old_entry)}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=100.0, high=110.0, low=100.0)]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('WEAK', 5.0)]
 
@@ -3464,11 +3448,11 @@ class TestEodFlat:
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
 
-        assert engine.state['WEAK']['pending_exit'] is True, \
-            "EOD cleanup must liquidate older positions below the profit threshold"
+        assert 'pending_exit' not in engine.state['WEAK']
+        assert not ib.placeOrder.called
 
-    def test_eod_flat_triggers_when_older_position_exactly_at_entry(self):
-        """After EOD_EXIT_TIME an older zero-profit position must also be liquidated."""
+    def test_eod_flat_does_not_churn_older_position_exactly_at_entry(self):
+        """Default profile does not close zero-profit positions solely for EOD cleanup."""
         from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -3478,7 +3462,7 @@ class TestEodFlat:
         cur   = 100.0  # exactly at entry, profit = 0
         old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 30))
         engine.state = {'FLAT': self._state_entry(entry, cur, tz_ny, old_entry)}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=100.0, high=105.0, low=99.0)]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('FLAT', 5.0)]
 
@@ -3490,21 +3474,21 @@ class TestEodFlat:
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
 
-        assert engine.state['FLAT']['pending_exit'] is True, \
-            "EOD cleanup must liquidate zero-profit position"
+        assert 'pending_exit' not in engine.state['FLAT']
+        assert not ib.placeOrder.called
 
-    def test_eod_flat_does_not_trigger_when_profit_clears_profit_threshold(self):
+    def test_eod_flat_does_not_trigger_when_hold_quality_passes(self):
         """A strong older winner after EOD_EXIT_TIME must not be closed."""
-        from src.config import EOD_EXIT_TIME, PROFIT_MIN_THRESHOLD
+        from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
         tz_ny  = pytz.timezone('US/Eastern')
 
         entry = 100.0
-        cur   = entry * (1 + PROFIT_MIN_THRESHOLD + 0.01)
+        cur   = 101.0
         old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 30))
         engine.state = {'GAIN': self._state_entry(entry, cur, tz_ny, old_entry)}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=100.0, high=107.0, low=100.0, vwap=104.0)]
 
         eod_time = tz_ny.localize(
             datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
@@ -3517,8 +3501,38 @@ class TestEodFlat:
         assert 'GAIN' in engine.state, "Strong profitable position must not be closed at EOD"
         assert not ib.placeOrder.called
 
-    def test_eod_flat_closes_same_day_weak_position(self):
-        """A same-day weak position must be closed by EOD cleanup."""
+    def test_eod_flat_does_not_liquidate_when_stop_is_not_confirmed_by_default(self):
+        """Stop confirmation is not an EOD cleanup gate when cleanup is disabled."""
+        from src.config import EOD_EXIT_TIME
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 101.0
+        old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 30))
+        state = self._state_entry(entry, cur, tz_ny, old_entry)
+        state['protection_status'] = 'unconfirmed'
+        engine.state = {'NO_STOP': state}
+        ib.reqTickers.return_value = [
+            _mock_price_ticker(cur, open=100.0, high=107.0, low=100.0, vwap=104.0)
+        ]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('NO_STOP', 5.0)]
+
+        eod_time = tz_ny.localize(
+            datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
+        )
+        with patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = eod_time
+            mock_dt.fromisoformat    = datetime.fromisoformat
+            engine.manage_position_exits()
+
+        assert 'pending_exit' not in engine.state['NO_STOP']
+        assert not ib.placeOrder.called
+
+    def test_eod_flat_does_not_close_same_day_weak_position(self):
+        """Same-day weak position is not closed by disabled EOD cleanup."""
         from src.config import EOD_EXIT_TIME
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -3528,7 +3542,7 @@ class TestEodFlat:
         cur   = 98.0
         same_day_entry = tz_ny.localize(datetime(2024, 6, 5, 11, 20))
         engine.state = {'NEW': self._state_entry(entry, cur, tz_ny, same_day_entry)}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=100.0, high=101.0, low=98.0)]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('NEW', 5.0)]
 
@@ -3540,9 +3554,8 @@ class TestEodFlat:
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
 
-        assert engine.state['NEW']['pending_exit'] is True, \
-            "Same-day weak position must be closed at EOD"
-        assert ib.placeOrder.called
+        assert 'pending_exit' not in engine.state['NEW']
+        assert not ib.placeOrder.called
 
     def test_eod_flat_does_not_trigger_before_eod_time(self):
         """Before EOD_EXIT_TIME the EOD cleanup rule must be inactive."""
@@ -3555,7 +3568,7 @@ class TestEodFlat:
         cur   = 104.0   # +4%, would trigger if time were right
         old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 0))
         engine.state = {'EARLY': self._state_entry(entry, cur, tz_ny, old_entry)}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=100.0, high=110.0, low=100.0)]
 
         # One minute before EOD_EXIT_TIME
         before_eod = tz_ny.localize(
@@ -3580,7 +3593,7 @@ class TestEodFlat:
         cur   = 98.0
         old_entry = tz_ny.localize(datetime(2024, 6, 4, 10, 30))
         engine.state = {'ONCE': self._state_entry(entry, cur, tz_ny, old_entry)}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=100.0, high=101.0, low=98.0)]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('ONCE', 5.0)]
 

@@ -1,19 +1,18 @@
 #!/usr/bin/env python
 """
-CLI entry-point for the Velocity Strategy forward backtester (v2).
+CLI entry-point for the Velocity Strategy forward backtester.
 
-Defaults to 2025-01-01 → 2026-05-01 (out-of-sample relative to the
-2023-2024 development period).
+Defaults to 2025-01-01 → 2026-05-01.
 
-Key v2 improvements baked in:
-  • RVOL-aware daily scanner ranking; 8096 entries no longer gate on RVOL
+Key assumptions baked in:
+  • The maintained strategy profile is indicator_swing
+  • Shared live/backtest entry rules and scorer
   • ATR-based position sizing (2% equity risk per trade)
-  • Break-even stop floor at 4% profit
-  • Trading-bar hold count (not calendar days)
+  • Break-even stop floor after the configured profit threshold
   • T+1 cash settlement: sale proceeds cannot fund same-day replacement buys
   • VIX regime gate enabled by default to match live-entry risk control
   • Gap-aware stop fills and no same-bar stop ratchet look-ahead
-  • 0.1% entry slippage + configurable commission per round trip
+  • Close-or-worse daily entry fills, 0.1% entry slippage, and commissions
   • Data caching to backtest/.cache/ (use --no-cache to force re-download)
   • Filter funnel stats printed after each run
 
@@ -22,7 +21,7 @@ Usage:
     .venv/bin/python run_backtest.py --start 2025-01-01 --end 2026-05-01
     .venv/bin/python run_backtest.py --capital 2000
     .venv/bin/python run_backtest.py --no-spy-filter
-    .venv/bin/python run_backtest.py --hold-bars 7 --chandelier-mult 1.9
+    .venv/bin/python run_backtest.py --chandelier-mult 1.9
     .venv/bin/python run_backtest.py --start 2020-01-01 --end 2026-05-22 --max-symbols 300 --yearly
     .venv/bin/python run_backtest.py --trades
     .venv/bin/python run_backtest.py --no-cache        # force fresh download
@@ -42,17 +41,18 @@ from backtest.strategy import VelocityBacktest
 from src.config import (
     BACKTEST_SCAN_COUNT, BACKTEST_INITIAL_CAPITAL, BACKTEST_COMMISSION_PER_ORDER,
     BACKTEST_MAX_SYMBOLS,
-    BACKTEST_RVOL_MIN, BREAK_EVEN_PCT,
-    CHANDELIER_MULT, CHANDELIER_PERIOD, PROFIT_MIN_THRESHOLD, HOLD_TRADING_BARS,
+    BREAK_EVEN_PCT,
+    CHANDELIER_MULT, CHANDELIER_PERIOD,
+    EOD_HOLD_MIN_PROFIT_PCT, EOD_HOLD_DAY_RANGE_LOCATION_MIN,
+    EOD_HOLD_RELATIVE_STRENGTH_MIN,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
-    SCORING_MODEL,
+    STRATEGY_PROFILE,
 )
-
-DEFAULT_HOLD_BARS = HOLD_TRADING_BARS
+from src.strategy_profiles import get_strategy_profile, profile_names
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Velocity Strategy Forward Backtester v2")
+    p = argparse.ArgumentParser(description="Velocity Strategy Forward Backtester")
     p.add_argument("--start",           default="2025-01-01",        help="Start date YYYY-MM-DD")
     p.add_argument("--end",             default="2026-05-01",         help="End date YYYY-MM-DD")
     p.add_argument("--capital",         default=BACKTEST_INITIAL_CAPITAL, type=float,
@@ -63,12 +63,14 @@ def parse_args():
                    help=f"Backtest commission assumption per order (default: ${BACKTEST_COMMISSION_PER_ORDER:.2f}; live uses IBKR commission reports)")
     p.add_argument("--max-symbols", default=BACKTEST_MAX_SYMBOLS, type=int,
                    help="Cap downloaded symbols for bounded validation; 0 means full filtered universe")
-    p.add_argument("--hold-bars",       default=DEFAULT_HOLD_BARS,    type=int,
-                   help="Legacy compatibility parameter; live EOD cleanup is same-day")
-    p.add_argument("--rvol",            default=BACKTEST_RVOL_MIN,    type=float,
-                   help=f"Legacy RVOL/ranking reference; 8096 does not gate entries on RVOL (default: {BACKTEST_RVOL_MIN}×)")
-    p.add_argument("--scoring-model", choices=["legacy", "legacy_v2", "enhanced"], default=SCORING_MODEL,
-                   help=f"Candidate ranking model used by live/backtest scoring (default: {SCORING_MODEL})")
+    p.add_argument("--strategy-profile", choices=profile_names(), default=STRATEGY_PROFILE,
+                   help=f"Screening/entry profile to test (default: {STRATEGY_PROFILE})")
+    p.add_argument("--min-price", default=None, type=float,
+                   help="Override the selected profile's scanner minimum price")
+    p.add_argument("--min-volume", default=None, type=float,
+                   help="Override the selected profile's scanner minimum daily volume")
+    p.add_argument("--min-dollar-vol", default=None, type=float,
+                   help="Override the selected profile's 20-day average dollar-volume floor")
     p.add_argument("--break-even-pct",  default=BREAK_EVEN_PCT,       type=float,
                    help=f"Break-even stop activation threshold (default: {BREAK_EVEN_PCT * 100:.0f}%%)")
     p.add_argument("--chandelier-mult", default=CHANDELIER_MULT,      type=float,
@@ -82,8 +84,6 @@ def parse_args():
                    help="Disable VIX regime gate for research only")
     p.add_argument("--vix-delay-bars", default=0, type=int,
                    help="Daily-bar delayed VIX proxy. 0=current VIX bar; 1=prior available VIX bar for delayed-VIX research")
-    p.add_argument("--conservative-daily-entry", action="store_true",
-                   help="Research mode: when a daily signal uses the completed close/RSI/CLV, fill no better than that close")
     p.add_argument("--trades",          action="store_true",
                    help="Print top-20 trade log after summary")
     p.add_argument("--yearly",          action="store_true",
@@ -119,6 +119,15 @@ def _year_ranges(start: str, end: str):
         year += 1
 
 
+def _effective_scoring_model(args) -> str:
+    profile = get_strategy_profile(args.strategy_profile)
+    return profile.scoring_model.strip().lower()
+
+
+def _daily_fill_label() -> str:
+    return "Close-or-worse daily swing fill; exits use the selected profile's stop stack"
+
+
 def _build_backtest(args, *, start: str, end: str, use_cache: bool) -> VelocityBacktest:
     return VelocityBacktest(
         start          = start,
@@ -127,15 +136,16 @@ def _build_backtest(args, *, start: str, end: str, use_cache: bool) -> VelocityB
         scan_count     = args.scan_count,
         commission_per_order = args.commission_per_order,
         max_symbols    = args.max_symbols,
-        hold_bars      = args.hold_bars,
-        rvol_min       = args.rvol,
         break_even_pct = args.break_even_pct,
         chandelier_mult= args.chandelier_mult,
         use_spy_filter = not args.no_spy_filter,
         use_vix_filter = args.vix_filter,
         vix_delay_bars = args.vix_delay_bars,
-        scoring_model  = args.scoring_model,
-        conservative_daily_entry = args.conservative_daily_entry,
+        scoring_model  = _effective_scoring_model(args),
+        strategy_profile = args.strategy_profile,
+        min_price      = args.min_price,
+        min_volume     = args.min_volume,
+        min_dollar_vol = args.min_dollar_vol,
         use_cache      = use_cache,
     )
 
@@ -161,6 +171,8 @@ def _print_yearly_report(args) -> None:
         bt = _build_backtest(args, start=y_start, end=y_end, use_cache=False)
         bt._data = base._data
         bt._spy_bull = base._spy_bull
+        bt._spy_return = base._spy_return
+        bt._spy_close = getattr(base, "_spy_close", None)
         bt._vix_series = base._vix_series
         bt._vix_delay_bars = base._vix_delay_bars
         bt._validate_regime_data()
@@ -194,6 +206,8 @@ def main():
     print(f"{'─' * 50}")
     print(f"  Period        : {args.start} → {args.end}")
     print(f"  Capital       : ${args.capital:,.2f}")
+    profile = get_strategy_profile(args.strategy_profile)
+    print(f"  Profile       : {profile.name} ({profile.label})")
     _deployable_capital = args.capital * SETTLED_CASH_DEPLOYMENT_PCT
     _init_slots = (
         min(int(_deployable_capital / MIN_BUCKET_SIZE), MAX_POSITIONS_CAP)
@@ -201,14 +215,25 @@ def main():
     )
     _bucket = _deployable_capital / _init_slots if _init_slots > 0 else 0.0
     print(f"  Max pos       : {MAX_POSITIONS_CAP} cap | Dynamic max=floor(equity/${MIN_BUCKET_SIZE:.0f}) | Initial slots={_init_slots}, bucket≈${_bucket:,.2f} using {SETTLED_CASH_DEPLOYMENT_PCT:.0%} deployable cash")
-    print(f"  Entry rules   : 8096 momentum/risk screener")
-    print(f"  Scoring model : {args.scoring_model}")
-    print(f"  RVOL ref      : {args.rvol:.1f}× (scanner ranking only; not an entry gate)")
-    print(f"  Exit          : Chandelier (ATR{CHANDELIER_PERIOD}×{args.chandelier_mult}) + 7% hard stop + {args.break_even_pct:.0%} break-even")
-    print(f"  EOD cleanup   : same-day close if profit < {PROFIT_MIN_THRESHOLD:.0%}")
-    print(f"  Hold bars     : {args.hold_bars} (legacy parameter; EOD cleanup is same-day)")
-    print(f"  Position size : Whole shares, ATR-based (2% equity risk) capped by bucket")
-    print(f"  Daily fill     : {'Conservative close-or-worse' if args.conservative_daily_entry else 'Legacy open/prev-high proxy'}")
+    print(f"  Entry rules   : {profile.description}")
+    scoring_model = _effective_scoring_model(args)
+    print(f"  Scoring model : {scoring_model}")
+    print(f"  Exit          : Chandelier (ATR{CHANDELIER_PERIOD}×{args.chandelier_mult}) + 7% software hard stop + {args.break_even_pct:.0%} break-even + analyst downgrade")
+    if profile.eod_quality_cleanup:
+        print(
+            "  EOD cleanup   : same-day quality hold "
+            f"(profit>={EOD_HOLD_MIN_PROFIT_PCT:.0%}, "
+            f"dayLoc>={EOD_HOLD_DAY_RANGE_LOCATION_MIN:.0%}, "
+            f"RS>={EOD_HOLD_RELATIVE_STRENGTH_MIN:.0%}, stop confirmed)"
+        )
+    else:
+        time_stop = (
+            f"{profile.time_stop_bars} bars with profit<={profile.time_stop_min_profit:.0%}"
+            if profile.time_stop_bars is not None else "disabled"
+        )
+        print(f"  Swing exits   : no EOD churn | time stop={time_stop}")
+    print(f"  Position size : Whole shares, broker-Chandelier risk (2% equity) capped by bucket")
+    print(f"  Daily fill     : {_daily_fill_label()}")
     print(f"  Slippage      : 0.1% entry  |  Commission: ${args.commission_per_order*2:.2f}/round-trip")
     print(f"  Symbol cap    : {'FULL filtered universe' if args.max_symbols <= 0 else f'{args.max_symbols:,} symbols'}")
     print(f"  SPY filter    : {'OFF' if args.no_spy_filter else 'ON (SPY > SMA50 > SMA200 and SMA200 rising)'}")
@@ -244,7 +269,8 @@ def main():
             use_spy_filter = not args.no_spy_filter,
             use_vix_filter = args.vix_filter,
             use_cache      = not args.no_cache,
-            scoring_model  = args.scoring_model,
+            scoring_model  = scoring_model,
+            strategy_profile = args.strategy_profile,
             progress       = True,
         )
         print(format_optimization_table(runs))

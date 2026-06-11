@@ -6,7 +6,7 @@
 
    You also possess expert-level, up-to-date knowledge of the entire Python ecosystem, especially all the best free and open-source libraries, and constantly optimize production trading systems by leveraging the most powerful, battle-tested features from libraries such as pandas, NumPy, Numba, Polars, TA-Lib, vectorbt, Backtrader, Zipline Reloaded, QuantLib, PyAlgoTrade, ccxt, asyncio and websockets, Redis, RQ, Celery, Prometheus and Grafana, Loguru, structlog, pydantic, SQLAlchemy, Joblib, Dask, Ray, PyArrow, SciPy, Statsmodels, scikit-learn, XGBoost, LightGBM, Optuna, and others.
 
-   We are building an automated swing trading bot where broker-side Chandelier trailing stops are the primary exit for working trades, and same-day EOD profit cleanup at 15:50 ET closes positions below the configured profit threshold so cash can settle T+1. The bot is for a cash account with T+1 settlement, starting initial capital of $2,000, and it should use compounded account growth for further trading.
+   We are building an automated swing trading bot where broker-side Chandelier trailing stops are the primary exit for working trades. The only maintained strategy profile is `indicator_swing`: a relative-strength-first swing system, not an intraday ORB system and not a long-term investment system. The bot is for a cash account with T+1 settlement, starting initial capital of $2,000, and it should use compounded account growth for further trading.
 
 2. Repository ownership and active project folder
 
@@ -25,25 +25,41 @@
 4. Current strategy intent
 
    - Instrument universe: US equities through IBKR.
-   - Live scanner default: broad active corporate stocks via `MOST_ACTIVE`, not `TOP_PERC_GAIN`; strategy rules decide momentum quality.
+   - Default and only maintained profile: `indicator_swing`.
+   - Removed profiles/code paths must not be reintroduced casually. Old ORB/current, standalone reversal/momentum, standalone Bollinger, standalone PSAR, legacy/enhanced/swing scoring models, and old backtest compatibility knobs were removed on 2026-06-11 to keep live code, tests, dashboard, and backtester aligned.
+   - Current production intent: relative-strength-first swing momentum. A stock must first pass trend/leadership gates before any indicator timing sleeve can buy.
+   - Live application scanner default: `VELOCITY_APP_SCANNER_SOURCE=hybrid`, meaning curated IBKR scanner hits plus a rotating full US common-stock universe batch. Strategy rules decide final momentum quality.
+   - Premarket scanner architecture: at `VELOCITY_APP_PREFILTER_START_TIME` (default `08:00 ET`), scan the full configured common-stock universe once, apply only static historical filters that cannot become true intraday, cache the surviving candidate list, and use that list for entry-window live screening. Do not spend the entry window rediscovering the full universe.
+   - If IBKR historical pacing is too slow to finish before `ENTRY_START`, keep `VELOCITY_APP_PREFILTER_STOP_AT_ENTRY_START=1`: save a partial same-day prefilter cache with `stopped_reason=entry_window_open` and trade only from the screened subset. Manual diagnostics can use `scripts/run_premarket_prefilter.py --ignore-entry-cutoff`.
    - Account type: cash account, T+1 settlement.
    - Live capital must come from IBKR `NetLiquidation` / `SettledCash`, not a local seed constant.
    - Maximum position capacity should be calculated from total equity, capped by explicit risk settings (`VELOCITY_MIN_BUCKET_SIZE`, `VELOCITY_MAX_POSITIONS_CAP`).
    - New-entry sizing must use settled cash, not total equity.
    - Never use `AvailableFunds` as a substitute for `SettledCash` in a cash account.
    - Bucket size should be settled cash divided by remaining cash-qualified open slots.
-   - Live scanner output should evaluate all unique IBKR screener results; do not cap live candidates with a fixed `SCAN_COUNT`.
+   - Live scanner output should evaluate all unique app-scanner candidates; do not cap live candidates with a backtest-style fixed `SCAN_COUNT`. Use `VELOCITY_APP_SCANNER_BATCH_SIZE` only as the fallback pacing control before a same-day premarket prefilter cache exists.
+   - Where IBKR exposes a direct scanner-side filter equivalent, apply it upstream and keep the local screener check as the final authority. Scanner-side filters are only noise reduction; the local profile evaluator is the final trading rule.
    - Live commissions must come from IBKR commission reports/fill data. Keep commission constants only as backtest assumptions.
-   - Entry logic should prefer liquid, high-quality momentum stocks, with special caution in bear regimes.
-   - Exit logic includes Chandelier trailing stop, hard stop, Friday/weekend risk handling, velocity/stagnation exit, and emergency liquidation.
+   - Scanner price floor for the default profile is `$10`; entry logic should prefer liquid, high-quality momentum stocks, with special caution in bear regimes.
+   - Default profile liquidity floors are at least 1,000,000 shares/day, $75M 20-day average dollar volume, and $1B market cap unless explicitly overridden.
+   - Default hard gates include weekly uptrend, positive 3/6-month relative strength versus SPY, positive 13/26-week absolute return, price near its 52-week high, price above MA50, MA50 above MA200, rising SMA200, controlled ATR%, controlled spread, and controlled MA20 extension.
+   - Default timing sleeves:
+     - `ma_cross`: default live sleeve. EMA20 must be above SMA50; fresh crosses, MA20/MA50 reclaims, or prior-high breaks can time entries only after the RS/trend gate passes.
+     - `bollinger_reversion`: standalone research profile only unless explicitly enabled. It means Bollinger lower-band reclaim after two prior closes below the lower band. Do not buy merely because price closed below the lower band.
+     - `psar_flip`: standalone research profile only unless explicitly enabled. PSAR may be confirmation/trailing evidence, but it is not a default primary buy trigger.
+   - Default confirmation rule: RSI must show momentum/recovery and at least two of MACD, OBV, PSAR, stochastic, or volume pace must confirm.
+   - Analyst ratings are bounded scoring/exit inputs only. Analyst consensus may improve or reduce rank, but it must never create a buy by itself or override weak price action.
+   - Default minimum entry score is 50.
+   - Exit logic includes tiered profit trims, Chandelier trailing stop, hard stop, break-even floor, analyst downgrade exit, matching-sleeve exit, swing time stop, and emergency liquidation.
+   - Tiered profit exits are cumulative and whole-share rounded: at +1R, sell the nearest whole-share amount needed to have sold about 20% of the original quantity; at +1.5R, reach about 40% sold; at +2R, reach about 60% sold. `R` is the original per-share Chandelier risk distance captured at entry. The remaining runner stays protected by the broker trailing stop unless another safety exit requires liquidation.
+   - Default swing time stop is 10 trading bars when the position is not above breakeven. The maintained profile disables same-day EOD churn and Friday cleanup by default.
    - The VIX risk filter is mandatory for live entries. If VIX market data is missing, invalid, or above the configured threshold, the engine must skip new entries while still managing existing positions.
    - Stock entries require real-time equity market data. VIX may use delayed IBKR market data as a regime-only safety input via `VELOCITY_VIX_MARKET_DATA_TYPE=3`; the engine must restore real-time stock data mode before scanning/ordering.
    - Forward backtests must model T+1 cash settlement: sale proceeds count toward equity while unsettled but cannot fund new entries until the next trading session.
    - Current yfinance/NASDAQ-listing backtests are useful regression checks, but they are not survivorship-free institutional research. Treat strong results as provisional until validated on point-in-time historical universe data.
-   - Current validated production entry rule set is Cartesian mask `8096`.
-   - 8096 active entry gates are: ORB/previous-high break, gap cap, RSI minimum delta, RSI minimum level, close location in the upper part of the day range, minimum intraday gain from open, and ATR% cap.
-   - Live-only fixed controls remain active around 8096: spread cap, 20-day dollar-volume floor, VIX/SPY regime handling, reduced bear-phase risk, correlation cap, sector cap, settled-cash sizing, and T+1 settlement.
-   - Exhaustive validation promoted removing these old entry gates: MA50/MA200 trend, SMA200 slope, VCP/ATR contraction, near-10-day-high proximity, RVOL minimum, and plain RSI-rising. RVOL/VCP/trend may still be logged or used for scoring/ranking, but they must not reject an otherwise valid 8096 entry.
+   - The old ORB/8096 rule set and `current` legacy profile were removed. Do not preserve tests, docs, config, scoring branches, or backtest parameters for them.
+   - Live-only fixed controls remain active around all profiles: spread cap, 20-day dollar-volume floor, VIX/SPY regime handling, correlation cap, sector cap, settled-cash sizing, and T+1 settlement.
+   - Do not add weak standalone indicator triggers to the default profile without multi-year forward validation. The previous naive Bollinger and PSAR primary-entry variants failed multi-year testing, and the default profile was improved by disabling Bollinger from the combined live sleeve set.
 
 5. Validation rules
 
@@ -122,7 +138,7 @@
 
 10. Live-safety fixes carried forward from the original project review
 
-   - Never set IBKR `goodAfterTime` to a past timestamp. Entry bracket orders omit it after the 10:00 ET entry gate.
+   - Never set IBKR `goodAfterTime` to a past timestamp. Entry BUY orders omit it after the configured entry gate, currently 10:15 ET.
    - In an IBKR cash account, `liquidate()` cancels active SELL orders, including protective TRAIL orders, before submitting the market exit. IBKR can otherwise reject the exit as a potential oversell because another full-size SELL is already live. If the market exit is rejected or placement fails, state is retained, `pending_exit` is cleared, an alert is emitted, and `_audit_stop_orders()` rebuilds protection immediately.
    - Liquidation market sells must be SMART-routed even if IBKR reports the position contract with a native exchange.
    - Filled liquidation attempts mark state `pending_exit=True`; state is removed only after IBKR sync confirms the position is flat.
@@ -139,8 +155,8 @@
    - `liquidate()` cancels active SELL protection before a cash-account market exit, then catches IBKR `placeOrder()` exceptions, clears `pending_exit`, retains state, alerts, and runs `_audit_stop_orders()` so protection is rebuilt if the exit cannot be placed or is rejected.
    - After IBKR confirms a symbol is flat, `_sync_positions_from_ibkr()` must cancel any leftover SELL exit orders before removing local state. This prevents orphaned trailing stops from becoming unintended future sell orders.
    - Liquidation state removal remains confirmation-based: one missing IBKR snapshot only defers removal unless `FORCE_EXIT_ALL` is active.
-   - `backtest/optimizer.py` must optimize only active 8096 parameters. Legacy `rvol_min`, `breakout_pct`, and `vcp_ratio` are retained for API/report compatibility but must not be swept as if they affect entries.
-   - `run_backtest.py` documentation must describe RVOL as scanner ranking only, not an entry gate.
+   - `backtest/optimizer.py` must optimize only active `indicator_swing` exit parameters: break-even threshold and Chandelier multiple.
+   - `run_backtest.py` must expose only current live/backtest strategy controls.
 
 12. Latest validation record
 
@@ -605,9 +621,9 @@
 22. Protective TRAIL activation gate, 2026-05-28
 
    Requirement: protective TRAIL sell orders must not activate before 09:32 ET.
-   This is deliberately separate from the 10:00 ET new-entry gate: existing
+   This is deliberately separate from the 10:15 ET new-entry gate: existing
    positions get protection after the first 2 opening minutes, while new BUY
-   entries still wait until 10:00 ET.
+   entries still wait until 10:15 ET.
 
    Implementation details to preserve:
 
@@ -616,7 +632,7 @@
    - New pre-09:32 audit-created TRAIL orders set
      `goodAfterTime=YYYYMMDD 09:32:00 US/Eastern`.
    - New entry bracket parent BUY and child TRAIL orders share the same
-     `goodAfterTime` value when submitted before 10:00 ET; after 10:00 ET the
+     `goodAfterTime` value when submitted before 10:15 ET; after 10:15 ET the
      field is omitted because IBKR rejects past activation timestamps.
    - Existing GTC TRAIL orders recovered from IBKR are checked during stop
      audit. If they lack the current day's 09:32 ET `goodAfterTime`, the engine
@@ -1072,11 +1088,11 @@
    Fix:
 
    - Renamed the live exit manager to `manage_position_exits()`.
-   - Kept `check_velocity_exits()` as a backward-compatible wrapper.
    - Updated engine call sites and tests to use `manage_position_exits()`.
+   - Removed the stale `check_velocity_exits()` compatibility wrapper during the 2026-06-04 cleanup pass.
    - Historical note: this pass temporarily stopped EOD flat from closing
-     same-day swing entries. Section 8 supersedes that behavior; current EOD
-     profit cleanup is same-day.
+     same-day swing entries. Sections 8 and 10 supersede that behavior; current
+     EOD quality cleanup is same-day.
    - Software exits now require a fresh broker price; cached `current_price`
      and stale ticker `close` values are no longer allowed to liquidate a
      position.
@@ -1090,8 +1106,8 @@
      fresh broker price only.
    - Break-even giveback: fresh broker price only.
    - Friday close: explicit weekend-risk policy.
-   - EOD profit cleanup: same-day at/after 15:50 ET, using the configured
-     profit threshold.
+   - EOD quality cleanup: same-day at/after 15:50 ET, using the quality-based
+     hold gate documented in section 10.
 
    Validation:
 
@@ -1154,3 +1170,123 @@
    - Important research caveat: same-day daily-bar cleanup fills weak entries at
      the completed daily close. This matches the intended live 15:50 ET rule at
      a coarse level, but it is still less realistic than an intraday replay.
+
+9. Plug-and-play strategy profiles, 2026-06-06
+
+   Screening and entry rules are now selectable profiles. Exit rules remain
+   unchanged.
+
+   Profiles:
+
+   - `current`: existing ORB momentum/risk filter.
+   - `reversal_reclaim`: lower-priced reclaim/reversal momentum sleeve.
+   - `five_day_momentum`: 5-day momentum sleeve near 20-day highs.
+   - `safer_liquid_momentum`: more liquid, tighter-risk momentum sleeve.
+
+   Implementation:
+
+   - Added `src/strategy_profiles.py` as the single source of truth for profile
+     scan codes, scanner-side generic filters, thresholds, and entry checks.
+   - Live scanner uses profile scan codes unless
+     `VELOCITY_IB_SCANNER_SCAN_CODES` explicitly overrides them.
+   - Live entry and backtest fine-entry logic now call the same shared evaluator.
+   - Backtest CLI now supports
+     `--strategy-profile {current,reversal_reclaim,five_day_momentum,safer_liquid_momentum}`
+     plus `--min-price`, `--min-volume`, and `--min-dollar-vol` overrides.
+   - Backtest cache keys now include profile and universe-floor values so
+     strategy sleeves cannot silently reuse the wrong cached universe.
+
+   Validation:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m py_compile src/strategy_profiles.py src/scanner.py src/engine.py backtest/strategy.py backtest/optimizer.py run_backtest.py
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m pytest -o cache_dir=/tmp/velocity-pytest-cache -q
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python run_backtest.py --help
+   ```
+
+   Results:
+
+   - Syntax compile: passed.
+   - Full suite: 409 passed.
+   - Backtest CLI exposes all four strategy profiles.
+
+10. EOD quality-based hold rule, 2026-06-06
+
+   The old same-day EOD cleanup was a blunt `profit < 5%` liquidation rule.
+   That has been replaced with a quality gate for deciding whether a position
+   deserves overnight capital.
+
+   New live EOD rule at/after `15:50 ET`:
+
+   - Hold only if profit is at least `EOD_HOLD_MIN_PROFIT_PCT` (default `0%`).
+   - Price must be above VWAP when VWAP is available, or strictly above entry.
+   - Price must be near the day high:
+     `day_range_location >= EOD_HOLD_DAY_RANGE_LOCATION_MIN` (default `0.70`).
+   - Intraday relative strength versus SPY must be positive:
+     stock intraday return minus SPY intraday return >=
+     `EOD_HOLD_RELATIVE_STRENGTH_MIN` (default `0%`).
+   - Protective stop must be confirmed when
+     `EOD_HOLD_REQUIRE_STOP_CONFIRMED=1` (default).
+
+   Fail-closed behavior:
+
+   - If fresh price, day range, stock open, SPY return, or confirmed stop data is
+     unavailable, the EOD hold test fails and the engine liquidates the position.
+   - Exit snapshots intentionally do not use stale `ticker.close` as a price
+     fallback.
+
+   Backtest approximation:
+
+   - Daily backtests use close >= entry as the no-look-ahead proxy for the
+     live VWAP/entry condition.
+   - Daily close location uses `(close - low) / (high - low)`.
+   - Daily relative strength uses stock daily return minus SPY daily return.
+   - The legacy `PROFIT_MIN_THRESHOLD` parameter remains only for optimizer
+     compatibility.
+
+   Validation:
+
+   ```bash
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m py_compile src/config.py src/engine.py backtest/strategy.py backtest/optimizer.py dashboard_server.py run_backtest.py tests/test_engine.py tests/test_trailing_stop_scoring_screener.py tests/test_backtest.py tests/test_dashboard_server.py
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m pytest -o cache_dir=/tmp/velocity-pytest-cache tests/test_engine.py::TestEodProfitCleanup tests/test_trailing_stop_scoring_screener.py::TestExitOrders tests/test_trailing_stop_scoring_screener.py::TestFridayClose tests/test_trailing_stop_scoring_screener.py::TestEodFlat tests/test_dashboard_server.py tests/test_backtest.py -q
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m pytest -o cache_dir=/tmp/velocity-pytest-cache -q
+   ```
+
+   Results:
+
+   - Syntax compile: passed.
+   - Focused EOD/dashboard/backtest tests: 97 passed.
+   - Full suite: 410 passed.
+
+11. Trader stale-heartbeat watchdog, 2026-06-08
+
+   Live issue observed:
+
+   - The dashboard server stayed alive and `/api/state` was reachable, but the
+     trader child stopped writing fresh `runtime/live/dashboard_data.json` and
+     `runtime/live/engine_state.json`.
+   - The Python `auto_trader.py` process was still present, so the existing
+     auto-restart loop did not help because it only restarted after process
+     exit.
+
+   Fix:
+
+   - `scripts/start_trader.sh` now has a supervisor-level heartbeat watchdog.
+   - The watchdog watches `${VELOCITY_BASE_DIR}/dashboard_data.json` by default.
+   - If the heartbeat file is stale beyond
+     `VELOCITY_TRADER_STALE_SEC` after
+     `VELOCITY_TRADER_WATCHDOG_STARTUP_GRACE_SEC`, the supervisor terminates
+     the stuck child and the normal restart loop starts a fresh trader.
+   - Defaults are conservative to avoid killing a slow but legitimate scanner
+     cycle:
+     `VELOCITY_TRADER_STALE_SEC=600`,
+     `VELOCITY_TRADER_WATCHDOG_INTERVAL_SEC=15`,
+     `VELOCITY_TRADER_WATCHDOG_STARTUP_GRACE_SEC=900`.
+   - `.env.paper.example` and `.env.live.example` document the knobs.
+
+   Validation commands:
+
+   ```bash
+   bash -n scripts/start_trader.sh
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m pytest -o cache_dir=/tmp/velocity-pytest-cache tests/test_start_trader_supervisor.py -q
+   ```

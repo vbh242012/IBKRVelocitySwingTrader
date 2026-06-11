@@ -66,21 +66,111 @@ mkdir -p logs "${VELOCITY_BASE_DIR}/logs"
 
 # Optional process supervision.  The Python engine already handles IB API
 # reconnects and can auto-start IBC/Gateway when the API port is down.  This
-# shell loop covers the different failure class: the Python process itself exits
-# because of an unhandled runtime/environment failure.  Keep it enabled for
-# unattended paper/live runs; disable only when debugging in the foreground.
+# shell supervisor covers two different failure classes:
+#   1. auto_trader.py exits because of an unhandled runtime/environment failure.
+#   2. auto_trader.py stays alive but stops writing fresh dashboard heartbeat
+#      data, which makes the dashboard look frozen while the process is stuck.
+# Keep it enabled for unattended paper/live runs; disable only when debugging in
+# the foreground.
 AUTO_RESTART="${VELOCITY_TRADER_AUTO_RESTART:-1}"
 RESTART_DELAY_SEC="${VELOCITY_TRADER_RESTART_DELAY_SEC:-30}"
 DISABLE_RESTART_FILE="${VELOCITY_BASE_DIR}/DISABLE_AUTO_RESTART"
+
+# Heartbeat watchdog.  The engine writes dashboard_data.json every cycle.  If
+# that file stops moving for too long after startup grace, the supervisor kills
+# the child and lets the normal restart path bring it back.  Defaults are
+# deliberately conservative so a slow IBKR scanner cycle is not mistaken for a
+# hang.
+WATCHDOG_ENABLED="${VELOCITY_TRADER_WATCHDOG_ENABLED:-1}"
+WATCHDOG_HEARTBEAT_FILE="${VELOCITY_TRADER_HEARTBEAT_FILE:-${VELOCITY_BASE_DIR}/dashboard_data.json}"
+WATCHDOG_STALE_SEC="${VELOCITY_TRADER_STALE_SEC:-600}"
+WATCHDOG_INTERVAL_SEC="${VELOCITY_TRADER_WATCHDOG_INTERVAL_SEC:-15}"
+WATCHDOG_STARTUP_GRACE_SEC="${VELOCITY_TRADER_WATCHDOG_STARTUP_GRACE_SEC:-900}"
 
 case "${AUTO_RESTART}" in
   1|true|TRUE|yes|YES|on|ON) AUTO_RESTART=1 ;;
   *) AUTO_RESTART=0 ;;
 esac
 
+case "${WATCHDOG_ENABLED}" in
+  1|true|TRUE|yes|YES|on|ON) WATCHDOG_ENABLED=1 ;;
+  *) WATCHDOG_ENABLED=0 ;;
+esac
+
+positive_int_or_default() {
+  # Accept only positive integers for timing knobs.  Bad local env values fall
+  # back to safe defaults instead of breaking the supervisor.
+  local value="$1"
+  local default="$2"
+  if [[ "${value}" =~ ^[0-9]+$ ]] && (( value > 0 )); then
+    printf '%s\n' "${value}"
+  else
+    printf '%s\n' "${default}"
+  fi
+}
+
+RESTART_DELAY_SEC="$(positive_int_or_default "${RESTART_DELAY_SEC}" 30)"
+WATCHDOG_STALE_SEC="$(positive_int_or_default "${WATCHDOG_STALE_SEC}" 600)"
+WATCHDOG_INTERVAL_SEC="$(positive_int_or_default "${WATCHDOG_INTERVAL_SEC}" 15)"
+WATCHDOG_STARTUP_GRACE_SEC="$(positive_int_or_default "${WATCHDOG_STARTUP_GRACE_SEC}" 900)"
+
 et_now() {
   # Keep supervisor stderr timestamps aligned with the trading engine logs.
   TZ=America/New_York date '+%Y-%m-%dT%H:%M:%S%z %Z'
+}
+
+child_is_running() {
+  # `kill -0` is true for zombies, so include process state before deciding that
+  # the child is genuinely still alive.
+  [[ -n "${child_pid}" ]] || return 1
+  kill -0 "${child_pid}" 2>/dev/null || return 1
+  local child_stat
+  child_stat="$(ps -o stat= -p "${child_pid}" 2>/dev/null || true)"
+  [[ -n "${child_stat}" && "${child_stat}" != Z* ]]
+}
+
+file_mtime_epoch() {
+  local path="$1"
+  [[ -f "${path}" ]] || return 1
+  stat -c '%Y' "${path}" 2>/dev/null
+}
+
+stop_stale_child_if_needed() {
+  local child_started_epoch="$1"
+  [[ "${WATCHDOG_ENABLED}" == "1" ]] || return 1
+  child_is_running || return 1
+
+  local now_epoch runtime_sec heartbeat_mtime age_sec
+  now_epoch="$(date +%s)"
+  runtime_sec=$((now_epoch - child_started_epoch))
+  if (( runtime_sec < WATCHDOG_STARTUP_GRACE_SEC )); then
+    return 1
+  fi
+
+  heartbeat_mtime="$(file_mtime_epoch "${WATCHDOG_HEARTBEAT_FILE}" || true)"
+  if [[ -z "${heartbeat_mtime}" ]]; then
+    age_sec="${runtime_sec}"
+  else
+    age_sec=$((now_epoch - heartbeat_mtime))
+  fi
+
+  if (( age_sec <= WATCHDOG_STALE_SEC )); then
+    return 1
+  fi
+
+  echo "$(et_now) watchdog: ${WATCHDOG_HEARTBEAT_FILE} stale for ${age_sec}s; terminating trader pid ${child_pid}." >&2
+  kill "${child_pid}" 2>/dev/null || return 0
+
+  # Give Python a short chance to release IB subscriptions and the instance
+  # lock.  Escalate only if it refuses to exit.
+  for _ in {1..20}; do
+    child_is_running || return 0
+    sleep 1
+  done
+
+  echo "$(et_now) watchdog: trader pid ${child_pid} ignored SIGTERM; sending SIGKILL." >&2
+  kill -KILL "${child_pid}" 2>/dev/null || true
+  return 0
 }
 
 if [[ "${AUTO_RESTART}" == "0" ]]; then
@@ -111,6 +201,17 @@ while true; do
 
   .venv/bin/python auto_trader.py &
   child_pid="$!"
+  child_started_epoch="$(date +%s)"
+
+  while child_is_running; do
+    if [[ -f "${DISABLE_RESTART_FILE}" ]]; then
+      echo "$(et_now) auto-restart disabled by ${DISABLE_RESTART_FILE}; stopping trader." >&2
+      stop_child
+    fi
+    stop_stale_child_if_needed "${child_started_epoch}" || true
+    sleep "${WATCHDOG_INTERVAL_SEC}"
+  done
+
   # `wait` returns the child's exit status.  With `set -e`, a non-zero child
   # status would otherwise terminate this supervisor before it can restart.
   set +e

@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import copy
 import shutil
@@ -17,6 +18,8 @@ import pytz
 from ib_async import IB, Index, Stock, MarketOrder, Order, util
 
 from src.config import (
+    ANALYST_RATING_EXIT_ENABLED,
+    ANALYST_RATING_SELL_THRESHOLD,
     BASE_DIR, STATE_FILE, DASHBOARD_FILE, EQUITY_HIST_FILE, READINESS_FILE,
     HEALTH_REPORT_FILE, HALT_FILE, FORCE_EXIT_FILE,
     LOG_DIR, LOG_FILE,
@@ -27,49 +30,59 @@ from src.config import (
     TRADING_MODE, LIVE_TRADING_ACK, LIVE_TRADING_ACK_PHRASE, LIVE_IB_PORTS, PAPER_IB_PORTS,
     ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
-    VIX_THRESHOLD, PROFIT_MIN_THRESHOLD, BREAK_EVEN_PCT,
+    VIX_THRESHOLD, BREAK_EVEN_PCT,
+    TIERED_PROFIT_EXIT_ENABLED, TIERED_PROFIT_EXIT_R_LEVELS,
     ENTRY_START, ENTRY_END, STOP_ACTIVATION_TIME, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
     POST_OPEN_AUDIT_TIME, PREMARKET_READINESS_TIME, POST_CLOSE_MAINTENANCE_TIME,
     MARKET_CLOSE_TIME, ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
-    RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW, RSI_THRESHOLD,
-    ORB_LOOKBACK, ORB_BAR_SIZE, DAILY_LOOKBACK, DAILY_BAR_SIZE,
-    SCAN_MIN_DOLLAR_VOL,
+    RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW,
+    DAILY_LOOKBACK, DAILY_BAR_SIZE,
     SCAN_INTERVAL, ERROR_WAIT,
     LOG_BACKUP_COUNT,
     EQUITY_RETRY_INTERVAL,
     TICKER_BLOCKLIST,
-    GAP_MAX_PCT,
     MAX_DAILY_LOSS_PCT,
-    RSI_MIN_DELTA,
-    DAY_RANGE_LOCATION_MIN,
-    INTRADAY_GAIN_MIN,
     ATR_PCT_MAX,
     HARD_STOP_PCT,
     RISK_PER_TRADE_PCT,
     BEAR_PHASE_TRADING_ENABLED,
     BEAR_PHASE_RISK_MULT,
     BEAR_PHASE_DOLLAR_VOL_MULT,
-    BEAR_RVOL_MIN,
-    BEAR_VCP_RATIO,
-    BEAR_RSI_THRESHOLD,
-    BEAR_RSI_MIN_DELTA,
-    BEAR_GAP_MAX_PCT,
     FRIDAY_CLOSE_HOUR,
     FRIDAY_MIN_PROFIT_PCT,
     FRIDAY_ENTRY_CUTOFF_TIME,
     EOD_EXIT_TIME,
-    MIN_CANDLES, VCP_RATIO, BREAKOUT_PCT, RVOL_MIN, SPREAD_MAX_PCT, SCORING_MODEL,
-    SCAN_MIN_PRICE,
+    EOD_HOLD_MIN_PROFIT_PCT,
+    EOD_HOLD_DAY_RANGE_LOCATION_MIN,
+    EOD_HOLD_RELATIVE_STRENGTH_MIN,
+    EOD_HOLD_REQUIRE_STOP_CONFIRMED,
+    MIN_CANDLES, SPREAD_MAX_PCT,
+    STRATEGY_PROFILE,
+    APP_SCANNER_SOURCE, APP_SCANNER_BATCH_SIZE, APP_SCANNER_MAX_SYMBOLS,
+    APP_PREFILTER_ENABLED, APP_PREFILTER_START_TIME, APP_PREFILTER_CACHE_FILE,
+    APP_PREFILTER_HISTORY_SLEEP_SEC, APP_PREFILTER_PROGRESS_EVERY,
+    APP_PREFILTER_STOP_AT_ENTRY_START,
     CORR_MAX, MAX_SECTOR_COUNT, SMA200_SLOPE_LOOKBACK,
     ENTRY_REPRICE_MAX_AGE_SEC, ENTRY_MAX_PRICE_DRIFT_PCT,
     ENTRY_LIMIT_ASK_CUSHION_PCT, ENTRY_LIMIT_MIN_TICK, ENTRY_LIMIT_MAX_OVER_MARKET_PCT,
     CHANDELIER_PERIOD, CHANDELIER_MULT,
     PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC, PROTECTIVE_STOP_CONFIRM_POLL_SEC,
 )
+from src.analyst_ratings import AnalystRatingProvider
 from src.ib_gateway import ensure_ib_gateway_ready
 from src.indicators import apply_all
-from src.scanner import build_momentum_scanners
+from src.scanner import (
+    build_momentum_scanner_filter_options,
+    build_momentum_scanners,
+    load_application_symbol_universe,
+)
 from src.scoring import score_candidate, volume_pace_from_intraday
+from src.strategy_profiles import (
+    evaluate_entry_rules,
+    get_strategy_profile,
+    indicator_sleeve_label,
+    select_entry_strategy,
+)
 
 os.makedirs(BASE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR,  exist_ok=True)
@@ -173,6 +186,8 @@ class VelocityEngine:
     def __init__(self):
         self.ib           = IB()
         self.state        = self.load_state()
+        self._strategy_profile = get_strategy_profile(STRATEGY_PROFILE)
+        self._analyst_provider = AnalystRatingProvider(allow_remote=True)
 
         # Metrics written to dashboard_data.json after every cycle
         self._last_equity:      float            = 0.0
@@ -186,6 +201,13 @@ class VelocityEngine:
         self._last_vix_failure_ts: float        = 0.0
         self._last_scan_ts:     Optional[str]   = None
         self._next_scan_dt:     Optional[str]   = None   # ISO string for the web UI
+        self._scanner_universe_symbols: list[str] = []
+        self._scanner_universe_offset: int = 0
+        self._scanner_universe_date: Optional[str] = None
+        self._prefilter_date: Optional[str] = None
+        self._prefilter_status: str = "not_started"
+        self._prefilter_candidates: list[str] = []
+        self._prefilter_stats: dict = {}
         self._historical_data_health: Dict[str, dict] = {}
 
         # Daily loss circuit breaker
@@ -211,9 +233,10 @@ class VelocityEngine:
         # Last trading date the post-open protective audit was run.
         self._last_post_open_audit_date: Optional[str] = None
         # Last trading dates for non-trading operational jobs.
+        self._last_premarket_prefilter_date: Optional[str] = None
         self._last_premarket_readiness_date: Optional[str] = None
         self._last_post_close_maintenance_date: Optional[str] = None
-        # Daily EOD profit cleanup: track the date so the exit fires once per trading day.
+        # Daily EOD quality cleanup: track the date so the exit fires once per trading day.
         self._last_eod_exit_date: Optional[str] = None
         # Avoid deleting state on one transient/partial IBKR positions snapshot.
         self._missing_position_counts: Dict[str, int] = {}
@@ -265,6 +288,8 @@ class VelocityEngine:
         # 10147: "OrderId not found" — same cascade as 135.
         SILENT = {135, 162, 202, 2104, 2106, 2107, 2108, 2119, 2158, 10147, 10167}
         if errorCode in SILENT:
+            return
+        if errorCode == 165 and "items retrieved" in str(errorString).lower():
             return
         self._metric_inc('ib_errors')
         self._metric_inc('ib_error_codes', subkey=str(errorCode))
@@ -630,6 +655,11 @@ class VelocityEngine:
             'scanner_candidates': 0,
             'scanner_skipped_no_slots': 0,
             'scanner_skipped_friday_cutoff': 0,
+            'prefilter_runs': 0,
+            'prefilter_processed': 0,
+            'prefilter_candidates': 0,
+            'prefilter_rejected': 0,
+            'prefilter_failures': 0,
             'protective_stop_confirmed': 0,
             'protective_stop_unconfirmed': 0,
             'protective_stop_rebuilt': 0,
@@ -735,6 +765,16 @@ class VelocityEngine:
             'scanner': {
                 'last_scan': getattr(self, '_last_scan_ts', None),
                 'next_scan': getattr(self, '_next_scan_dt', None),
+                'source': self._normalise_app_scanner_source(APP_SCANNER_SOURCE),
+                'universe_size': len(getattr(self, '_scanner_universe_symbols', []) or []),
+                'universe_offset': int(getattr(self, '_scanner_universe_offset', 0) or 0),
+                'universe_batch_size': int(APP_SCANNER_BATCH_SIZE or 0),
+                'prefilter': {
+                    'date': getattr(self, '_prefilter_date', None),
+                    'status': getattr(self, '_prefilter_status', 'not_started'),
+                    'candidates': len(getattr(self, '_prefilter_candidates', []) or []),
+                    'stats': copy.deepcopy(getattr(self, '_prefilter_stats', {}) or {}),
+                },
             },
             'risk': {
                 'unconfirmed_protection_symbols': unconfirmed,
@@ -913,28 +953,212 @@ class VelocityEngine:
 
     def _fresh_market_price(self, sym: str) -> Optional[float]:
         """Fetch a fresh market price from IBKR for exit/risk decisions."""
+        snapshot = self._fresh_market_snapshot(sym)
+        return snapshot.get('price') if snapshot else None
+
+    def _fresh_market_snapshot(self, sym: str) -> Optional[Dict[str, Optional[float]]]:
+        """Fetch a fresh IBKR quote snapshot with fields needed by exit rules."""
         try:
             contract = self._stock_contract(sym)
             tickers = self.ib.reqTickers(contract)
             if not tickers:
                 return None
             ticker = tickers[0]
+            price = None
             for candidate in (
                 ticker.marketPrice(),
                 getattr(ticker, 'last', None),
             ):
                 price = self._coerce_positive_price(candidate)
                 if price is not None:
-                    return price
+                    break
             bid = self._coerce_positive_price(getattr(ticker, 'bid', None))
             ask = self._coerce_positive_price(getattr(ticker, 'ask', None))
-            if bid is not None and ask is not None and ask >= bid:
-                return (bid + ask) / 2.0
-            if bid is not None:
-                return bid
+            if price is None and bid is not None and ask is not None and ask >= bid:
+                price = (bid + ask) / 2.0
+            if price is None and bid is not None:
+                price = bid
+            if price is None:
+                return None
+
+            day_open = self._coerce_positive_price(getattr(ticker, 'open', None))
+            day_high = self._coerce_positive_price(getattr(ticker, 'high', None))
+            day_low  = self._coerce_positive_price(getattr(ticker, 'low', None))
+            vwap     = self._coerce_positive_price(getattr(ticker, 'vwap', None))
+            if day_high is not None:
+                day_high = max(day_high, price)
+            if day_low is not None:
+                day_low = min(day_low, price)
+            return {
+                'price': price,
+                'bid': bid,
+                'ask': ask,
+                'open': day_open,
+                'high': day_high,
+                'low': day_low,
+                'vwap': vwap,
+            }
         except Exception as e:
-            logger.warning(f"PRICE {sym}: fresh market price unavailable ({e})")
+            logger.warning(f"PRICE {sym}: fresh market snapshot unavailable ({e})")
         return None
+
+    def _fresh_spy_intraday_return(self, today_str: str) -> Optional[float]:
+        """Return SPY's intraday return from IBKR, cached per EOD cycle."""
+        cached = getattr(self, '_eod_spy_return_cache', None)
+        if cached and cached.get('date') == today_str:
+            return cached.get('return')
+
+        snapshot = self._fresh_market_snapshot('SPY')
+        spy_ret = None
+        if snapshot:
+            price = snapshot.get('price')
+            day_open = snapshot.get('open')
+            if price is not None and day_open is not None and day_open > 0:
+                spy_ret = (price - day_open) / day_open
+        self._eod_spy_return_cache = {'date': today_str, 'return': spy_ret}
+        if spy_ret is None:
+            logger.warning("EOD QUALITY: SPY intraday return unavailable; hold test will fail closed.")
+        return spy_ret
+
+    def _eod_quality_hold_passes(
+        self,
+        sym: str,
+        data: dict,
+        snapshot: Dict[str, Optional[float]],
+        entry_price: float,
+        today_str: str,
+    ) -> Tuple[bool, str]:
+        """Quality gate for carrying a position overnight after EOD cleanup time."""
+        cur = snapshot.get('price')
+        if cur is None or entry_price <= 0:
+            return False, "fresh price unavailable"
+
+        profit = (cur - entry_price) / entry_price
+        if profit < EOD_HOLD_MIN_PROFIT_PCT:
+            return False, (
+                f"profit {profit*100:.2f}% < "
+                f"{EOD_HOLD_MIN_PROFIT_PCT*100:.2f}%"
+            )
+
+        vwap = snapshot.get('vwap')
+        above_vwap_or_entry = (
+            (vwap is not None and cur >= vwap)
+            or cur > entry_price
+        )
+        if not above_vwap_or_entry:
+            ref = f"VWAP ${vwap:.2f}" if vwap is not None else f"entry ${entry_price:.2f}"
+            return False, f"price ${cur:.2f} below {ref}"
+
+        day_high = snapshot.get('high') or self._coerce_positive_price(data.get('day_high'))
+        day_low = snapshot.get('low') or self._coerce_positive_price(data.get('day_low'))
+        day_loc = None
+        if day_high is not None and day_low is not None and day_high > day_low:
+            day_loc = (cur - day_low) / (day_high - day_low)
+        if day_loc is None or day_loc < EOD_HOLD_DAY_RANGE_LOCATION_MIN:
+            shown = "unavailable" if day_loc is None else f"{day_loc:.2f}"
+            return False, (
+                f"day-range location {shown} < "
+                f"{EOD_HOLD_DAY_RANGE_LOCATION_MIN:.2f}"
+            )
+
+        stock_open = (
+            snapshot.get('open')
+            or self._coerce_positive_price(data.get('day_open'))
+            or self._coerce_positive_price(data.get('entry_day_open'))
+        )
+        if stock_open is None or stock_open <= 0:
+            return False, "stock intraday open unavailable"
+        stock_ret = (cur - stock_open) / stock_open
+        spy_ret = self._fresh_spy_intraday_return(today_str)
+        if spy_ret is None:
+            return False, "SPY intraday return unavailable"
+        rel_strength = stock_ret - spy_ret
+        if rel_strength < EOD_HOLD_RELATIVE_STRENGTH_MIN:
+            return False, (
+                f"relative strength {rel_strength*100:.2f}% < "
+                f"{EOD_HOLD_RELATIVE_STRENGTH_MIN*100:.2f}%"
+            )
+
+        if EOD_HOLD_REQUIRE_STOP_CONFIRMED:
+            protection_status = str(data.get('protection_status', '') or '').lower()
+            if protection_status != 'confirmed':
+                return False, f"protective stop not confirmed ({protection_status or 'missing'})"
+
+        if ANALYST_RATING_EXIT_ENABLED:
+            rating_score = self._analyst_context(sym).get(
+                'analyst_rating_score',
+                data.get('analyst_rating_score'),
+            )
+            try:
+                rating_score = float(rating_score)
+            except (TypeError, ValueError):
+                rating_score = None
+            if rating_score is not None and np.isfinite(rating_score):
+                data['analyst_rating_score'] = round(rating_score, 4)
+                if rating_score <= ANALYST_RATING_SELL_THRESHOLD:
+                    return False, (
+                        f"analyst rating score {rating_score:+.2f} <= "
+                        f"{ANALYST_RATING_SELL_THRESHOLD:+.2f}"
+                    )
+
+        return True, (
+            f"profit={profit*100:.2f}% dayLoc={day_loc:.2f} "
+            f"RS={rel_strength*100:.2f}% stop={data.get('protection_status', 'unknown')}"
+        )
+
+    def _analyst_exit_required(self, sym: str, data: dict) -> tuple[bool, str]:
+        """Return True when current analyst consensus is bearish enough to exit."""
+        if not ANALYST_RATING_EXIT_ENABLED:
+            return False, "disabled"
+
+        rating_score = self._analyst_context(sym).get(
+            'analyst_rating_score',
+            data.get('analyst_rating_score'),
+        )
+        try:
+            rating_score = float(rating_score)
+        except (TypeError, ValueError):
+            return False, "unavailable"
+        if not np.isfinite(rating_score):
+            return False, "unavailable"
+
+        data['analyst_rating_score'] = round(rating_score, 4)
+        if rating_score <= ANALYST_RATING_SELL_THRESHOLD:
+            return True, (
+                f"analyst rating score {rating_score:+.2f} <= "
+                f"{ANALYST_RATING_SELL_THRESHOLD:+.2f}"
+            )
+        return False, f"analyst rating score {rating_score:+.2f}"
+
+    def _indicator_strategy_exit_required(self, sym: str, data: dict) -> tuple[bool, str]:
+        strategy = str(data.get('entry_strategy') or '').strip().lower()
+        if strategy not in {'ma_cross', 'bollinger_reversion', 'psar_flip'}:
+            return False, "not an indicator-swing position"
+
+        try:
+            contract = self._stock_contract(sym)
+            bars = self.ib.reqHistoricalData(
+                contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
+            )
+            if not isinstance(bars, list) or len(bars) < MIN_CANDLES:
+                return False, "insufficient daily bars"
+            df = apply_all(
+                util.df(bars),
+                RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW,
+                SMA200_SLOPE_LOOKBACK, CHANDELIER_PERIOD,
+            )
+            last = df.iloc[-1]
+        except Exception as exc:
+            logger.warning(f"STRATEGY EXIT: {sym} indicator check failed: {exc}")
+            return False, "indicator check unavailable"
+
+        if strategy == "ma_cross" and bool(last.get('MA_BEAR_CROSS', False)):
+            return True, "EMA20 crossed below SMA50"
+        if strategy == "bollinger_reversion" and bool(last.get('BB_ABOVE_UPPER_2', False)):
+            return True, "two closes above upper Bollinger Band"
+        if strategy == "psar_flip" and bool(last.get('PSAR_BEAR_3', False)):
+            return True, "three PSAR dots above price"
+        return False, "strategy exit not triggered"
 
     # ── State persistence ──────────────────────────────────────────────────────
     def load_state(self):
@@ -988,6 +1212,14 @@ class VelocityEngine:
             "connected":    connected,
             "last_scan":    self._last_scan_ts,
             "next_scan":    self._next_scan_dt,
+            "scanner_source": self._normalise_app_scanner_source(APP_SCANNER_SOURCE),
+            "scanner_universe_size": len(getattr(self, '_scanner_universe_symbols', []) or []),
+            "scanner_universe_offset": int(getattr(self, '_scanner_universe_offset', 0) or 0),
+            "scanner_universe_batch_size": int(APP_SCANNER_BATCH_SIZE or 0),
+            "scanner_prefilter_date": getattr(self, '_prefilter_date', None),
+            "scanner_prefilter_status": getattr(self, '_prefilter_status', 'not_started'),
+            "scanner_prefilter_candidates": len(getattr(self, '_prefilter_candidates', []) or []),
+            "scanner_prefilter_stats": copy.deepcopy(getattr(self, '_prefilter_stats', {}) or {}),
             "last_updated": now.isoformat(),
         }
         try:
@@ -1186,7 +1418,7 @@ class VelocityEngine:
 
         Phase 2 (timed): sleep until PRE_ENTRY_SYNC_TIME (09:15 ET) so the
         definitive position re-sync and chandelier stop audit happen with the
-        morning IBKR position/order snapshot before the 10:00 AM entry window opens.
+        morning IBKR position/order snapshot before the configured entry window opens.
         If the engine starts after the sync time (intraday restart, evening),
         Phase 2 runs immediately with no sleep.
 
@@ -1270,7 +1502,7 @@ class VelocityEngine:
     def _wait_for_pre_entry_sync(self):
         """
         Sleep until PRE_ENTRY_SYNC_TIME (default 09:15 ET) so the definitive
-        position re-sync and stop audit run before the 10:00 AM entry window.
+        position re-sync and stop audit run before the configured entry window.
 
         If the engine starts after the sync time (intraday restart, evening run),
         the method returns immediately without sleeping.
@@ -1295,7 +1527,7 @@ class VelocityEngine:
         self._safe_sleep(wait_s, context="INIT pre-entry wait")
 
     def _entry_good_after_time(self) -> str:
-        """Return a 10:00 ET activation string only while that time is still future."""
+        """Return an entry-window activation string only while that time is still future."""
         now_ny = datetime.now(_TZ_NY)
         entry_gate = now_ny.replace(
             hour=ENTRY_START[0],
@@ -1627,7 +1859,7 @@ class VelocityEngine:
         3. If no TRAIL SELL remains after cancellations, fetch ATR(22) from daily bars
            and place a new chandelier TRAIL SELL (GTC, transmit=True).
 
-        The entry trading window (10:00–15:30 ET) applies only to new BUY entries.
+        The configured entry trading window applies only to new BUY entries.
         Stop orders for existing positions are placed immediately regardless of time,
         but when the audit runs before the configured stop gate their activation is
         delayed with goodAfterTime. After placeOrder() we wait 2 s and verify the
@@ -2161,6 +2393,20 @@ class VelocityEngine:
         hhmm = (now_ny.hour, now_ny.minute)
         ran = False
 
+        if (APP_PREFILTER_ENABLED
+                and APP_PREFILTER_START_TIME <= hhmm < ENTRY_START
+                and getattr(self, '_last_premarket_prefilter_date', None) != today):
+            try:
+                self._run_premarket_universe_prefilter()
+                self._last_premarket_prefilter_date = today
+                ran = True
+            except Exception as e:
+                self._metric_inc('prefilter_failures')
+                self._alert(
+                    "ERROR",
+                    f"OFFHOURS: premarket universe prefilter failed: {e}",
+                )
+
         if (PREMARKET_READINESS_TIME <= hhmm < ENTRY_START
                 and getattr(self, '_last_premarket_readiness_date', None) != today):
             try:
@@ -2188,12 +2434,13 @@ class VelocityEngine:
         return ran
 
     # ── Regime / sector / correlation helpers ──────────────────────────────────
-    def _fetch_spy_trend(self) -> bool:
-        """True when SPY price > SMA50 > SMA200 and SMA200 is rising."""
-        tz_ny  = pytz.timezone('US/Eastern')
-        today  = datetime.now(tz_ny).strftime('%Y-%m-%d')
-        if self._spy_cache.get('date') == today:
-            return self._spy_cache['trend']
+    def _fetch_spy_daily_frame(self) -> Optional[pd.DataFrame]:
+        """Return cached SPY daily bars with MA context for regime/RS checks."""
+        tz_ny = pytz.timezone('US/Eastern')
+        today = datetime.now(tz_ny).strftime('%Y-%m-%d')
+        cached = self._spy_cache.get('df') if self._spy_cache.get('date') == today else None
+        if cached is not None:
+            return cached
         try:
             if 'SPY' not in self._contract_cache:
                 self._contract_cache['SPY'] = self._stock_contract('SPY')
@@ -2201,24 +2448,97 @@ class VelocityEngine:
                 self._contract_cache['SPY'], '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
             )
             if not isinstance(bars, list) or len(bars) < MA_SLOW + SMA200_SLOPE_LOOKBACK:
-                logger.warning("SPY regime check has insufficient history — blocking new entries")
-                self._spy_cache = {'date': today, 'trend': False}
-                return False
+                logger.warning("SPY context has insufficient history — blocking new entries")
+                self._spy_cache = {'date': today, 'trend': False, 'df': None}
+                return None
             df = util.df(bars)
-            df['MA50']  = df['close'].rolling(50).mean()
+            df['MA50'] = df['close'].rolling(50).mean()
             df['MA200'] = df['close'].rolling(200).mean()
             df['SMA200_SLOPE'] = df['MA200'] - df['MA200'].shift(SMA200_SLOPE_LOOKBACK)
-            last  = df.iloc[-1]
+            last = df.iloc[-1]
             trend = bool(
                 last['close'] > last['MA50']
                 and last['MA50'] > last['MA200']
                 and last['SMA200_SLOPE'] > 0
             )
-            self._spy_cache = {'date': today, 'trend': trend}
-            return trend
+            self._spy_cache = {'date': today, 'trend': trend, 'df': df}
+            return df
         except Exception as e:
-            logger.warning(f"SPY regime check failed: {e} — blocking new entries")
+            logger.warning(f"SPY context fetch failed: {e} — blocking new entries")
+            self._spy_cache = {'date': today, 'trend': False, 'df': None}
+            return None
+
+    def _fetch_spy_trend(self) -> bool:
+        """True when SPY price > SMA50 > SMA200 and SMA200 is rising."""
+        tz_ny  = pytz.timezone('US/Eastern')
+        today  = datetime.now(tz_ny).strftime('%Y-%m-%d')
+        if self._spy_cache.get('date') == today:
+            return self._spy_cache['trend']
+        df = self._fetch_spy_daily_frame()
+        return bool(self._spy_cache.get('trend')) if df is not None else False
+
+    @staticmethod
+    def _return_from_daily(df: pd.DataFrame, latest_price: float, bars_back: int) -> float:
+        if df is None or len(df) <= bars_back or latest_price <= 0:
+            return float('nan')
+        try:
+            ref = float(df['close'].iloc[-bars_back])
+        except Exception:
+            return float('nan')
+        return latest_price / ref - 1 if ref > 0 else float('nan')
+
+    @staticmethod
+    def _weekly_uptrend_from_daily(df: pd.DataFrame, latest_price: float) -> bool:
+        if df is None or df.empty or latest_price <= 0:
             return False
+        try:
+            d = df.copy()
+            if 'date' in d.columns:
+                d = d.set_index(pd.to_datetime(d['date']))
+            weekly = d['close'].resample('W-FRI').last().dropna()
+            if len(weekly) < 30:
+                return False
+            ma10w = weekly.rolling(10).mean().iloc[-1]
+            ma30w = weekly.rolling(30).mean().iloc[-1]
+            ret_13w = latest_price / float(weekly.iloc[-13]) - 1 if len(weekly) > 13 else float('nan')
+            return bool(
+                latest_price > ma10w
+                and ma10w > ma30w
+                and np.isfinite(ret_13w)
+                and ret_13w > 0
+            )
+        except Exception:
+            return False
+
+    def _build_swing_context(self, df_daily: pd.DataFrame, live_price: float) -> dict:
+        spy_df = self._fetch_spy_daily_frame()
+        ret_63d = self._return_from_daily(df_daily, live_price, 63)
+        ret_126d = self._return_from_daily(df_daily, live_price, 126)
+        ret_13w = ret_63d
+        ret_26w = ret_126d
+        spy_ret_63d = self._return_from_daily(spy_df, float(spy_df['close'].iloc[-1]), 63) if spy_df is not None and not spy_df.empty else float('nan')
+        spy_ret_126d = self._return_from_daily(spy_df, float(spy_df['close'].iloc[-1]), 126) if spy_df is not None and not spy_df.empty else float('nan')
+        high_52w = float(df_daily['high'].tail(252).max()) if df_daily is not None and len(df_daily) else float('nan')
+        return {
+            'return_13w': ret_13w,
+            'return_26w': ret_26w,
+            'relative_strength_63d': (
+                ret_63d - spy_ret_63d if np.isfinite(ret_63d) and np.isfinite(spy_ret_63d) else float('nan')
+            ),
+            'relative_strength_126d': (
+                ret_126d - spy_ret_126d if np.isfinite(ret_126d) and np.isfinite(spy_ret_126d) else float('nan')
+            ),
+            'weekly_uptrend': self._weekly_uptrend_from_daily(df_daily, live_price),
+            'high_52w': high_52w,
+            'price_vs_52w_high': live_price / high_52w if high_52w > 0 else float('nan'),
+        }
+
+    def _analyst_context(self, symbol: str) -> dict:
+        provider = getattr(self, '_analyst_provider', None)
+        if provider is None:
+            self._analyst_provider = AnalystRatingProvider(allow_remote=True)
+            provider = self._analyst_provider
+        return provider.get(symbol).as_context()
 
     def _get_sector(self, symbol: str, contract) -> str:
         """Return IB industry string for symbol.  Cached; returns 'Unknown' on error."""
@@ -2357,13 +2677,36 @@ class VelocityEngine:
         }
 
     # ── Scanner ────────────────────────────────────────────────────────────────
-    def get_institutional_scan(self):
-        """Dynamic discovery of institutional momentum from every unique IBKR scanner hit."""
+    @staticmethod
+    def _normalise_app_scanner_source(source: str) -> str:
+        value = str(source or "").strip().lower()
+        if value in {"ib", "ibkr", "broker"}:
+            return "ibkr"
+        if value in {"all", "full", "symbols", "symbol_universe", "universe"}:
+            return "universe"
+        if value in {"hybrid", "mixed", "both"}:
+            return "hybrid"
+        return "hybrid"
+
+    @staticmethod
+    def _dedupe_symbols(symbols) -> list:
+        seen: set = set()
+        out: list = []
+        for raw in symbols or []:
+            sym = str(raw or "").strip().upper()
+            if sym and sym not in seen:
+                seen.add(sym)
+                out.append(sym)
+        return out
+
+    def _ibkr_scanner_symbols(self) -> list:
+        """Dynamic discovery of institutional momentum from IBKR scanner hits."""
         seen: set = set()
         symbols: list = []
+        filter_options = build_momentum_scanner_filter_options()
         for sub in build_momentum_scanners():
             try:
-                scan = self.ib.reqScannerData(sub)
+                scan = self.ib.reqScannerData(sub, [], filter_options)
                 for item in scan:
                     sym = item.contractDetails.contract.symbol
                     if sym not in seen:
@@ -2375,6 +2718,462 @@ class VelocityEngine:
                 )
         if not symbols:
             logger.warning("SCAN: all scanner queries failed or returned no candidates")
+        return symbols
+
+    def _application_universe_symbols(self) -> list:
+        tz_ny = pytz.timezone('US/Eastern')
+        today = datetime.now(tz_ny).strftime('%Y-%m-%d')
+        cached_day = getattr(self, '_scanner_universe_date', None)
+        cached_symbols = getattr(self, '_scanner_universe_symbols', None)
+        if cached_day != today or not cached_symbols:
+            symbols = load_application_symbol_universe()
+            max_symbols = int(APP_SCANNER_MAX_SYMBOLS or 0)
+            if max_symbols > 0:
+                symbols = symbols[:max_symbols]
+            self._scanner_universe_symbols = self._dedupe_symbols(symbols)
+            self._scanner_universe_offset = 0
+            self._scanner_universe_date = today
+            logger.info(
+                f"SCAN SOURCE: loaded application universe "
+                f"({len(self._scanner_universe_symbols)} symbols)"
+            )
+        return list(getattr(self, '_scanner_universe_symbols', []) or [])
+
+    def _next_universe_batch(self) -> list:
+        symbols = self._application_universe_symbols()
+        if not symbols:
+            return []
+        batch_size = int(APP_SCANNER_BATCH_SIZE or 0)
+        if batch_size <= 0 or batch_size >= len(symbols):
+            self._scanner_universe_offset = 0
+            return symbols
+
+        start = int(getattr(self, '_scanner_universe_offset', 0) or 0) % len(symbols)
+        end = start + batch_size
+        if end <= len(symbols):
+            batch = symbols[start:end]
+        else:
+            batch = symbols[start:] + symbols[: end - len(symbols)]
+        self._scanner_universe_offset = end % len(symbols)
+        logger.info(
+            f"SCAN SOURCE: universe batch {len(batch)}/{len(symbols)} "
+            f"offset={start}->{self._scanner_universe_offset}"
+        )
+        return batch
+
+    def _read_prefilter_cache(self, today: str, profile_name: str) -> Optional[dict]:
+        try:
+            with open(APP_PREFILTER_CACHE_FILE, "r") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("date") != today or payload.get("profile") != profile_name:
+            return None
+        candidates = payload.get("candidates", [])
+        if not isinstance(candidates, list):
+            return None
+        self._prefilter_date = today
+        self._prefilter_status = str(payload.get("status") or "complete")
+        self._prefilter_candidates = self._dedupe_symbols(candidates)
+        self._prefilter_stats = dict(payload.get("stats") or {})
+        if self._prefilter_status == "complete":
+            self._last_premarket_prefilter_date = today
+        return payload
+
+    def _write_prefilter_cache(self, payload: dict) -> None:
+        os.makedirs(os.path.dirname(APP_PREFILTER_CACHE_FILE) or ".", exist_ok=True)
+        tmp = f"{APP_PREFILTER_CACHE_FILE}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        os.replace(tmp, APP_PREFILTER_CACHE_FILE)
+
+    def _prefilter_candidates_for_today(self) -> Optional[list]:
+        if not APP_PREFILTER_ENABLED:
+            return None
+        today = datetime.now(_TZ_NY).strftime('%Y-%m-%d')
+        profile = getattr(self, "_strategy_profile", get_strategy_profile(STRATEGY_PROFILE))
+        if getattr(self, '_prefilter_date', None) == today and getattr(self, '_prefilter_status', None):
+            status = getattr(self, '_prefilter_status', 'not_started')
+            if status in {"complete", "partial"}:
+                return list(getattr(self, '_prefilter_candidates', []) or [])
+        payload = self._read_prefilter_cache(today, profile.name)
+        if payload and str(payload.get("status")) in {"complete", "partial"}:
+            return list(getattr(self, '_prefilter_candidates', []) or [])
+        return None
+
+    def _enrich_prefilter_daily_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        fixed = apply_all(
+            df, RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW,
+            SMA200_SLOPE_LOOKBACK, CHANDELIER_PERIOD
+        )
+        fixed['MA10'] = fixed['close'].rolling(10).mean()
+        fixed['MA20'] = fixed['close'].rolling(20).mean()
+        fixed['HIGH20'] = fixed['high'].rolling(20).max()
+        fixed['HIGH50'] = fixed['high'].rolling(50).max()
+        return fixed
+
+    @staticmethod
+    def _weekly_structure_from_daily(df: pd.DataFrame) -> dict:
+        try:
+            d = df.copy()
+            if 'date' in d.columns:
+                d = d.set_index(pd.to_datetime(d['date']))
+            weekly = d['close'].resample('W-FRI').last().dropna()
+            if len(weekly) < 30:
+                return {'weekly_ma10_gt_ma30': False}
+            ma10w = weekly.rolling(10).mean().iloc[-1]
+            ma30w = weekly.rolling(30).mean().iloc[-1]
+            return {'weekly_ma10_gt_ma30': bool(ma10w > ma30w)}
+        except Exception:
+            return {'weekly_ma10_gt_ma30': False}
+
+    def _build_prefilter_context(self, df: pd.DataFrame) -> dict:
+        last = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) > 1 else last
+        price = float(last['close'])
+        ma20 = float(last['MA20']) if not pd.isna(last['MA20']) else float('nan')
+        ma50 = float(last['MA50']) if not pd.isna(last['MA50']) else float('nan')
+        ma200 = float(last['MA200']) if not pd.isna(last['MA200']) else float('nan')
+        high20 = float(last['HIGH20']) if not pd.isna(last['HIGH20']) else float('nan')
+        high50 = float(last['HIGH50']) if not pd.isna(last['HIGH50']) else float('nan')
+        atr_chandelier = float(last['ATR_CHAND']) if not pd.isna(last['ATR_CHAND']) else float('nan')
+        avg_20d_vol = float(df['volume'].tail(20).mean())
+        dollar_vol_20d = float((df['close'] * df['volume']).tail(20).mean())
+        ctx = {
+            'price': price,
+            'close': price,
+            'live_price': price,
+            'ma10': float(last['MA10']) if not pd.isna(last['MA10']) else float('nan'),
+            'ma20': ma20,
+            'ma50': ma50,
+            'ma200': ma200,
+            'atr': float(last['ATR']) if not pd.isna(last['ATR']) else float('nan'),
+            'atr5': float(last['ATR5']) if not pd.isna(last['ATR5']) else float('nan'),
+            'atr20': float(last['ATR20']) if not pd.isna(last['ATR20']) else float('nan'),
+            'atr_chandelier': atr_chandelier,
+            'atr_pct': atr_chandelier / price if price > 0 and np.isfinite(atr_chandelier) else float('nan'),
+            'sma200_slope': float(last['SMA200_SLOPE']) if not pd.isna(last['SMA200_SLOPE']) else float('nan'),
+            'high10': float(last['HIGH10']) if not pd.isna(last['HIGH10']) else float('nan'),
+            'high20': high20,
+            'high50': high50,
+            'dist_high20': price / high20 - 1 if high20 > 0 else float('nan'),
+            'dist_high50': price / high50 - 1 if high50 > 0 else float('nan'),
+            'rsi': float(last['RSI']) if not pd.isna(last['RSI']) else float('nan'),
+            'rsi_prev': float(prev['RSI']) if not pd.isna(prev['RSI']) else float('nan'),
+            'prev_close': float(prev['close']) if not pd.isna(prev['close']) else price,
+            'prev_daily_high': float(prev['high']) if not pd.isna(prev['high']) else float('nan'),
+            'prev_high': float(prev['high']) if not pd.isna(prev['high']) else float('nan'),
+            'spread_pct': 0.0,
+            'rvol': 0.0,
+            'volume_pace': 0.0,
+            'volume': int(last['volume']) if not pd.isna(last['volume']) else 0,
+            'avg_20d_volume': avg_20d_vol,
+            'dollar_vol_20d': dollar_vol_20d,
+            'macd_hist': float(last['MACD_HIST']) if not pd.isna(last['MACD_HIST']) else float('nan'),
+            'macd_hist_delta': (
+                float(last['MACD_HIST'] - prev['MACD_HIST'])
+                if not pd.isna(last['MACD_HIST']) and not pd.isna(prev['MACD_HIST']) else float('nan')
+            ),
+            'obv_slope_5': float(last['OBV_SLOPE_5']) if not pd.isna(last['OBV_SLOPE_5']) else float('nan'),
+            'obv_uptrend': bool(last.get('OBV_UPTREND', False)),
+            'obv_bull_divergence': bool(last.get('OBV_BULL_DIVERGENCE', False)),
+            'obv_bear_divergence': bool(last.get('OBV_BEAR_DIVERGENCE', False)),
+            'ema20_gt_sma50': bool(last.get('EMA20_GT_SMA50', False)),
+            'ma_bull_cross': bool(last.get('MA_BULL_CROSS', False)),
+            'ma_bear_cross': bool(last.get('MA_BEAR_CROSS', False)),
+            'bb_below_lower_2': bool(last.get('BB_BELOW_LOWER_2', False)),
+            'bb_above_upper_2': bool(last.get('BB_ABOVE_UPPER_2', False)),
+            'bb_reclaim_lower': bool(last.get('BB_RECLAIM_LOWER', False)),
+            'psar_bull_3': bool(last.get('PSAR_BULL_3', False)),
+            'psar_bear_3': bool(last.get('PSAR_BEAR_3', False)),
+            'stoch_k': float(last['STOCH_K']) if not pd.isna(last['STOCH_K']) else float('nan'),
+            'stoch_d': float(last['STOCH_D']) if not pd.isna(last['STOCH_D']) else float('nan'),
+            'stoch_bull_exit_oversold': bool(last.get('STOCH_BULL_EXIT_OVERSOLD', False)),
+            'stoch_bear_exit_overbought': bool(last.get('STOCH_BEAR_EXIT_OVERBOUGHT', False)),
+            'macd_bull_divergence': bool(last.get('MACD_BULL_DIVERGENCE', False)),
+            'macd_bear_divergence': bool(last.get('MACD_BEAR_DIVERGENCE', False)),
+            'reclaim_ma20': False,
+            'reclaim_ma50': False,
+            'break_prev_high': False,
+            'df_daily': df,
+        }
+        ctx.update(self._weekly_structure_from_daily(df))
+        ctx.update(self._build_swing_context(df, price))
+        return ctx
+
+    @staticmethod
+    def _prefilter_static_failures(ctx: dict, profile) -> tuple[str, ...]:
+        failures: list[str] = []
+
+        def finite(name: str) -> float:
+            try:
+                value = float(ctx.get(name))
+            except (TypeError, ValueError):
+                return float('nan')
+            return value if np.isfinite(value) else float('nan')
+
+        volume = finite('volume')
+        dollar_vol = finite('dollar_vol_20d')
+        rsi = finite('rsi')
+        rsi_prev = finite('rsi_prev')
+        ma50 = finite('ma50')
+        ma200 = finite('ma200')
+        sma200_slope = finite('sma200_slope')
+        macd_hist = finite('macd_hist')
+        macd_delta = finite('macd_hist_delta')
+        obv_slope = finite('obv_slope_5')
+
+        if profile.min_volume and (not np.isfinite(volume) or volume < float(profile.min_volume)):
+            failures.append(f"historical_volume<{float(profile.min_volume):.0f}")
+        if profile.min_dollar_vol and (
+            not np.isfinite(dollar_vol) or dollar_vol < float(profile.min_dollar_vol)
+        ):
+            failures.append(f"historical_dollar_vol<{float(profile.min_dollar_vol):.0f}")
+        if profile.require_ma50_above_ma200 and (
+            not np.isfinite(ma50) or not np.isfinite(ma200) or ma50 <= ma200
+        ):
+            failures.append("MA50<=MA200")
+        if profile.require_sma200_slope_positive and (
+            not np.isfinite(sma200_slope) or sma200_slope <= 0
+        ):
+            failures.append("SMA200_slope<=0")
+        sleeves = profile.indicator_sleeves or ()
+        ma_trend_active = bool(ctx.get('ema20_gt_sma50')) or bool(ctx.get('ma_bull_cross'))
+        stoch_bull = bool(ctx.get('stoch_bull_exit_oversold'))
+        macd_bull = bool(ctx.get('macd_bull_divergence')) or (
+            np.isfinite(macd_delta) and macd_delta > 0
+        )
+        obv_bull = bool(ctx.get('obv_uptrend')) or bool(ctx.get('obv_bull_divergence'))
+        psar_confirm = bool(ctx.get('psar_bull_3'))
+        rsi_momentum = np.isfinite(rsi) and rsi >= 50.0
+        rsi_recovery_possible = (
+            "bollinger_reversion" in sleeves
+            and np.isfinite(rsi)
+            and np.isfinite(rsi_prev)
+            and rsi >= 40.0
+            and rsi > rsi_prev
+        )
+        static_confirmations = sum(bool(v) for v in (stoch_bull, macd_bull, obv_bull, psar_confirm))
+        volume_can_confirm = profile.min_volume_pace is not None
+        if profile.min_volume_pace is None:
+            static_confirmations += 1
+
+        possible_sleeves: list[str] = []
+        if "ma_cross" in sleeves and ma_trend_active and (macd_bull or obv_bull):
+            possible_sleeves.append("ma_cross")
+        if "bollinger_reversion" in sleeves and bool(ctx.get('bb_reclaim_lower')):
+            possible_sleeves.append("bollinger_reversion")
+        if "psar_flip" in sleeves and bool(ctx.get('psar_bull_3')):
+            possible_sleeves.append("psar_flip")
+
+        if profile.require_weekly_uptrend and not bool(ctx.get('weekly_ma10_gt_ma30')):
+            failures.append("weekly_MA10<=MA30")
+        if not possible_sleeves:
+            failures.append("no_possible_indicator_sleeve")
+        if not (rsi_momentum or rsi_recovery_possible):
+            failures.append("daily_RSI_cannot_confirm")
+        if static_confirmations + (1 if volume_can_confirm else 0) < 2:
+            failures.append("not_enough_static_confirmations_for_intraday_volume")
+
+        return tuple(failures)
+
+    def _prefilter_symbol(self, symbol: str, profile, today: str) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+        if symbol in TICKER_BLOCKLIST:
+            return False, ("blocklisted",), ()
+        try:
+            contract = self._stock_contract(symbol)
+            bars_daily = self.ib.reqHistoricalData(
+                contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
+            )
+            if not isinstance(bars_daily, list) or len(bars_daily) < MIN_CANDLES:
+                return False, (f"insufficient_daily_history<{MIN_CANDLES}",), ()
+            df = util.df(bars_daily)
+            if df is None or len(df) < MIN_CANDLES:
+                return False, (f"insufficient_daily_history<{MIN_CANDLES}",), ()
+            df = self._enrich_prefilter_daily_frame(df)
+            if np.isnan(float(df['MA200'].iloc[-1])):
+                return False, ("invalid_MA200",), ()
+            ctx = self._build_prefilter_context(df)
+            static_failures = self._prefilter_static_failures(ctx, profile)
+            evaluation = evaluate_entry_rules(ctx, profile)
+            deferred = tuple(
+                failure for failure in evaluation.failed
+                if failure not in static_failures
+            )
+            if static_failures:
+                return False, static_failures, deferred
+
+            self._bar_cache[symbol] = {
+                'date': today,
+                'bars_daily': bars_daily,
+            }
+            return True, (), deferred
+        except Exception as e:
+            return False, (f"historical_fetch_failed:{type(e).__name__}",), ()
+
+    def _run_premarket_universe_prefilter(self) -> dict:
+        """Scan the full application universe once and cache daily-pass candidates."""
+        now_ny = datetime.now(_TZ_NY)
+        today = now_ny.strftime('%Y-%m-%d')
+        profile = getattr(self, "_strategy_profile", get_strategy_profile(STRATEGY_PROFILE))
+
+        cached = self._read_prefilter_cache(today, profile.name)
+        if cached and cached.get("status") == "complete":
+            logger.info(
+                f"PREFILTER: using cached {today} universe sieve "
+                f"({len(self._prefilter_candidates)} candidates)"
+            )
+            return cached
+
+        universe = load_application_symbol_universe()
+        max_symbols = int(APP_SCANNER_MAX_SYMBOLS or 0)
+        if max_symbols > 0:
+            universe = universe[:max_symbols]
+        universe = self._dedupe_symbols(universe)
+        processed: set[str] = set()
+        candidates: list[str] = []
+        deferred_by_symbol: dict[str, list[str]] = {}
+        reject_reasons: dict[str, int] = {}
+        rejections_by_symbol: dict[str, list[str]] = {}
+        processed_count = 0
+
+        if cached:
+            processed = set(str(s).upper() for s in cached.get("processed_symbols", []) or [])
+            candidates = self._dedupe_symbols(cached.get("candidates", []) or [])
+            deferred_by_symbol = dict(cached.get("deferred_rules", {}) or {})
+            reject_reasons = dict(cached.get("reject_reasons", {}) or {})
+            rejections_by_symbol = dict(cached.get("rejections_by_symbol", {}) or {})
+            processed_count = len(processed)
+
+        self._metric_inc('prefilter_runs')
+        self._prefilter_date = today
+        self._prefilter_status = "running"
+        logger.info(
+            f"PREFILTER: starting full-universe historical sieve at {now_ny.strftime('%H:%M:%S %Z')} "
+            f"profile={profile.name} universe={len(universe)} already_done={len(processed)}"
+        )
+
+        progress_every = max(1, int(APP_PREFILTER_PROGRESS_EVERY or 100))
+
+        def write_checkpoint(status: str, stopped_reason: Optional[str] = None) -> dict:
+            self._prefilter_candidates = self._dedupe_symbols(candidates)
+            self._prefilter_status = status
+            self._prefilter_stats = {
+                'processed': processed_count,
+                'universe': len(universe),
+                'candidates': len(self._prefilter_candidates),
+                'rejected': max(0, processed_count - len(self._prefilter_candidates)),
+                'reject_reasons': reject_reasons,
+            }
+            payload = {
+                'date': today,
+                'generated_at': datetime.now(_TZ_NY).isoformat(),
+                'profile': profile.name,
+                'status': status,
+                'source': 'application_universe_historical_prefilter',
+                'universe': len(universe),
+                'processed_symbols': sorted(processed),
+                'candidates': self._prefilter_candidates,
+                'deferred_rules': deferred_by_symbol,
+                'reject_reasons': reject_reasons,
+                'rejections_by_symbol': rejections_by_symbol,
+                'stats': self._prefilter_stats,
+            }
+            if stopped_reason:
+                payload['stopped_reason'] = stopped_reason
+                payload['stopped_at'] = payload['generated_at']
+                self._prefilter_stats['stopped_reason'] = stopped_reason
+            self._write_prefilter_cache(payload)
+            self._write_dashboard_data(connected=True)
+            return payload
+
+        for sym in universe:
+            if sym in processed:
+                continue
+            passed, failures, deferred = self._prefilter_symbol(sym, profile, today)
+            processed.add(sym)
+            processed_count += 1
+            self._metric_inc('prefilter_processed')
+            if passed:
+                candidates.append(sym)
+                deferred_by_symbol[sym] = list(deferred)
+                rejections_by_symbol.pop(sym, None)
+            else:
+                self._metric_inc('prefilter_rejected')
+                reason_key = failures[0] if failures else "unknown"
+                reject_reasons[reason_key] = int(reject_reasons.get(reason_key, 0)) + 1
+                rejections_by_symbol[sym] = list(failures or ("unknown",))
+
+            if processed_count % progress_every == 0:
+                write_checkpoint('partial')
+                logger.info(
+                    f"PREFILTER: progress {processed_count}/{len(universe)} "
+                    f"candidates={len(self._prefilter_candidates)}"
+                )
+
+            cutoff_now = datetime.now(_TZ_NY)
+            if (APP_PREFILTER_STOP_AT_ENTRY_START
+                    and cutoff_now.weekday() < 5
+                    and (cutoff_now.hour, cutoff_now.minute) >= ENTRY_START):
+                payload = write_checkpoint('partial', stopped_reason='entry_window_open')
+                self._last_premarket_prefilter_date = today
+                logger.warning(
+                    f"PREFILTER: stopped at entry window "
+                    f"{ENTRY_START[0]:02d}:{ENTRY_START[1]:02d} ET after "
+                    f"{processed_count}/{len(universe)} symbols; using "
+                    f"{len(self._prefilter_candidates)} cached candidates today."
+                )
+                return payload
+
+            sleep_s = max(0.0, float(APP_PREFILTER_HISTORY_SLEEP_SEC or 0.0))
+            if sleep_s > 0:
+                self.ib.sleep(sleep_s)
+
+        payload = write_checkpoint('complete')
+        self._last_premarket_prefilter_date = today
+        self._metric_inc('prefilter_candidates', len(self._prefilter_candidates))
+        logger.info(
+            f"PREFILTER COMPLETE: processed={processed_count}/{len(universe)} "
+            f"candidates={len(self._prefilter_candidates)} "
+            f"rejected={self._prefilter_stats['rejected']}"
+        )
+        return payload
+
+    def get_institutional_scan(self):
+        """Return app scanner candidates before local profile rules screen them."""
+        source = self._normalise_app_scanner_source(APP_SCANNER_SOURCE)
+        ibkr_symbols: list = []
+        universe_symbols: list = []
+        prefiltered = (
+            self._prefilter_candidates_for_today()
+            if source in {"universe", "hybrid"} else None
+        )
+
+        if source in {"ibkr", "hybrid"} and prefiltered is None:
+            ibkr_symbols = self._ibkr_scanner_symbols()
+
+        if source in {"universe", "hybrid"}:
+            if prefiltered is not None:
+                universe_symbols = prefiltered
+                logger.info(
+                    f"SCAN SOURCE: using premarket prefiltered universe "
+                    f"({len(universe_symbols)} candidates)"
+                )
+            else:
+                try:
+                    universe_symbols = self._next_universe_batch()
+                except Exception as e:
+                    logger.warning(f"SCAN SOURCE: application universe unavailable ({e})")
+                    if source == "universe":
+                        return []
+
+        symbols = self._dedupe_symbols(ibkr_symbols + universe_symbols)
+        logger.info(
+            f"SCAN SOURCE: mode={source} ibkr={len(ibkr_symbols)} "
+            f"universe_batch={len(universe_symbols)} combined={len(symbols)}"
+        )
         return symbols
 
     # ── Technical context ──────────────────────────────────────────────────────
@@ -2393,51 +3192,26 @@ class VelocityEngine:
         contract = self._contract_cache[symbol]
 
         # Bar cache — daily bars are valid for one trading day; re-fetch on date change.
-        # ORB bars are also anchored to today's 9:45 AM, so same daily scope applies.
         tz_ny      = pytz.timezone('US/Eastern')
         now_ny     = datetime.now(tz_ny)
         today_str  = now_ny.strftime('%Y-%m-%d')
 
         cached = self._bar_cache.get(symbol)
-        if cached and cached.get('date') == today_str:
-            bars_orb   = cached['bars_orb']
-            bars_daily = cached['bars_daily']
-        else:
-            # 1. Opening Range High — the 9:30–9:45 AM bar of TODAY.
-            #
-            #    Using an empty endDateTime with '1 D' duration is WRONG: at 10 AM
-            #    it starts at yesterday 10 AM, so bars[0] is a yesterday bar.
-            #    Fix: anchor endDateTime to today's 9:45 AM ET so the 1-hour lookback
-            #    window (8:45–9:45 AM) contains exactly one RTH bar — the 9:30 bar.
-            #    bars[-1] is then reliably today's ORB bar regardless of current time.
-            end_of_orb = now_ny.replace(hour=9, minute=45, second=0, microsecond=0)
-            bars_orb   = self.ib.reqHistoricalData(
-                contract, end_of_orb, ORB_LOOKBACK, ORB_BAR_SIZE, 'TRADES', True
-            )
+        bars_daily = cached.get('bars_daily') if cached and cached.get('date') == today_str else None
 
-            # 2. Daily Context (Trends, ATR, RSI) — prior completed daily bars
+        if not bars_daily:
+            # Daily context (trends, ATR, RSI) — prior completed daily bars.
             bars_daily = self.ib.reqHistoricalData(
                 contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
             )
 
-            if bars_orb and bars_daily:
-                self._bar_cache[symbol] = {
-                    'date':       today_str,
-                    'bars_orb':   bars_orb,
-                    'bars_daily': bars_daily,
-                }
+        if bars_daily:
+            self._bar_cache[symbol] = {
+                'date':       today_str,
+                'bars_daily': bars_daily,
+            }
 
-        if not bars_orb:
-            return None
-        orb_bar = bars_orb[-1]         # last bar = the 9:30 AM bar that closed at 9:45
-        orb_high = orb_bar.high
-        day_open = float(getattr(orb_bar, 'open', np.nan))
-        if not orb_high or np.isnan(float(orb_high)) or orb_high <= 0:
-            logger.warning(f"SCAN {symbol}: ORB high invalid ({orb_high}), skipping")
-            return None
-        if np.isnan(day_open) or day_open <= 0:
-            logger.warning(f"SCAN {symbol}: day open invalid ({day_open}), skipping")
-            return None
+        orb_high = float('nan')
 
         if not bars_daily:
             return None
@@ -2453,6 +3227,22 @@ class VelocityEngine:
             logger.warning(f"SCAN {symbol}: MA200 is NaN (data gaps in history), skipping")
             self._remember_daily_scan_skip(symbol, "invalid daily MA200")
             return None
+
+        # Extra profile inputs used by the plug-and-play entry sleeves.  Daily
+        # bars here are prior completed sessions; today's live price is applied
+        # below for reclaims and distance-to-level checks.
+        df['MA10'] = df['close'].rolling(10).mean()
+        df['MA20'] = df['close'].rolling(20).mean()
+        df['HIGH20'] = df['high'].rolling(20).max()
+        df['HIGH50'] = df['high'].rolling(50).max()
+        ema12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['close'].ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
+        df['MACD_HIST'] = macd - macd_signal
+        signed_volume = np.where(df['close'].diff() >= 0, df['volume'], -df['volume'])
+        df['OBV'] = pd.Series(signed_volume, index=df.index).cumsum()
+        df['OBV_SLOPE_5'] = df['OBV'] - df['OBV'].shift(5)
 
         # 20-day average dollar volume — used to block low-liquidity pumps
         avg_20d_vol    = float(df['volume'].tail(20).mean())
@@ -2472,6 +3262,10 @@ class VelocityEngine:
         if live_price is None:
             logger.warning(f"SCAN {symbol}: live price unavailable, skipping")
             return None
+        day_open = (
+            self._coerce_positive_price(getattr(ticker, 'open', None))
+            or live_price
+        )
 
         bid = float(ticker.bid) if not pd.isna(ticker.bid) else 0.0
         ask = float(ticker.ask) if not pd.isna(ticker.ask) else 0.0
@@ -2502,20 +3296,46 @@ class VelocityEngine:
         else:
             day_range_location = None
 
-        return {
+        ma10 = float(df['MA10'].iloc[-1]) if not pd.isna(df['MA10'].iloc[-1]) else float('nan')
+        ma20 = float(df['MA20'].iloc[-1]) if not pd.isna(df['MA20'].iloc[-1]) else float('nan')
+        ma50 = float(df['MA50'].iloc[-1])
+        ma200 = float(df['MA200'].iloc[-1])
+        prev_close = float(df['close'].iloc[-1])
+        prev_daily_high = float(df['high'].iloc[-1])
+        high20 = float(df['HIGH20'].iloc[-1]) if not pd.isna(df['HIGH20'].iloc[-1]) else float('nan')
+        high50 = float(df['HIGH50'].iloc[-1]) if not pd.isna(df['HIGH50'].iloc[-1]) else float('nan')
+        macd_hist = float(df['MACD_HIST'].iloc[-1]) if not pd.isna(df['MACD_HIST'].iloc[-1]) else float('nan')
+        macd_hist_prev = float(df['MACD_HIST'].iloc[-2]) if len(df) > 1 and not pd.isna(df['MACD_HIST'].iloc[-2]) else float('nan')
+        obv_slope_5 = float(df['OBV_SLOPE_5'].iloc[-1]) if not pd.isna(df['OBV_SLOPE_5'].iloc[-1]) else float('nan')
+        atr_chandelier = float(df['ATR_CHAND'].iloc[-1])
+        swing_context = self._build_swing_context(df, live_price)
+
+        ctx = {
             'orb_high':         orb_high,
             'day_open':         day_open,
-            'ma50':             float(df['MA50'].iloc[-1]),
-            'ma200':            float(df['MA200'].iloc[-1]),
+            'day_high':         day_high if not pd.isna(day_high) else None,
+            'day_low':          day_low if not pd.isna(day_low) else None,
+            'ma10':             ma10,
+            'ma20':             ma20,
+            'ma50':             ma50,
+            'ma200':            ma200,
             'atr':              float(df['ATR'].iloc[-1]),
             'atr5':             float(df['ATR5'].iloc[-1]),
             'atr20':            float(df['ATR20'].iloc[-1]),
-            'atr_chandelier':   float(df['ATR_CHAND'].iloc[-1]),
+            'atr_chandelier':   atr_chandelier,
+            'atr_pct':          atr_chandelier / live_price if live_price > 0 else float('nan'),
             'sma200_slope':     float(df['SMA200_SLOPE'].iloc[-1]),
             'high10':           float(df['HIGH10'].iloc[-1]),
+            'high20':           high20,
+            'high50':           high50,
+            'dist_high20':      live_price / high20 - 1 if high20 > 0 else float('nan'),
+            'dist_high50':      live_price / high50 - 1 if high50 > 0 else float('nan'),
             'rsi':              float(df['RSI'].iloc[-1]),
             'rsi_prev':         float(df['RSI'].iloc[-2]),
-            'close':            float(df['close'].iloc[-1]),
+            'close':            prev_close,
+            'prev_close':       prev_close,
+            'prev_daily_high':  prev_daily_high,
+            'prev_high':        prev_daily_high,
             'live_price':       live_price,
             'bid':              bid,
             'ask':              ask,
@@ -2531,12 +3351,39 @@ class VelocityEngine:
             'avg_20d_volume':   avg_20d_vol,
             'day_range_location': day_range_location,
             'intraday_gain':    intraday_gain,
+            'macd_hist':        macd_hist,
+            'macd_hist_prev':   macd_hist_prev,
+            'macd_hist_delta':  macd_hist - macd_hist_prev if not pd.isna(macd_hist) and not pd.isna(macd_hist_prev) else float('nan'),
+            'obv_slope_5':      obv_slope_5,
+            'obv_uptrend':      bool(df.get('OBV_UPTREND', pd.Series(False, index=df.index)).iloc[-1]),
+            'obv_bull_divergence': bool(df.get('OBV_BULL_DIVERGENCE', pd.Series(False, index=df.index)).iloc[-1]),
+            'obv_bear_divergence': bool(df.get('OBV_BEAR_DIVERGENCE', pd.Series(False, index=df.index)).iloc[-1]),
+            'ema20_gt_sma50':   bool(df.get('EMA20_GT_SMA50', pd.Series(False, index=df.index)).iloc[-1]),
+            'ma_bull_cross':    bool(df.get('MA_BULL_CROSS', pd.Series(False, index=df.index)).iloc[-1]),
+            'ma_bear_cross':    bool(df.get('MA_BEAR_CROSS', pd.Series(False, index=df.index)).iloc[-1]),
+            'bb_below_lower_2': bool(df.get('BB_BELOW_LOWER_2', pd.Series(False, index=df.index)).iloc[-1]),
+            'bb_above_upper_2': bool(df.get('BB_ABOVE_UPPER_2', pd.Series(False, index=df.index)).iloc[-1]),
+            'bb_reclaim_lower': bool(df.get('BB_RECLAIM_LOWER', pd.Series(False, index=df.index)).iloc[-1]),
+            'psar_bull_3':      bool(df.get('PSAR_BULL_3', pd.Series(False, index=df.index)).iloc[-1]),
+            'psar_bear_3':      bool(df.get('PSAR_BEAR_3', pd.Series(False, index=df.index)).iloc[-1]),
+            'stoch_k':          float(df.get('STOCH_K', pd.Series(float('nan'), index=df.index)).iloc[-1]),
+            'stoch_d':          float(df.get('STOCH_D', pd.Series(float('nan'), index=df.index)).iloc[-1]),
+            'stoch_bull_exit_oversold': bool(df.get('STOCH_BULL_EXIT_OVERSOLD', pd.Series(False, index=df.index)).iloc[-1]),
+            'stoch_bear_exit_overbought': bool(df.get('STOCH_BEAR_EXIT_OVERBOUGHT', pd.Series(False, index=df.index)).iloc[-1]),
+            'macd_bull_divergence': bool(df.get('MACD_BULL_DIVERGENCE', pd.Series(False, index=df.index)).iloc[-1]),
+            'macd_bear_divergence': bool(df.get('MACD_BEAR_DIVERGENCE', pd.Series(False, index=df.index)).iloc[-1]),
+            'reclaim_ma20':     ma20 > 0 and prev_close <= ma20 and live_price > ma20,
+            'reclaim_ma50':     ma50 > 0 and prev_close <= ma50 and live_price > ma50,
+            'break_prev_high':  prev_daily_high > 0 and live_price > prev_daily_high,
             'volume':           int(df['volume'].iloc[-1]),
             'dollar_vol_20d':   dollar_vol_20d,
             'price_fetched_at': datetime.now(tz_ny),
             'contract':         contract,
             'df_daily':         df,
         }
+        ctx.update(swing_context)
+        ctx.update(self._analyst_context(symbol))
+        return ctx
 
     # ── Exit management ────────────────────────────────────────────────────────
     def manage_position_exits(self):
@@ -2546,14 +3393,20 @@ class VelocityEngine:
         require a fresh broker price so stale dashboard/cache values cannot
         liquidate a valid swing position.
         """
-        now_et          = datetime.now(_TZ_NY)
-        is_friday_close = (now_et.weekday() == 4 and now_et.hour >= FRIDAY_CLOSE_HOUR)
-        today_str       = now_et.strftime('%Y-%m-%d')
-        hhmm            = (now_et.hour, now_et.minute)
-        is_eod_window   = (hhmm >= EOD_EXIT_TIME and now_et.weekday() < 5)
-        eod_exit_due    = (
+        now_et        = datetime.now(_TZ_NY)
+        profile       = getattr(self, "_strategy_profile", get_strategy_profile(STRATEGY_PROFILE))
+        today_str     = now_et.strftime('%Y-%m-%d')
+        hhmm          = (now_et.hour, now_et.minute)
+        is_eod_window = (hhmm >= EOD_EXIT_TIME and now_et.weekday() < 5)
+        is_friday_close = (
+            now_et.weekday() == 4
+            and now_et.hour >= FRIDAY_CLOSE_HOUR
+            and profile.friday_close_enabled
+        )
+        eod_exit_due  = (
             is_eod_window
             and getattr(self, '_last_eod_exit_date', None) != today_str
+            and profile.eod_quality_cleanup
         )
         changed          = False
         eod_exit_checked = False
@@ -2568,7 +3421,8 @@ class VelocityEngine:
                 continue
 
             cached_cur = self._coerce_positive_price(data.get('current_price', 0))
-            fresh_cur  = self._fresh_market_price(sym)
+            snapshot   = self._fresh_market_snapshot(sym)
+            fresh_cur  = snapshot.get('price') if snapshot else None
             if fresh_cur is None:
                 logger.warning(
                     f"EXIT: {sym} fresh price unavailable; skipping software exit checks "
@@ -2579,6 +3433,15 @@ class VelocityEngine:
             cur = fresh_cur
             self.state[sym]['current_price'] = round(cur, 2)
             self.state[sym]['price_checked_at'] = now_et.isoformat()
+            for state_key, snapshot_key in (
+                ('day_open', 'open'),
+                ('day_high', 'high'),
+                ('day_low', 'low'),
+                ('vwap', 'vwap'),
+            ):
+                value = snapshot.get(snapshot_key) if snapshot else None
+                if value is not None:
+                    self.state[sym][state_key] = round(float(value), 4)
             changed = True
 
             # ── 1. Intraday hard stop — requires a fresh broker price
@@ -2595,6 +3458,25 @@ class VelocityEngine:
             if peak_price != float(data.get('peak_price', entry_price) or entry_price):
                 self.state[sym]['peak_price'] = round(peak_price, 2)
                 changed = True
+            if 'entry_qty' not in self.state[sym]:
+                self.state[sym]['entry_qty'] = float(data.get('qty', 0) or 0)
+                self.state[sym].setdefault('profit_tiers_fired', [])
+                self.state[sym].setdefault('profit_tier_exits', [])
+                changed = True
+
+            tier_plan = self._tiered_profit_exit_plan(
+                self.state[sym],
+                current_qty=float(self.state[sym].get('qty', 0) or 0),
+                current_price=cur,
+                entry_price=entry_price,
+            )
+            if tier_plan:
+                tier_result = self._execute_tiered_profit_exit(sym, tier_plan, cur)
+                if tier_result == 'sold':
+                    continue
+                if tier_result == 'skipped':
+                    changed = True
+
             if peak_price >= entry_price * (1 + BREAK_EVEN_PCT) and cur <= entry_price:
                 logger.warning(
                     f"BREAK-EVEN EXIT: {sym} gave back a prior "
@@ -2603,6 +3485,46 @@ class VelocityEngine:
                 )
                 self.liquidate(sym)
                 continue
+
+            analyst_exit, analyst_reason = self._analyst_exit_required(sym, data)
+            if analyst_exit:
+                logger.warning(
+                    f"ANALYST DOWNGRADE EXIT: {sym} {analyst_reason}. Closing."
+                )
+                self.liquidate(sym)
+                continue
+
+            strategy_exit, strategy_reason = self._indicator_strategy_exit_required(sym, data)
+            if strategy_exit:
+                logger.warning(
+                    f"STRATEGY EXIT: {sym} [{data.get('entry_strategy', 'unknown')}] "
+                    f"{strategy_reason}. Closing."
+                )
+                self.liquidate(sym)
+                continue
+
+            entry_time_raw = data.get('time')
+            trading_bars_held = 0
+            try:
+                entry_dt = datetime.fromisoformat(entry_time_raw) if entry_time_raw else now_et
+                if entry_dt.tzinfo is None:
+                    entry_dt = _TZ_NY.localize(entry_dt)
+                else:
+                    entry_dt = entry_dt.astimezone(_TZ_NY)
+                trading_bars_held = _count_trading_days(entry_dt, now_et)
+            except (TypeError, ValueError):
+                trading_bars_held = 0
+
+            if profile.time_stop_bars is not None and trading_bars_held >= int(profile.time_stop_bars):
+                min_profit = float(profile.time_stop_min_profit or 0.0)
+                profit = (cur - entry_price) / entry_price
+                if profit <= min_profit:
+                    logger.warning(
+                        f"SWING TIME STOP: {sym} held {trading_bars_held} trading bars "
+                        f"with profit={profit*100:.1f}% <= {min_profit*100:.1f}%. Closing."
+                    )
+                    self.liquidate(sym)
+                    continue
 
             # ── 2. Friday afternoon close — explicit weekend-risk policy
             if is_friday_close:
@@ -2615,25 +3537,31 @@ class VelocityEngine:
                     self.liquidate(sym)
                     continue
 
-            # ── 3. EOD profit cleanup — same-day capital recycling.
+            # ── 3. EOD quality cleanup — same-day capital recycling.
             #
             # Fires once per trading day after EOD_EXIT_TIME (default 15:50 ET).
-            # Positions that have not reached the minimum profit threshold are
-            # sold near the close so capital can settle T+1 instead of being tied
-            # up in weak follow-through. This intentionally applies to same-day
-            # entries too.
+            # A position is carried only if it is at least breakeven, closing
+            # strong, outperforming SPY intraday, and protected by a confirmed
+            # broker stop. This intentionally applies to same-day entries too.
             if eod_exit_due:
                 eod_exit_checked = True
-                eod_profit = (cur - entry_price) / entry_price
-                if eod_profit < PROFIT_MIN_THRESHOLD:
+                hold_ok, hold_reason = self._eod_quality_hold_passes(
+                    sym,
+                    data,
+                    snapshot,
+                    entry_price,
+                    today_str,
+                )
+                if not hold_ok:
                     logger.warning(
-                        f"EOD PROFIT CLEANUP: {sym} profit={eod_profit*100:.2f}% < "
-                        f"{PROFIT_MIN_THRESHOLD*100:.0f}% near the close "
+                        f"EOD QUALITY CLEANUP: {sym} failed hold quality "
+                        f"({hold_reason}) near the close "
                         f"(cur=${cur:.2f}, entry=${entry_price:.2f}) "
                         f"— closing position."
                     )
                     self.liquidate(sym)
                     continue
+                logger.info(f"EOD QUALITY HOLD: {sym} held overnight ({hold_reason}).")
 
         # Mark EOD exit as done only after at least one live-price evaluation.
         if eod_exit_due and eod_exit_checked:
@@ -2642,9 +3570,300 @@ class VelocityEngine:
         if changed:
             self.save_state()
 
-    def check_velocity_exits(self):
-        """Deprecated compatibility wrapper for the consolidated EOD exit manager."""
-        return self.manage_position_exits()
+    @staticmethod
+    def _nearest_whole_share(value: float) -> int:
+        """Round half-up to the nearest whole share for tiered exits."""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 0
+        if not math.isfinite(value) or value <= 0:
+            return 0
+        return int(math.floor(value + 0.5))
+
+    @staticmethod
+    def _profit_tier_id(target_r: float) -> str:
+        return f"{float(target_r):.2f}R"
+
+    @staticmethod
+    def _profit_tier_sold_qty(data: dict) -> float:
+        total = 0.0
+        for record in data.get('profit_tier_exits') or []:
+            try:
+                total += max(0.0, float(record.get('sold_qty', 0) or 0))
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    @staticmethod
+    def _profit_tier_risk_per_share(data: dict, entry_price: float) -> float:
+        for key in (
+            'entry_risk_per_share',
+            'initial_risk_per_share',
+            'risk_per_share',
+            'stop_dist',
+        ):
+            try:
+                risk = float(data.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                risk = 0.0
+            if math.isfinite(risk) and risk > 0:
+                return risk
+
+        for key in ('initial_stop_loss', 'stop_loss'):
+            try:
+                stop_loss = float(data.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                stop_loss = 0.0
+            risk = entry_price - stop_loss
+            if math.isfinite(risk) and risk > 0:
+                return risk
+
+        fallback = entry_price * HARD_STOP_PCT
+        return fallback if math.isfinite(fallback) and fallback > 0 else 0.0
+
+    def _tiered_profit_exit_plan(
+        self,
+        data: dict,
+        current_qty: float,
+        current_price: float,
+        entry_price: float,
+    ) -> Optional[dict]:
+        if not TIERED_PROFIT_EXIT_ENABLED or entry_price <= 0:
+            return None
+
+        try:
+            current_qty = float(current_qty)
+        except (TypeError, ValueError):
+            current_qty = 0.0
+        if current_qty <= 0:
+            return None
+
+        risk_per_share = self._profit_tier_risk_per_share(data, entry_price)
+        if risk_per_share <= 0:
+            return None
+        profit_r = (current_price - entry_price) / risk_per_share
+        profit_pct = (current_price - entry_price) / entry_price
+        fired = {
+            str(tier_id)
+            for tier_id in (data.get('profit_tiers_fired') or [])
+        }
+        entry_qty = data.get('entry_qty') or data.get('initial_qty') or data.get('qty') or current_qty
+        try:
+            entry_qty = float(entry_qty)
+        except (TypeError, ValueError):
+            entry_qty = current_qty
+        if entry_qty <= 0:
+            entry_qty = current_qty
+
+        sold_so_far = self._profit_tier_sold_qty(data)
+        if sold_so_far <= 0 and fired:
+            sold_so_far = max(0.0, entry_qty - current_qty)
+
+        available_whole = int(math.floor(max(current_qty, 0.0)))
+        planned = []
+        remaining_available = available_whole
+
+        for target_r, cumulative_fraction in TIERED_PROFIT_EXIT_R_LEVELS:
+            target_r = float(target_r)
+            tier_id = self._profit_tier_id(target_r)
+            if tier_id in fired:
+                continue
+            if profit_r + 1e-9 < target_r:
+                break
+
+            cumulative_target = self._nearest_whole_share(
+                entry_qty * float(cumulative_fraction)
+            )
+            tier_qty = max(0, cumulative_target - self._nearest_whole_share(sold_so_far))
+            tier_qty = min(tier_qty, remaining_available)
+            planned.append({
+                'tier_id': tier_id,
+                'target_r': target_r,
+                'target_price': round(entry_price + risk_per_share * target_r, 4),
+                'target_pct': round((risk_per_share * target_r) / entry_price, 6),
+                'cumulative_fraction': float(cumulative_fraction),
+                'planned_qty': int(tier_qty),
+            })
+            sold_so_far += tier_qty
+            remaining_available -= tier_qty
+
+        if not planned:
+            return None
+
+        return {
+            'profit_r': profit_r,
+            'profit_pct': profit_pct,
+            'risk_per_share': risk_per_share,
+            'sell_qty': int(sum(item['planned_qty'] for item in planned)),
+            'tiers': planned,
+        }
+
+    def _record_profit_tier_results(
+        self,
+        symbol: str,
+        plan: dict,
+        sold_qty: float,
+        fill_price: Optional[float],
+        status: str,
+    ) -> None:
+        if symbol not in self.state:
+            return
+
+        state = self.state[symbol]
+        fired = [str(tier_id) for tier_id in (state.get('profit_tiers_fired') or [])]
+        records = list(state.get('profit_tier_exits') or [])
+        remaining_fill = max(0.0, float(sold_qty or 0))
+        now_iso = datetime.now(_TZ_NY).isoformat()
+
+        for tier in plan.get('tiers') or []:
+            tier_id = str(tier.get('tier_id'))
+            planned_qty = int(tier.get('planned_qty') or 0)
+            allocated = min(float(planned_qty), remaining_fill)
+            remaining_fill -= allocated
+
+            if tier_id not in fired and (planned_qty == 0 or allocated > 0):
+                fired.append(tier_id)
+
+            if planned_qty == 0 or allocated > 0:
+                records.append({
+                    'time': now_iso,
+                    'tier_id': tier_id,
+                    'target_r': round(float(tier.get('target_r') or 0.0), 4),
+                    'target_price': round(float(tier.get('target_price') or 0.0), 4),
+                    'target_pct': round(float(tier.get('target_pct') or 0.0), 4),
+                    'cumulative_fraction': round(
+                        float(tier.get('cumulative_fraction') or 0.0), 4
+                    ),
+                    'planned_qty': planned_qty,
+                    'sold_qty': round(float(allocated), 4),
+                    'fill_price': round(float(fill_price), 4) if fill_price else None,
+                    'profit_r': round(float(plan.get('profit_r') or 0.0), 4),
+                    'profit_pct': round(float(plan.get('profit_pct') or 0.0), 4),
+                    'status': status if allocated > 0 else 'skipped_rounding_to_zero',
+                })
+
+        state['profit_tiers_fired'] = fired
+        state['profit_tier_exits'] = records
+        self.save_state()
+
+    def _execute_tiered_profit_exit(
+        self,
+        symbol: str,
+        plan: dict,
+        current_price: float,
+    ) -> str:
+        sell_qty = int(plan.get('sell_qty') or 0)
+        if sell_qty <= 0:
+            self._record_profit_tier_results(
+                symbol,
+                plan,
+                sold_qty=0.0,
+                fill_price=current_price,
+                status='skipped_rounding_to_zero',
+            )
+            return 'skipped'
+
+        found_position = False
+        for p in self.ib.positions():
+            if p.contract.symbol != symbol:
+                continue
+            ibkr_qty = float(p.position)
+            if ibkr_qty <= 0:
+                continue
+            found_position = True
+            qty = min(float(sell_qty), float(math.floor(ibkr_qty)))
+            if qty <= 0:
+                self._record_profit_tier_results(
+                    symbol,
+                    plan,
+                    sold_qty=0.0,
+                    fill_price=current_price,
+                    status='skipped_rounding_to_zero',
+                )
+                return 'skipped'
+
+            if not self._cancel_open_orders_before_market_exit(symbol):
+                return 'deferred'
+
+            sell_order = MarketOrder('SELL', qty)
+            sell_order.tif = 'DAY'
+            sell_order.goodAfterTime = ''
+            sell_contract = copy.copy(p.contract)
+            sell_contract.exchange = 'SMART'
+            try:
+                trade = self.ib.placeOrder(sell_contract, sell_order)
+            except Exception as e:
+                self._alert(
+                    "CRITICAL",
+                    f"TIERED PROFIT EXIT {symbol}: market SELL placement failed; "
+                    f"state retained and stop audit requested ({e})"
+                )
+                self._audit_stop_orders()
+                return 'failed'
+
+            try:
+                for _ in self.ib.loopUntil(trade.isDone, timeout=30):
+                    pass
+            except Exception as e:
+                logger.warning(f"TIERED PROFIT EXIT {symbol}: status wait failed: {e}")
+
+            status = str(getattr(trade.orderStatus, 'status', '') or '')
+            try:
+                filled_qty = float(getattr(trade.orderStatus, 'filled', 0) or 0)
+            except (TypeError, ValueError):
+                filled_qty = 0.0
+
+            if status in _REJECTED_ORDER_STATUSES:
+                self._alert(
+                    "CRITICAL",
+                    f"TIERED PROFIT EXIT {symbol}: market SELL rejected "
+                    f"(status={status}); rebuilding protection"
+                )
+                self._audit_stop_orders()
+                return 'failed'
+
+            actual_sold = filled_qty if filled_qty > 0 else (qty if status == 'Filled' else 0.0)
+            if actual_sold <= 0:
+                self._alert(
+                    "ERROR",
+                    f"TIERED PROFIT EXIT {symbol}: market SELL not confirmed filled "
+                    f"(status={status}, filled={filled_qty:g}); rebuilding protection"
+                )
+                self._audit_stop_orders()
+                return 'failed'
+
+            actual_sold = min(float(actual_sold), ibkr_qty)
+            remaining_qty = max(0.0, ibkr_qty - actual_sold)
+            if symbol in self.state:
+                state = self.state[symbol]
+                entry_qty = state.get('entry_qty') or max(ibkr_qty, float(state.get('qty', 0) or 0))
+                state['entry_qty'] = round(float(entry_qty), 4)
+                state['qty'] = round(remaining_qty, 4)
+                state['last_profit_tier_exit_at'] = datetime.now(_TZ_NY).isoformat()
+                state['last_profit_tier_exit_price'] = round(float(current_price), 4)
+            self._record_profit_tier_results(
+                symbol,
+                plan,
+                sold_qty=actual_sold,
+                fill_price=current_price,
+                status=status or 'Submitted',
+            )
+            logger.info(
+                f"TIERED PROFIT EXIT {symbol}: sold {actual_sold:g} share(s) "
+                f"at profit={float(plan.get('profit_r') or 0.0):.2f}R "
+                f"({float(plan.get('profit_pct') or 0.0)*100:.1f}%) "
+                f"(remaining={remaining_qty:g}, status={status})"
+            )
+            self._audit_stop_orders()
+            return 'sold'
+
+        if not found_position:
+            logger.warning(
+                f"TIERED PROFIT EXIT {symbol}: no IBKR position found; "
+                "deferring partial exit until sync reconciles state."
+            )
+        return 'deferred'
 
     def _active_open_trades_for_symbol(self, symbol: str) -> list:
         """Return non-terminal open trades for one symbol."""
@@ -2818,18 +4037,15 @@ class VelocityEngine:
     def _score_candidate(
         self,
         ctx: dict,
-        *,
-        volume_floor: float = RVOL_MIN,
-        gap_max_pct: float = GAP_MAX_PCT,
     ) -> float:
         """Rank a passing candidate with the shared live/backtest scorer."""
+        profile = getattr(self, "_strategy_profile", get_strategy_profile(STRATEGY_PROFILE))
         return score_candidate(
             ctx,
-            model=SCORING_MODEL,
-            volume_floor=volume_floor,
+            model=profile.scoring_model,
+            volume_floor=profile.min_volume_pace or 1.0,
             spread_max_pct=SPREAD_MAX_PCT,
-            atr_pct_max=ATR_PCT_MAX,
-            gap_max_pct=gap_max_pct,
+            atr_pct_max=profile.max_atr_pct or ATR_PCT_MAX,
         )
 
     def _entry_price_is_still_valid(
@@ -2837,33 +4053,32 @@ class VelocityEngine:
         sym: str,
         ctx: dict,
         price: float,
-        breakout_pct: float = BREAKOUT_PCT,
-        gap_max_pct: float = GAP_MAX_PCT,
+        profile=None,
     ) -> bool:
         """Re-check fast-moving entry gates immediately before sending an order."""
+        profile = profile or getattr(self, "_strategy_profile", get_strategy_profile(STRATEGY_PROFILE))
         if np.isnan(price) or price <= 0:
             logger.warning(f"SKIP {sym}: refreshed entry price invalid ({price})")
             return False
 
-        if price < SCAN_MIN_PRICE:
+        if price < profile.min_price:
             logger.warning(
                 f"SKIP {sym}: refreshed entry price ${price:.2f} below "
-                f"minimum ${SCAN_MIN_PRICE:.2f}"
+                f"{profile.name} minimum ${profile.min_price:.2f}"
             )
             return False
 
-        orb_h = float(ctx.get('orb_high', 0.0))
-        if orb_h <= 0 or price <= orb_h:
+        refreshed_ctx = dict(ctx)
+        refreshed_ctx['live_price'] = price
+        refreshed_ctx['close'] = price
+        evaluation = evaluate_entry_rules(
+            refreshed_ctx,
+            profile,
+        )
+        if not evaluation.passed:
             logger.warning(
-                f"SKIP {sym}: refreshed price ${price:.2f} no longer clears ORB ${orb_h:.2f}"
-            )
-            return False
-
-        day_open = float(ctx.get('day_open', price) or price)
-        if day_open > orb_h * (1 + gap_max_pct):
-            logger.warning(
-                f"SKIP {sym}: day open ${day_open:.2f} is beyond "
-                f"{gap_max_pct*100:.0f}% opening-gap cap from ORB ${orb_h:.2f}"
+                f"SKIP {sym}: refreshed price no longer passes swing setup "
+                f"({list(evaluation.failed)})"
             )
             return False
 
@@ -2890,10 +4105,11 @@ class VelocityEngine:
 
             qty = round(ibkr_qty, 4)
             avg_cost = float(pos.avgCost) if pos.avgCost else 0.0
+            fallback_risk = round(avg_cost * HARD_STOP_PCT, 4) if avg_cost > 0 else 0.0
             if avg_cost <= 0:
                 logger.warning(
                     f"SYNC: {sym} — avgCost={avg_cost} from IBKR; "
-                    f"EOD profit cleanup will be skipped until price is corrected."
+                    f"EOD quality cleanup will be skipped until price is corrected."
                 )
 
             if sym not in self.state:
@@ -2903,10 +4119,15 @@ class VelocityEngine:
                     'broker_avg_cost': round(avg_cost, 4),
                     'time':            datetime.now(_TZ_NY).isoformat(),
                     'qty':             qty,
+                    'entry_qty':       qty,
+                    'entry_risk_per_share': fallback_risk,
+                    'initial_stop_loss': round(avg_cost - fallback_risk, 4) if fallback_risk > 0 else 0.0,
                     'stop_loss':       0.0,
                     'peak_price':      round(avg_cost, 2),
                     'volume':          0,
                     'score':           None,
+                    'profit_tiers_fired': [],
+                    'profit_tier_exits': [],
                 }
                 logger.info(f"SYNC: Added {sym} from IBKR (qty={pos.position} avg=${avg_cost:.2f})")
                 changed = True
@@ -2925,6 +4146,29 @@ class VelocityEngine:
                         f"to IBKR={qty:g}"
                     )
                     self.state[sym]['qty'] = qty
+                    changed = True
+                if float(self.state[sym].get('entry_qty', 0) or 0) <= 0:
+                    self.state[sym]['entry_qty'] = max(qty, state_qty)
+                    changed = True
+                if float(self.state[sym].get('entry_risk_per_share', 0) or 0) <= 0:
+                    fallback_risk = (
+                        float(self.state[sym].get('stop_dist', 0) or 0)
+                        or (avg_cost * HARD_STOP_PCT if avg_cost > 0 else 0.0)
+                    )
+                    if fallback_risk > 0:
+                        self.state[sym]['entry_risk_per_share'] = round(float(fallback_risk), 4)
+                        changed = True
+                if float(self.state[sym].get('initial_stop_loss', 0) or 0) <= 0:
+                    entry_px = float(self.state[sym].get('fill_price', self.state[sym].get('price', avg_cost)) or 0)
+                    entry_risk = float(self.state[sym].get('entry_risk_per_share', 0) or 0)
+                    if entry_px > 0 and entry_risk > 0:
+                        self.state[sym]['initial_stop_loss'] = round(entry_px - entry_risk, 4)
+                        changed = True
+                if 'profit_tiers_fired' not in self.state[sym]:
+                    self.state[sym]['profit_tiers_fired'] = []
+                    changed = True
+                if 'profit_tier_exits' not in self.state[sym]:
+                    self.state[sym]['profit_tier_exits'] = []
                     changed = True
 
                 if avg_cost > 0:
@@ -3121,6 +4365,10 @@ class VelocityEngine:
             self._day_start_equity = equity
             self._daily_scan_skip.clear()
             self._bar_cache.clear()
+            self._prefilter_date = None
+            self._prefilter_status = "not_started"
+            self._prefilter_candidates = []
+            self._prefilter_stats = {}
         elif (self._day_start_equity is not None
               and equity < self._day_start_equity * (1 - MAX_DAILY_LOSS_PCT)):
             logger.warning(
@@ -3152,9 +4400,13 @@ class VelocityEngine:
             self._update_position_prices()
             return
 
-        # 5. Entry Window (10:00 AM – 3:30 PM EST)
+        # 5. Entry Window
         tz_ny  = pytz.timezone('US/Eastern')
         now_ny = datetime.now(tz_ny)
+        profile = getattr(self, "_strategy_profile", None)
+        if profile is None:
+            profile = get_strategy_profile(STRATEGY_PROFILE)
+            self._strategy_profile = profile
 
         if now_ny.weekday() < 5 and ENTRY_START <= (now_ny.hour, now_ny.minute) <= ENTRY_END:
             # On Fridays raise the liquidity bar to 2× to avoid holding over weekends.
@@ -3168,7 +4420,7 @@ class VelocityEngine:
                 )
                 self._update_position_prices()
                 return
-            dol_vol_threshold = SCAN_MIN_DOLLAR_VOL * (VOL_MULT_FRIDAY if is_friday else 1.0)
+            dol_vol_threshold = profile.min_dollar_vol * (VOL_MULT_FRIDAY if is_friday else 1.0)
 
             allocation = self._calc_entry_allocation(equity, settled, len(self.state))
             max_pos        = int(allocation['max_pos'])
@@ -3206,40 +4458,37 @@ class VelocityEngine:
                 # Check SPY regime once per cycle — same answer for all candidates
                 spy_trend = self._fetch_spy_trend()
                 bear_phase = not spy_trend
-                if bear_phase and not BEAR_PHASE_TRADING_ENABLED:
-                    logger.warning("REGIME: SPY trend weak/falling — no new entries this cycle")
+                if bear_phase and (
+                    not BEAR_PHASE_TRADING_ENABLED
+                    or not profile.allow_bear_phase_entries
+                ):
+                    logger.warning(
+                        f"REGIME: SPY trend weak/falling — no new {profile.name} entries this cycle"
+                    )
                     self._update_position_prices()
                     return
 
                 if bear_phase:
                     regime_label = "BEAR"
-                    rvol_min = BEAR_RVOL_MIN
-                    vcp_ratio = BEAR_VCP_RATIO
-                    rsi_threshold = BEAR_RSI_THRESHOLD
-                    rsi_min_delta = BEAR_RSI_MIN_DELTA
-                    gap_max_pct = BEAR_GAP_MAX_PCT
                     dol_vol_threshold *= BEAR_PHASE_DOLLAR_VOL_MULT
                     risk_per_trade_pct = RISK_PER_TRADE_PCT * BEAR_PHASE_RISK_MULT
                     logger.warning(
                         "REGIME: SPY trend weak/falling — bear-phase participation enabled; "
-                        f"using stricter 8096 rules (gap≤{gap_max_pct*100:.0f}%, "
-                        f"RSI>{rsi_threshold}, RSIΔ≥{rsi_min_delta}, "
-                        f"risk={risk_per_trade_pct*100:.1f}%)."
+                        f"profile={profile.name}; using stricter risk/liquidity "
+                        f"(risk={risk_per_trade_pct*100:.1f}%)."
                     )
                 else:
                     regime_label = "BULL"
-                    rvol_min = RVOL_MIN
-                    vcp_ratio = VCP_RATIO
-                    rsi_threshold = RSI_THRESHOLD
-                    rsi_min_delta = RSI_MIN_DELTA
-                    gap_max_pct = GAP_MAX_PCT
                     risk_per_trade_pct = RISK_PER_TRADE_PCT
 
                 watchlist = self.get_institutional_scan()
                 self._metric_inc('scanner_runs')
                 self._metric_inc('scanner_candidates', len(watchlist))
-                logger.info(f"SCAN: {len(watchlist)} candidates → {watchlist}"
-                            + (f" [FRIDAY: dolVol threshold ${dol_vol_threshold/1e6:.0f}M]" if is_friday else ""))
+                logger.info(
+                    f"SCAN: profile={profile.name} ({profile.label}) "
+                    f"{len(watchlist)} candidates → {watchlist}"
+                    + (f" [FRIDAY: dolVol threshold ${dol_vol_threshold/1e6:.0f}M]" if is_friday else "")
+                )
 
                 # Pre-compute sector counts for current book (for clustering check)
                 book_sectors: Dict[str, int] = {}
@@ -3250,16 +4499,28 @@ class VelocityEngine:
 
                 # ── Phase 1: evaluate ALL candidates, collect those passing ──
                 signals = []
+                reject_counts = {
+                    'already_held': 0,
+                    'blocklisted': 0,
+                    'cached_day_filter': 0,
+                    'no_technical_data': 0,
+                    'entry_filter': 0,
+                    'correlation': 0,
+                    'sector_limit': 0,
+                }
                 for sym in watchlist:
                     if sym in self.state:
+                        reject_counts['already_held'] += 1
                         logger.info(f"SCAN {sym}: SKIP — already in portfolio")
                         continue
 
                     if sym in TICKER_BLOCKLIST:
+                        reject_counts['blocklisted'] += 1
                         logger.debug(f"SCAN {sym}: SKIP — blocklisted (leveraged/inverse ETF)")
                         continue
 
                     if sym in self._daily_scan_skip:
+                        reject_counts['cached_day_filter'] += 1
                         logger.debug(
                             f"SCAN {sym}: SKIP — day-filtered "
                             f"({self._daily_scan_skip[sym]})"
@@ -3268,94 +4529,65 @@ class VelocityEngine:
 
                     ctx = self.get_technical_context(sym)
                     if not ctx:
+                        reject_counts['no_technical_data'] += 1
                         logger.warning(f"SCAN {sym}: SKIP — no technical data")
                         continue
 
-                    price        = ctx['live_price']
-                    day_open     = float(ctx.get('day_open') or price)
-                    orb_h        = ctx['orb_high']
-                    ma50         = ctx['ma50']
-                    ma200        = ctx['ma200']
-                    rsi          = ctx['rsi']
-                    rsi_p        = ctx['rsi_prev']
-                    atr          = ctx['atr']
-                    atr_chand    = ctx.get('atr_chandelier', atr)
-                    atr5         = ctx.get('atr5', atr)
-                    atr20        = ctx.get('atr20', atr)
-                    sma200_slope = ctx.get('sma200_slope', 0.0)
-                    rvol         = ctx.get('rvol', 0.0)
-                    day_loc      = ctx.get('day_range_location')
+                    price         = ctx['live_price']
+                    day_open      = float(ctx.get('day_open') or price)
+                    ma50          = ctx['ma50']
+                    ma200         = ctx['ma200']
+                    rsi           = ctx['rsi']
+                    rsi_p         = ctx['rsi_prev']
+                    atr           = ctx['atr']
+                    atr_chand     = ctx.get('atr_chandelier', atr)
+                    atr5          = ctx.get('atr5', atr)
+                    atr20         = ctx.get('atr20', atr)
+                    sma200_slope  = ctx.get('sma200_slope', 0.0)
+                    rvol          = ctx.get('rvol', 0.0)
+                    day_loc       = ctx.get('day_range_location')
                     intraday_gain = ctx.get('intraday_gain')
-                    spread_pct   = ctx.get('spread_pct', 0.0)
-                    dol_vol_20d  = ctx['dollar_vol_20d']
-                    atr_ratio    = (atr5 / atr20) if atr20 > 0 else float('nan')
+                    spread_pct    = ctx.get('spread_pct', 0.0)
+                    dol_vol_20d   = ctx['dollar_vol_20d']
+                    atr_ratio     = (atr5 / atr20) if atr20 > 0 else float('nan')
+                    atr_pct       = atr_chand / price if price > 0 else float('nan')
+                    rs_63d        = ctx.get('relative_strength_63d', float('nan'))
+                    ret_13w       = ctx.get('return_13w', float('nan'))
+                    px_52w        = ctx.get('price_vs_52w_high', float('nan'))
+                    analyst_score = ctx.get('analyst_rating_score', 0.0)
+                    analyst_total = ctx.get('analyst_rating_total', 0)
 
-                    # ── Production entry filter ───────────────────────────────
-                    c_trend    = price > ma50 and ma50 > ma200
-                    c_slope    = sma200_slope > 0
-                    c_vcp      = atr20 > 0 and (atr5 / atr20) < vcp_ratio
-                    c_rvol     = rvol >= rvol_min
-                    c_spread   = spread_pct <= SPREAD_MAX_PCT
-                    c_dol_vol  = dol_vol_20d >= dol_vol_threshold
-                    c_orb      = price > orb_h
-                    c_gap      = day_open <= orb_h * (1 + gap_max_pct)
-                    c_rsi_rise  = rsi > rsi_p
-                    c_rsi_delta = (rsi - rsi_p) >= rsi_min_delta
-                    c_rsi_lvl   = rsi > rsi_threshold
-                    c_day_loc   = (
-                        day_loc is not None
-                        and not pd.isna(day_loc)
-                        and day_loc >= DAY_RANGE_LOCATION_MIN
-                    )
-                    c_open_gain = (
-                        intraday_gain is not None
-                        and not pd.isna(intraday_gain)
-                        and intraday_gain >= INTRADAY_GAIN_MIN
-                    )
-                    c_atr_pct = (
-                        price > 0
-                        and atr_chand > 0
-                        and (atr_chand / price) <= ATR_PCT_MAX
-                    )
+                    entry_overrides = {
+                        "min_dollar_vol": dol_vol_threshold,
+                    }
+                    evaluation = evaluate_entry_rules(ctx, profile, overrides=entry_overrides)
 
                     scan_detail = (
-                        f"SCAN {sym} [{regime_label}]: price=${price:.2f} ORB=${orb_h:.2f} "
-                        f"MA50=${ma50:.2f} MA200=${ma200:.2f} SMA200slope={sma200_slope:+.3f} "
-                        f"ATR5/ATR20={atr_ratio:.2f}(vcp<{vcp_ratio}) "
-                        f"VolPace={rvol:.1f}(≥{rvol_min}) rawRVOL={ctx.get('rvol_raw', rvol):.1f} "
-                        f"spread={spread_pct*100:.2f}%(≤{SPREAD_MAX_PCT*100:.1f}%) "
-                        f"Open=${day_open:.2f} OpenGap={(day_open/orb_h - 1) if orb_h > 0 else float('nan'):+.2%}(≤{gap_max_pct:.0%}) "
-                        f"DayLoc={day_loc if day_loc is not None else float('nan'):.2f}(≥{DAY_RANGE_LOCATION_MIN:.2f}) "
-                        f"OpenGain={intraday_gain if intraday_gain is not None else float('nan'):+.2%}(≥{INTRADAY_GAIN_MIN:.1%}) "
+                        f"SCAN {sym} [{regime_label}/{profile.name}]: price=${price:.2f} "
+                        f"PrevHigh=${ctx.get('prev_daily_high', ctx.get('prev_high', float('nan'))):.2f} "
+                        f"MA20=${ctx.get('ma20', float('nan')):.2f} MA50=${ma50:.2f} MA200=${ma200:.2f} "
+                        f"SMA200slope={sma200_slope:+.3f} ATR5/ATR20={atr_ratio:.2f} "
+                        f"VolPace={rvol:.1f} rawRVOL={ctx.get('rvol_raw', rvol):.1f} "
+                        f"spread={spread_pct*100:.2f}% "
+                        f"Open=${day_open:.2f} DayLoc={day_loc if day_loc is not None else float('nan'):.2f} "
+                        f"OpenGain={intraday_gain if intraday_gain is not None else float('nan'):+.2%} "
                         f"RSI={rsi:.1f}(Δ{rsi-rsi_p:+.1f}) "
-                        f"ATR=${atr:.2f} ATR%={atr_chand/price if price > 0 else float('nan'):.2%}(≤{ATR_PCT_MAX:.0%}) "
-                        f"DolVol20d=${dol_vol_20d/1e6:.0f}M(thr=${dol_vol_threshold/1e6:.0f}M) | "
-                        f"InfoTrend={c_trend} InfoSlope={c_slope} InfoVCP={c_vcp} "
-                        f"InfoVolPace={c_rvol} Spread={c_spread} "
-                        f"DayLoc={c_day_loc} OpenGain={c_open_gain} ATRPct={c_atr_pct} "
-                        f"ORB={c_orb} Gap={c_gap} InfoRSI↑={c_rsi_rise} "
-                        f"RSIΔ≥{rsi_min_delta}={c_rsi_delta} RSI>{rsi_threshold}={c_rsi_lvl} "
-                        f"DolVol={c_dol_vol}"
+                        f"MACDh={ctx.get('macd_hist', float('nan')):+.3f} "
+                        f"MACDhΔ={ctx.get('macd_hist_delta', float('nan')):+.3f} "
+                        f"DistHigh20={ctx.get('dist_high20', float('nan')):+.2%} "
+                        f"RS63={rs_63d:+.2%} Ret13w={ret_13w:+.2%} "
+                        f"Px52w={px_52w:.2f} WeeklyUp={bool(ctx.get('weekly_uptrend'))} "
+                        f"Analyst={float(analyst_score):+.2f}/{int(analyst_total or 0)} "
+                        f"ATR=${atr:.2f} ATR%={atr_pct:.2%} "
+                        f"DolVol20d=${dol_vol_20d/1e6:.0f}M(thr=${dol_vol_threshold/1e6:.0f}M)"
                     )
 
-                    if not (c_spread and c_dol_vol
-                            and c_orb and c_gap
-                            and c_rsi_delta and c_rsi_lvl
-                            and c_day_loc and c_open_gain and c_atr_pct):
-                        failed = [n for n, v in [
-                            (f'Spread≤{SPREAD_MAX_PCT*100:.1f}%', c_spread),
-                            (f'DolVol≥{dol_vol_threshold/1e6:.0f}M', c_dol_vol),
-                            (f'DayLoc≥{DAY_RANGE_LOCATION_MIN:.2f}', c_day_loc),
-                            (f'OpenGain≥{INTRADAY_GAIN_MIN:.1%}', c_open_gain),
-                            (f'ATR%≤{ATR_PCT_MAX:.0%}', c_atr_pct),
-                            ('price>ORB', c_orb),
-                            (f'open gap≤{gap_max_pct*100:.0f}%', c_gap),
-                            (f'RSIΔ≥{rsi_min_delta}', c_rsi_delta),
-                            (f'RSI>{rsi_threshold}', c_rsi_lvl),
-                        ] if not v]
+                    if not evaluation.passed:
+                        reject_counts['entry_filter'] += 1
+                        failed = list(evaluation.failed)
                         logger.debug(f"{scan_detail}")
                         logger.debug(f"SCAN {sym}: NO SIGNAL — failed: {failed}")
-                        if not c_dol_vol:
+                        if any(name.startswith("dollar_vol>=") for name in failed):
                             self._remember_daily_scan_skip(
                                 sym,
                                 f"DolVol20d ${dol_vol_20d/1e6:.0f}M "
@@ -3363,11 +4595,16 @@ class VelocityEngine:
                             )
                         continue
 
+                    entry_strategy = select_entry_strategy(ctx, profile) or profile.name
+                    ctx['entry_strategy'] = entry_strategy
+                    ctx['entry_strategy_label'] = indicator_sleeve_label(entry_strategy)
+
                     # ── Correlation filter (expensive — only for passing candidates) ──
                     df_daily = ctx.get('df_daily')
                     if df_daily is not None and self.state:
                         max_corr = self._compute_book_correlation(sym, df_daily)
                         if max_corr > CORR_MAX:
+                            reject_counts['correlation'] += 1
                             logger.debug(
                                 f"SCAN {sym}: SKIP — correlation {max_corr:.2f} > {CORR_MAX} with book"
                             )
@@ -3376,40 +4613,69 @@ class VelocityEngine:
                     # ── Sector clustering filter ──────────────────────────────
                     sector = self._get_sector(sym, ctx['contract'])
                     if book_sectors.get(sector, 0) >= MAX_SECTOR_COUNT:
+                        reject_counts['sector_limit'] += 1
                         logger.debug(
                             f"SCAN {sym}: SKIP — sector '{sector}' already has "
                             f"{book_sectors[sector]}/{MAX_SECTOR_COUNT} positions"
                         )
                         continue
 
-                    score = self._score_candidate(
-                        ctx,
-                        volume_floor=rvol_min,
-                        gap_max_pct=gap_max_pct,
-                    )
+                    score = self._score_candidate(ctx)
+                    if profile.min_score is not None and score < float(profile.min_score):
+                        reject_counts['entry_filter'] += 1
+                        logger.debug(
+                            f"SCAN {sym}: SKIP — score {score:.1f} < "
+                            f"{float(profile.min_score):.1f}"
+                        )
+                        continue
                     signals.append((score, sym, ctx))
                     logger.info(scan_detail)
                     logger.info(
                         f"SIGNAL {sym} [{regime_label}]: score={score:.1f}/100 | "
+                        f"profile={profile.name} strategy={ctx.get('entry_strategy_label')} "
                         f"VolPace={rvol:.1f}x rawRVOL={ctx.get('rvol_raw', rvol):.1f}x "
                         f"trend_sep={(ma50-ma200)/ma200*100:.1f}% "
-                        f"RSI_delta={rsi-rsi_p:.1f} spread={spread_pct*100:.2f}% "
+                        f"RSI_delta={rsi-rsi_p:.1f} RS63={rs_63d:+.2%} "
+                        f"Analyst={float(analyst_score):+.2f}/{int(analyst_total or 0)} "
+                        f"spread={spread_pct*100:.2f}% "
                         f"DolVol20d=${dol_vol_20d/1e6:.0f}M"
                     )
 
-                # ── Phase 2: rank by score; enter in descending order, falling
-                #    through to the next eligible stock when one is skipped ──────
+                # ── Phase 2: rank eligible signals by score; enter in descending
+                #    order, falling through to the next candidate when a higher
+                #    ranked symbol cannot be ordered because of sizing/cash/broker
+                #    checks.
+                filtered = sum(reject_counts.values())
+                reject_summary = ", ".join(
+                    f"{name}={count}"
+                    for name, count in reject_counts.items()
+                    if count
+                ) or "none"
+                logger.info(
+                    f"SCAN SUMMARY: scanner_hits={len(watchlist)} "
+                    f"eligible_signals={len(signals)} "
+                    f"filtered={filtered} "
+                    f"rejects[{reject_summary}]"
+                )
                 if not signals:
                     logger.info("SCAN: No signals this cycle")
                 else:
                     signals.sort(key=lambda x: x[0], reverse=True)
                     ranked = [(s, sym) for s, sym, _ in signals]
-                    logger.info(f"RANKED: {ranked} — attempting up to {min(slots, len(signals))}")
+                    logger.info(
+                        f"RANKED SIGNALS DESC: {ranked} — attempting up to "
+                        f"{min(slots, len(signals))}"
+                    )
 
                     placed = 0
-                    for score, sym, ctx in signals:
+                    for rank_idx, (score, sym, ctx) in enumerate(signals, start=1):
                         if placed >= slots:
                             break
+                        logger.info(
+                            f"ORDER ATTEMPT: rank={rank_idx}/{len(signals)} "
+                            f"symbol={sym} score={score:.1f} "
+                            f"filled_slots={placed}/{slots}"
+                        )
                         if placed > 0:
                             self.manage_position_exits()
 
@@ -3464,9 +4730,7 @@ class VelocityEngine:
                         else:
                             price = ctx['live_price']
 
-                        if not self._entry_price_is_still_valid(
-                            sym, ctx, float(price), gap_max_pct=gap_max_pct
-                        ):
+                        if not self._entry_price_is_still_valid(sym, ctx, float(price), profile=profile):
                             continue
 
                         # Spread-aware marketable limit: price from validated ask,
@@ -3488,18 +4752,18 @@ class VelocityEngine:
                         atr_chandelier  = ctx.get('atr_chandelier', atr)
                         chandelier_dist = round(atr_chandelier * CHANDELIER_MULT, 2)
                         hard_stop_dist  = round(price * HARD_STOP_PCT, 2)
-                        risk_stop_dist  = min(chandelier_dist, hard_stop_dist)
+                        risk_stop_dist  = chandelier_dist
                         if np.isnan(risk_stop_dist) or risk_stop_dist <= 0:
                             logger.warning(
                                 f"SKIP {sym}: invalid risk stop distance "
-                                f"(chandelier=${chandelier_dist:.2f}, hard=${hard_stop_dist:.2f})"
+                                f"(broker_chandelier=${chandelier_dist:.2f}, "
+                                f"software_hard=${hard_stop_dist:.2f})"
                             )
                             continue
 
-                        # Whole shares only. Size by the stricter of capital bucket
-                        # and true dollars-at-risk to keep live sizing aligned with
-                        # the backtest risk model. Settled cash must cover the whole
-                        # intended order; otherwise skip rather than send dust trades.
+                        # Whole shares only. Risk-size from the broker-protected
+                        # Chandelier distance; hard/break-even exits are software
+                        # overlays and must not inflate live size.
                         bucket_qty = int(bucket_size / limit_price)
                         risk_qty   = int((equity * risk_per_trade_pct) / risk_stop_dist)
                         qty        = min(bucket_qty, risk_qty)
@@ -3593,14 +4857,35 @@ class VelocityEngine:
                             'entry_order_id': parent_trade.order.orderId,
                             'time':           datetime.now(_TZ_NY).isoformat(),
                             'qty':            filled_qty,
+                            'entry_qty':      filled_qty,
+                            'entry_risk_per_share': chandelier_dist,
+                            'initial_stop_loss': round(fill_price - chandelier_dist, 4),
                             'stop_loss':      round(fill_price - chandelier_dist, 2),
                             'stop_dist':      chandelier_dist,
                             'peak_price':     fill_price,
                             'volume':         ctx.get('volume', 0),
                             'score':          score,
                             'regime':         regime_label.lower(),
+                            'strategy_profile': profile.name,
+                            'entry_strategy': ctx.get('entry_strategy', profile.name),
+                            'entry_strategy_label': ctx.get('entry_strategy_label', profile.label),
+                            'relative_strength_63d': ctx.get('relative_strength_63d'),
+                            'relative_strength_126d': ctx.get('relative_strength_126d'),
+                            'return_13w':     ctx.get('return_13w'),
+                            'return_26w':     ctx.get('return_26w'),
+                            'weekly_uptrend': bool(ctx.get('weekly_uptrend')),
+                            'price_vs_52w_high': ctx.get('price_vs_52w_high'),
+                            'analyst_rating_score': ctx.get('analyst_rating_score'),
+                            'analyst_rating_total': ctx.get('analyst_rating_total'),
+                            'analyst_rating_source': ctx.get('analyst_rating_source'),
+                            'analyst_rating_period': ctx.get('analyst_rating_period'),
+                            'day_open':       ctx.get('day_open'),
+                            'day_high':       ctx.get('day_high'),
+                            'day_low':        ctx.get('day_low'),
                             'protection_status': 'pending',
                             'protection_reason': 'awaiting_trail_stop_confirmation',
+                            'profit_tiers_fired': [],
+                            'profit_tier_exits': [],
                         }
                         # Commission report sometimes lands synchronously with the fill.
                         # Capture it now if available; _on_commission_report handles it
@@ -3727,7 +5012,7 @@ class VelocityEngine:
                             f"FillPrice=${fill_price:.2f} "
                             f"Commission={'$'+str(self.state[sym]['commission']) if 'commission' in self.state[sym] else 'pending'} "
                             f"ChandelierStop=${round(fill_price-chandelier_dist,2):.2f} "
-                            f"(dist=${chandelier_dist:.2f}, risk_dist=${risk_stop_dist:.2f}, "
+                            f"(broker_dist=${chandelier_dist:.2f}, software_hard=${hard_stop_dist:.2f}, "
                             f"risk={risk_per_trade_pct*100:.1f}%) | "
                             f"Protection={'confirmed' if protection_confirmed else 'UNCONFIRMED'} | "
                             f"Settled remaining=${settled:.2f}"
