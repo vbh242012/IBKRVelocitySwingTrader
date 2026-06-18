@@ -1,5 +1,9 @@
 import csv
+import json
+import sys
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from src.analyst_ratings import AnalystRatingProvider, rating_from_counts
@@ -49,6 +53,11 @@ def test_rating_from_counts_is_bounded_and_confidence_adjusted():
     assert rating.score == pytest.approx(0.50)
     assert rating.total == 10
     assert rating.adjusted_score == pytest.approx(0.50)
+    assert rating.as_context()["analyst_rating_strong_buy"] == 4
+    assert rating.as_context()["analyst_rating_buy"] == 3
+    assert rating.as_context()["analyst_rating_hold"] == 2
+    assert rating.as_context()["analyst_rating_sell"] == 1
+    assert rating.as_context()["analyst_rating_strong_sell"] == 0
 
 
 def test_provider_uses_latest_dated_file_row_without_remote_lookahead(tmp_path):
@@ -93,6 +102,122 @@ def test_provider_uses_latest_dated_file_row_without_remote_lookahead(tmp_path):
     assert late.adjusted_score > early.adjusted_score
     assert missing.source == "no_historical_rating"
     assert missing.adjusted_score == 0.0
+
+
+def test_provider_falls_back_to_yahoo_free_source(tmp_path, monkeypatch):
+    class FakeTicker:
+        def __init__(self, symbol):
+            self.symbol = symbol
+
+        @property
+        def recommendations(self):
+            return pd.DataFrame([
+                {
+                    "period": "0m",
+                    "strongBuy": 4,
+                    "buy": 3,
+                    "hold": 2,
+                    "sell": 1,
+                    "strongSell": 0,
+                }
+            ])
+
+    monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(Ticker=FakeTicker))
+    provider = AnalystRatingProvider(
+        api_key="",
+        free_source="yahoo",
+        ratings_file="",
+        cache_file=str(tmp_path / "cache.json"),
+        allow_remote=True,
+    )
+
+    rating = provider.get("AAPL")
+
+    assert rating.source == "yahoo"
+    assert rating.period == "0m"
+    assert rating.total == 10
+    assert rating.score == pytest.approx(0.50)
+
+
+def test_provider_loads_cached_yahoo_rating_without_remote(tmp_path, monkeypatch):
+    cache_file = tmp_path / "cache.json"
+    cache_file.write_text(json.dumps({
+        "AAPL": {
+            "symbol": "AAPL",
+            "score": 0.4,
+            "total": 9,
+            "strong_buy": 3,
+            "buy": 3,
+            "hold": 2,
+            "sell": 1,
+            "strong_sell": 0,
+            "period": "0m",
+            "source": "yahoo",
+            "fetched_at": 4_000_000_000,
+        }
+    }))
+
+    provider = AnalystRatingProvider(
+        api_key="",
+        free_source="yahoo",
+        ratings_file="",
+        cache_file=str(cache_file),
+        allow_remote=False,
+    )
+
+    rating = provider.get("AAPL")
+
+    assert rating.source == "yahoo"
+    assert rating.total == 9
+    assert rating.adjusted_score == pytest.approx(0.4)
+
+
+def test_provider_does_not_use_free_source_for_historical_dates(tmp_path):
+    class ExplodingProvider(AnalystRatingProvider):
+        def _fetch_finnhub(self, symbol):
+            raise AssertionError("historical lookup should not call Finnhub")
+
+        def _fetch_yahoo(self, symbol):
+            raise AssertionError("historical lookup should not call Yahoo")
+
+    provider = ExplodingProvider(
+        api_key="key",
+        free_source="yahoo",
+        ratings_file="",
+        cache_file=str(tmp_path / "cache.json"),
+        allow_remote=True,
+    )
+
+    rating = provider.get("MSFT", as_of="2025-07-01")
+
+    assert rating.source == "no_historical_rating"
+    assert rating.adjusted_score == 0.0
+
+
+def test_provider_prefers_finnhub_when_configured(tmp_path):
+    provider = AnalystRatingProvider(
+        api_key="key",
+        free_source="yahoo",
+        ratings_file="",
+        cache_file=str(tmp_path / "cache.json"),
+        allow_remote=True,
+    )
+    calls = {"yahoo": 0}
+
+    def fake_finnhub(symbol):
+        return rating_from_counts(symbol, strong_buy=2, buy=1, source="finnhub")
+
+    def fake_yahoo(symbol):
+        calls["yahoo"] += 1
+        return rating_from_counts(symbol, sell=3, source="yahoo")
+
+    provider._fetch_finnhub = fake_finnhub
+    provider._fetch_yahoo = fake_yahoo
+
+    rating = provider.get("MSFT")
+
+    assert rating.source == "finnhub"
+    assert calls["yahoo"] == 0
 
 
 def test_analyst_rating_adjusts_candidate_score_but_cannot_exceed_bounds():

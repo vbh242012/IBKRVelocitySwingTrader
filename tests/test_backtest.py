@@ -102,9 +102,9 @@ def test_removed_backtest_kwargs_are_not_accepted():
 
 def test_optimizer_params_only_cover_active_exit_knobs():
     params = OptimizationParams()
-    assert set(params.__dataclass_fields__) == {"break_even_pct", "chandelier_mult"}
-    assert all(set(p.__dataclass_fields__) == {"break_even_pct", "chandelier_mult"} for p in quick_grid())
-    assert all(set(p.__dataclass_fields__) == {"break_even_pct", "chandelier_mult"} for p in default_grid())
+    assert set(params.__dataclass_fields__) == {"break_even_r", "chandelier_mult"}
+    assert all(set(p.__dataclass_fields__) == {"break_even_r", "chandelier_mult"} for p in quick_grid())
+    assert all(set(p.__dataclass_fields__) == {"break_even_r", "chandelier_mult"} for p in default_grid())
 
 
 def test_run_backtest_scoring_model_is_profile_owned():
@@ -187,6 +187,54 @@ def test_backtest_tiered_profit_plan_sells_remaining_delta_only():
     assert plan["sell_qty"] == 2
     assert [tier["tier_id"] for tier in plan["tiers"]] == ['2.00R']
     assert plan["tiers"][0]["planned_qty"] == 2
+
+
+def test_backtest_break_even_requires_r_target_and_close_confirmation():
+    bt = VelocityBacktest()
+    trade = Trade(
+        symbol="AAPL",
+        entry_date=pd.Timestamp("2026-01-02").date(),
+        entry_price=100.0,
+        qty=5,
+    )
+    trade.__dict__['_entry_risk_per_share'] = 4.0
+
+    assert not bt._break_even_exit_required(trade, pd.Series({"high": 103.9, "close": 99.0}))
+    assert not bt._break_even_exit_required(trade, pd.Series({"high": 104.1, "close": 101.0}))
+    assert bt._break_even_exit_required(trade, pd.Series({"high": 104.1, "close": 100.0}))
+
+
+def test_backtest_analyst_exit_requires_price_confirmation():
+    bt = VelocityBacktest()
+    trade = Trade(
+        symbol="AAPL",
+        entry_date=pd.Timestamp("2026-01-02").date(),
+        entry_price=100.0,
+        qty=5,
+    )
+    trade.__dict__['_analyst_rating_score'] = -0.50
+    today = pd.Timestamp("2026-01-05")
+
+    bt._analyst_context = lambda _symbol, _today: {
+        "analyst_rating_score": -0.50,
+        "analyst_rating_total": 12,
+    }
+
+    assert not bt._analyst_exit_required(
+        trade,
+        today,
+        pd.Series({"close": 105.0, "MA20": 102.0, "MA_BEAR_CROSS": False}),
+    )
+    assert bt._analyst_exit_required(
+        trade,
+        today,
+        pd.Series({"close": 99.0, "MA20": 102.0, "MA_BEAR_CROSS": False}),
+    )
+    assert bt._analyst_exit_required(
+        trade,
+        today,
+        pd.Series({"close": 101.0, "MA20": 102.0, "MA_BEAR_CROSS": False}),
+    )
 
 
 def test_profile_names_in_backtest_cli_match_single_profile():

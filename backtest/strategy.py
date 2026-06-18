@@ -3,8 +3,9 @@
 The backtester intentionally mirrors the live swing-entry code path:
 candidate rows are enriched with the same indicator fields, screened through
 ``evaluate_entry_rules``, ranked with the shared scorer, and exited with the
-same tiered profit trim, Chandelier, hard-stop, break-even,
-analyst-downgrade, strategy-exit, and time-stop stack.
+same tiered profit trim, Chandelier, hard-stop, R-based close-confirmed
+break-even, analyst-downgrade-with-price-confirmation, strategy-exit, and
+time-stop stack.
 
 Daily bars cannot know the intraday fill sequence, so entries fill no better
 than the completed signal-day close plus the configured slippage. Stop fills
@@ -51,7 +52,7 @@ from src.config import (
     ATR_PCT_MAX, HARD_STOP_PCT,
     SMA200_SLOPE_LOOKBACK,
     SPREAD_MAX_PCT,
-    RISK_PER_TRADE_PCT, BREAK_EVEN_PCT,
+    RISK_PER_TRADE_PCT, BREAK_EVEN_R_MULT,
     TIERED_PROFIT_EXIT_ENABLED, TIERED_PROFIT_EXIT_R_LEVELS,
     BACKTEST_COMMISSION_PER_ORDER,
     BEAR_PHASE_TRADING_ENABLED, BEAR_PHASE_RISK_MULT,
@@ -177,7 +178,7 @@ class VelocityBacktest:
     use_vix_filter  : if True, skip new entries when VIX is missing or > VIX_THRESHOLD
     vix_delay_bars  : daily-bar proxy for delayed VIX data; 0=current bar,
                       1=prior available VIX bar (used for 15-minute delayed research)
-    break_even_pct       : once profit exceeds this, floor the stop at entry (0.04 optimal)
+    break_even_r         : once profit reaches this R multiple, a close back at/below entry exits
     chandelier_mult      : ATR multiplier for trailing stop
     use_cache            : load/save downloaded data from backtest/.cache/
     """
@@ -195,7 +196,7 @@ class VelocityBacktest:
         use_spy_filter: bool  = True,
         use_vix_filter: bool  = True,
         vix_delay_bars: int   = 0,
-        break_even_pct:       float = BREAK_EVEN_PCT,
+        break_even_r:         float = BREAK_EVEN_R_MULT,
         chandelier_mult:      float = CHANDELIER_MULT,
         bear_phase_trading:   bool  = BEAR_PHASE_TRADING_ENABLED,
         commission_per_order: float = BACKTEST_COMMISSION_PER_ORDER,
@@ -216,7 +217,7 @@ class VelocityBacktest:
         self._use_spy_filter       = use_spy_filter
         self._use_vix_filter       = use_vix_filter
         self._vix_delay_bars       = max(0, int(vix_delay_bars or 0))
-        self._break_even_pct       = break_even_pct
+        self._break_even_r         = max(0.0, float(break_even_r or 0.0)) or 1.0
         self._chandelier_mult      = chandelier_mult
         self._bear_phase_trading   = bear_phase_trading
         self._round_trip_cost      = max(0.0, float(commission_per_order)) * 2.0
@@ -1312,7 +1313,42 @@ class VelocityBacktest:
 
         return True
 
-    def _analyst_exit_required(self, trade: Trade, today) -> bool:
+    def _break_even_target_price(self, trade: Trade) -> float:
+        risk_per_share = self._entry_risk_per_share(trade)
+        if risk_per_share <= 0 or trade.entry_price <= 0:
+            return float('inf')
+        return float(trade.entry_price) + risk_per_share * self._break_even_r
+
+    def _break_even_exit_armed(self, trade: Trade, row: pd.Series) -> bool:
+        if trade.__dict__.get('_profit_tiers_fired') or trade.__dict__.get('_profit_tier_sold_qty', 0):
+            return True
+        target = self._break_even_target_price(trade)
+        if not np.isfinite(target):
+            return False
+        high_mark = max(
+            float(trade.__dict__.get('_peak_high', trade.entry_price) or trade.entry_price),
+            float(row.get('high', trade.entry_price) or trade.entry_price),
+        )
+        return high_mark + 1e-9 >= target
+
+    def _break_even_exit_required(self, trade: Trade, row: pd.Series) -> bool:
+        if not self._break_even_exit_armed(trade, row):
+            return False
+        close = float(row.get('close', np.nan))
+        return bool(np.isfinite(close) and close <= trade.entry_price)
+
+    def _analyst_price_confirms_exit(self, trade: Trade, row: pd.Series) -> bool:
+        close = float(row.get('close', np.nan))
+        ma20 = float(row.get('MA20', np.nan))
+        if np.isfinite(close) and close <= trade.entry_price:
+            return True
+        if np.isfinite(close) and np.isfinite(ma20) and close < ma20:
+            return True
+        if bool(row.get('MA_BEAR_CROSS', False)):
+            return True
+        return False
+
+    def _analyst_exit_required(self, trade: Trade, today, row: Optional[pd.Series] = None) -> bool:
         if not ANALYST_RATING_EXIT_ENABLED:
             return False
         rating_ctx = self._analyst_context(trade.symbol, today)
@@ -1329,7 +1365,9 @@ class VelocityBacktest:
             rating_score = float(rating_score)
         except (TypeError, ValueError):
             return False
-        return bool(np.isfinite(rating_score) and rating_score <= ANALYST_RATING_SELL_THRESHOLD)
+        if not (np.isfinite(rating_score) and rating_score <= ANALYST_RATING_SELL_THRESHOLD):
+            return False
+        return self._analyst_price_confirms_exit(trade, row) if row is not None else False
 
     @staticmethod
     def _whole_share_qty(account_equity: float, bucket: float,
@@ -1498,7 +1536,7 @@ class VelocityBacktest:
     def _run_loop(self) -> BacktestResult:
         """
         Strategy loop:
-        - Tiered profit trims + Chandelier trailing stop + hard stop + break-even floor exit
+        - Tiered profit trims + Chandelier trailing stop + hard stop + close-confirmed break-even exit
         - ATR-based position sizing with 0.1% entry slippage
         - $2 round-trip commission per trade
         - Trading-bar hold count (not calendar days)
@@ -1581,18 +1619,10 @@ class VelocityBacktest:
                 # Hard stop: flat 7% below entry
                 hard_stop = t.entry_price * (1 - HARD_STOP_PCT)
 
-                # Break-even floor: once up BREAK_EVEN_PCT, stop ≥ entry
-                if peak_high >= t.entry_price * (1 + self._break_even_pct):
-                    be_stop = t.entry_price
-                else:
-                    be_stop = 0.0   # inactive until profit threshold reached
-
                 stop_candidates = [
                     ("chandelier_stop", chand_stop),
                     ("hard_stop", hard_stop),
                 ]
-                if be_stop > 0:
-                    stop_candidates.append(("break_even_stop", be_stop))
                 exit_stop_reason, effective_stop = max(stop_candidates, key=lambda item: item[1])
 
                 exit_reason = None
@@ -1661,7 +1691,10 @@ class VelocityBacktest:
                                 t.__dict__['_peak_high'] = max(peak_high, float(row['high']))
                             continue
 
-                if exit_reason is None and self._analyst_exit_required(t, today):
+                if exit_reason is None and self._break_even_exit_required(t, row):
+                    exit_reason = "break_even_close"
+                    exit_price = float(row['close'])
+                elif exit_reason is None and self._analyst_exit_required(t, today, row):
                     exit_reason = "analyst_downgrade"
                     exit_price = float(row['close'])
                 elif exit_reason is None and t.entry_strategy == "ma_cross" and bool(row.get('MA_BEAR_CROSS', False)):

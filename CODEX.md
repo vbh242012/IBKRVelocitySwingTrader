@@ -29,7 +29,8 @@
    - Removed profiles/code paths must not be reintroduced casually. Old ORB/current, standalone reversal/momentum, standalone Bollinger, standalone PSAR, legacy/enhanced/swing scoring models, and old backtest compatibility knobs were removed on 2026-06-11 to keep live code, tests, dashboard, and backtester aligned.
    - Current production intent: relative-strength-first swing momentum. A stock must first pass trend/leadership gates before any indicator timing sleeve can buy.
    - Live application scanner default: `VELOCITY_APP_SCANNER_SOURCE=hybrid`, meaning curated IBKR scanner hits plus a rotating full US common-stock universe batch. Strategy rules decide final momentum quality.
-   - Premarket scanner architecture: at `VELOCITY_APP_PREFILTER_START_TIME` (default `08:00 ET`), scan the full configured common-stock universe once, apply only static historical filters that cannot become true intraday, cache the surviving candidate list, and use that list for entry-window live screening. Do not spend the entry window rediscovering the full universe.
+   - Premarket scanner architecture: at `VELOCITY_APP_PREFILTER_START_TIME` (default `06:30 ET`), scan the full configured common-stock universe once, apply only static historical filters that cannot become true intraday, cache the surviving candidate list, and use that list for entry-window live screening. Do not spend the entry window rediscovering the full universe.
+   - Startup must not block until the 09:15 ET pre-entry sync. It should enter the main loop after the immediate safety audit so the 06:30 ET prefilter can run; the 09:15 ET sync/stop audit is a scheduled checkpoint.
    - If IBKR historical pacing is too slow to finish before `ENTRY_START`, keep `VELOCITY_APP_PREFILTER_STOP_AT_ENTRY_START=1`: save a partial same-day prefilter cache with `stopped_reason=entry_window_open` and trade only from the screened subset. Manual diagnostics can use `scripts/run_premarket_prefilter.py --ignore-entry-cutoff`.
    - Account type: cash account, T+1 settlement.
    - Live capital must come from IBKR `NetLiquidation` / `SettledCash`, not a local seed constant.
@@ -48,9 +49,10 @@
      - `bollinger_reversion`: standalone research profile only unless explicitly enabled. It means Bollinger lower-band reclaim after two prior closes below the lower band. Do not buy merely because price closed below the lower band.
      - `psar_flip`: standalone research profile only unless explicitly enabled. PSAR may be confirmation/trailing evidence, but it is not a default primary buy trigger.
    - Default confirmation rule: RSI must show momentum/recovery and at least two of MACD, OBV, PSAR, stochastic, or volume pace must confirm.
-   - Analyst ratings are bounded scoring/exit inputs only. Analyst consensus may improve or reduce rank, but it must never create a buy by itself or override weak price action.
+   - Analyst ratings are bounded scoring/exit inputs only. Analyst consensus may improve or reduce rank, but it must never create a buy by itself or force an exit without weak price action confirming the downgrade.
+   - Live/paper analyst ratings resolve in this order: dated local CSV, Finnhub when `VELOCITY_FINNHUB_API_KEY` is set, then Yahoo/yfinance when `VELOCITY_ANALYST_RATINGS_FREE_SOURCE=yahoo` is enabled. Backtests use only dated local CSV snapshots to avoid look-ahead.
    - Default minimum entry score is 50.
-   - Exit logic includes tiered profit trims, Chandelier trailing stop, hard stop, break-even floor, analyst downgrade exit, matching-sleeve exit, swing time stop, and emergency liquidation.
+   - Exit logic includes tiered profit trims, Chandelier trailing stop, hard stop, close-confirmed +1R/first-tier break-even exit, analyst downgrade exit only with price confirmation, matching-sleeve exit, swing time stop, and emergency liquidation.
    - Tiered profit exits are cumulative and whole-share rounded: at +1R, sell the nearest whole-share amount needed to have sold about 20% of the original quantity; at +1.5R, reach about 40% sold; at +2R, reach about 60% sold. `R` is the original per-share Chandelier risk distance captured at entry. The remaining runner stays protected by the broker trailing stop unless another safety exit requires liquidation.
    - Default swing time stop is 10 trading bars when the position is not above breakeven. The maintained profile disables same-day EOD churn and Friday cleanup by default.
    - The VIX risk filter is mandatory for live entries. If VIX market data is missing, invalid, or above the configured threshold, the engine must skip new entries while still managing existing positions.
@@ -138,13 +140,13 @@
 
 10. Live-safety fixes carried forward from the original project review
 
-   - Never set IBKR `goodAfterTime` to a past timestamp. Entry BUY orders omit it after the configured entry gate, currently 10:15 ET.
+   - Never set IBKR `goodAfterTime` to a past timestamp. Entry BUY orders omit it after the configured entry gate, currently 09:45 ET.
    - In an IBKR cash account, `liquidate()` cancels active SELL orders, including protective TRAIL orders, before submitting the market exit. IBKR can otherwise reject the exit as a potential oversell because another full-size SELL is already live. If the market exit is rejected or placement fails, state is retained, `pending_exit` is cleared, an alert is emitted, and `_audit_stop_orders()` rebuilds protection immediately.
    - Liquidation market sells must be SMART-routed even if IBKR reports the position contract with a native exchange.
    - Filled liquidation attempts mark state `pending_exit=True`; state is removed only after IBKR sync confirms the position is flat.
    - `_sync_positions_from_ibkr()` must backfill `fill_price`, `broker_avg_cost`, and `peak_price` for positions recovered after a restart.
    - `_preflight_order()` must handle both `OrderState` and `[OrderState]` returns from IBKR `whatIfOrder()`.
-   - Live break-even protection is dual enforced: dashboard/effective stop floors at entry after the 4% threshold, and `manage_position_exits()` market-sells if a prior 4%+ winner retraces to entry.
+   - Live break-even protection is R-based: it arms after the first profit tier or the configured +1R threshold, then `manage_position_exits()` sells only after price is at/below entry and a close confirms the giveback.
 
 11. Latest production-safety changes to preserve
 
@@ -155,7 +157,7 @@
    - `liquidate()` cancels active SELL protection before a cash-account market exit, then catches IBKR `placeOrder()` exceptions, clears `pending_exit`, retains state, alerts, and runs `_audit_stop_orders()` so protection is rebuilt if the exit cannot be placed or is rejected.
    - After IBKR confirms a symbol is flat, `_sync_positions_from_ibkr()` must cancel any leftover SELL exit orders before removing local state. This prevents orphaned trailing stops from becoming unintended future sell orders.
    - Liquidation state removal remains confirmation-based: one missing IBKR snapshot only defers removal unless `FORCE_EXIT_ALL` is active.
-   - `backtest/optimizer.py` must optimize only active `indicator_swing` exit parameters: break-even threshold and Chandelier multiple.
+   - `backtest/optimizer.py` must optimize only active `indicator_swing` exit parameters: break-even R threshold and Chandelier multiple.
    - `run_backtest.py` must expose only current live/backtest strategy controls.
 
 12. Latest validation record
@@ -603,8 +605,9 @@
      - `SBUX`: qty 4, stop `$98.92`, trail `4.807%`
      - `OXY`: qty 10, stop `$55.22`, trail `6.5614%`
      - `CSCO`: qty 4, stop `$114.05`, trail `5.5749%`
-   - Live autotrader reached the expected pre-entry wait state:
-     `Waiting until 09:15 ET for pre-entry position sync & stop audit`.
+   - Live autotrader should finish startup and enter the main loop promptly;
+     the 09:15 ET pre-entry position sync and stop audit is now a scheduled
+     checkpoint, not a blocking startup wait.
 
    Validation after the code changes:
 
@@ -621,9 +624,9 @@
 22. Protective TRAIL activation gate, 2026-05-28
 
    Requirement: protective TRAIL sell orders must not activate before 09:32 ET.
-   This is deliberately separate from the 10:15 ET new-entry gate: existing
+   This is deliberately separate from the 09:45 ET new-entry gate: existing
    positions get protection after the first 2 opening minutes, while new BUY
-   entries still wait until 10:15 ET.
+   entries still wait until 09:45 ET.
 
    Implementation details to preserve:
 
@@ -632,7 +635,7 @@
    - New pre-09:32 audit-created TRAIL orders set
      `goodAfterTime=YYYYMMDD 09:32:00 US/Eastern`.
    - New entry bracket parent BUY and child TRAIL orders share the same
-     `goodAfterTime` value when submitted before 10:15 ET; after 10:15 ET the
+     `goodAfterTime` value when submitted before 09:45 ET; after 09:45 ET the
      field is omitted because IBKR rejects past activation timestamps.
    - Existing GTC TRAIL orders recovered from IBKR are checked during stop
      audit. If they lack the current day's 09:32 ET `goodAfterTime`, the engine
@@ -660,7 +663,7 @@
    CSCO | order 7258 | clientId 1 | qty 4  | goodAfterTime 20260528 10:00:00 US/Eastern | stop 114.05 | trail 5.5749%
    ```
 
-   Live autotrader was restarted with `clientId=1` and reached the normal
+   Live autotrader was restarted with `clientId=1` and reached the then-normal
    pre-entry wait state.
 
    Validation after the change:
@@ -806,9 +809,9 @@
 
    - `PRE_ENTRY_SYNC_TIME` is `09:15 ET`. This is the early morning account,
      position, and stop-order health check.
-   - Startup also runs one immediate position sync and protective-stop audit
-     before the 09:15 wait. This makes restarts safer when the engine comes up
-     long before the scheduled pre-entry sync.
+   - Startup also runs one immediate position sync and protective-stop audit.
+     It must not sleep until 09:15 ET, because the 06:30 ET full-universe
+     prefilter runs from the main loop.
    - `POST_OPEN_AUDIT_TIME` is `09:35 ET`. This is a separate mandatory
      post-open position sync and protective-stop audit after the 09:30 opening
      auction and after TRAIL orders become active at 09:32 ET.

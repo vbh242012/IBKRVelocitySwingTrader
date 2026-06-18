@@ -38,6 +38,7 @@ def test_dashboard_bucket_uses_deployable_settled_cash(dashboard_files):
             "qty": 1.0,
             "stop_loss": 90.0,
             "effective_stop": 95.0,
+            "entry_risk_per_share": 5.0,
             "time": now.isoformat(),
             "strategy_profile": "indicator_swing",
             "relative_strength_63d": 0.067,
@@ -48,6 +49,11 @@ def test_dashboard_bucket_uses_deployable_settled_cash(dashboard_files):
             "price_vs_52w_high": 0.93,
             "analyst_rating_score": 0.4,
             "analyst_rating_total": "12",
+            "analyst_rating_strong_buy": "3",
+            "analyst_rating_buy": "4",
+            "analyst_rating_hold": "4",
+            "analyst_rating_sell": "1",
+            "analyst_rating_strong_sell": "0",
             "analyst_rating_source": "csv",
             "analyst_rating_period": "2026-06-01",
             "protection_status": "confirmed",
@@ -72,7 +78,13 @@ def test_dashboard_bucket_uses_deployable_settled_cash(dashboard_files):
     assert data["strategy"]["allow_bear_phase_entries"] is False
     assert set(data["strategy"]["indicator_sleeves"]) == {"ma_cross"}
     assert data["positions"][0]["relative_strength_63d"] == pytest.approx(0.067)
+    assert data["positions"][0]["r_multiple"] == pytest.approx(0.2)
     assert data["positions"][0]["analyst_rating_total"] == 12
+    assert data["positions"][0]["analyst_rating_strong_buy"] == 3
+    assert data["positions"][0]["analyst_rating_buy"] == 4
+    assert data["positions"][0]["analyst_rating_hold"] == 4
+    assert data["positions"][0]["analyst_rating_sell"] == 1
+    assert data["positions"][0]["analyst_rating_strong_sell"] == 0
     assert data["positions"][0]["protection_status"] == "confirmed"
 
 
@@ -134,5 +146,9 @@ def test_dashboard_equity_chart_uses_intraday_time_labels():
     assert "No EOD Churn" in html
     assert "Swing Time Stop" in html
     assert "Analyst Downgrade" in html
+    assert "ANALYST SCORE" in html
+    assert "ANALYST VOTES" in html
+    assert "<th>R</th>" in html
+    assert "B:${buyVotes" in html
     assert "__SWING_" not in html
     assert "Velocity Exit" not in html

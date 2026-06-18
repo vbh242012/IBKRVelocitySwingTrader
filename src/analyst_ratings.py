@@ -5,9 +5,10 @@ bounded score in [-1, 1] derived from recommendation counts:
 
     strongBuy=+2, buy=+1, hold=0, sell=-1, strongSell=-2
 
-Live mode can fetch Finnhub recommendation trends when configured.  Backtests
-should use dated local snapshots only, so historical research does not leak
-today's analyst consensus into old trades.
+Live mode can fetch Finnhub recommendation trends when configured, and can fall
+back to Yahoo/yfinance as a free source.  Backtests should use dated local
+snapshots only, so historical research does not leak today's analyst consensus
+into old trades.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from src.config import (
     ANALYST_RATINGS_CACHE_FILE,
     ANALYST_RATINGS_ENABLED,
     ANALYST_RATINGS_FILE,
+    ANALYST_RATINGS_FREE_SOURCE,
     ANALYST_RATINGS_TTL_SEC,
     FINNHUB_API_KEY,
 )
@@ -61,6 +63,11 @@ class AnalystRating:
             "analyst_rating_score": self.adjusted_score,
             "analyst_rating_raw_score": self.score,
             "analyst_rating_total": self.total,
+            "analyst_rating_strong_buy": self.strong_buy,
+            "analyst_rating_buy": self.buy,
+            "analyst_rating_hold": self.hold,
+            "analyst_rating_sell": self.sell,
+            "analyst_rating_strong_sell": self.strong_sell,
             "analyst_rating_source": self.source,
             "analyst_rating_period": self.period,
         }
@@ -169,7 +176,7 @@ def rating_from_row(row: dict, *, source: str) -> AnalystRating:
 
 
 class AnalystRatingProvider:
-    """Rating provider with CSV snapshots, JSON cache, and optional Finnhub live fetch."""
+    """Rating provider with CSV snapshots, JSON cache, and live recommendation fetches."""
 
     def __init__(
         self,
@@ -177,6 +184,7 @@ class AnalystRatingProvider:
         enabled: bool = ANALYST_RATINGS_ENABLED,
         allow_remote: bool = True,
         api_key: str = FINNHUB_API_KEY,
+        free_source: str = ANALYST_RATINGS_FREE_SOURCE,
         ratings_file: str = ANALYST_RATINGS_FILE,
         cache_file: str = ANALYST_RATINGS_CACHE_FILE,
         ttl_sec: float = ANALYST_RATINGS_TTL_SEC,
@@ -184,6 +192,7 @@ class AnalystRatingProvider:
         self.enabled = bool(enabled)
         self.allow_remote = bool(allow_remote)
         self.api_key = str(api_key or "").strip()
+        self.free_source = str(free_source or "").strip().lower()
         self.ratings_file = str(ratings_file or "").strip()
         self.cache_file = str(cache_file or "").strip()
         self.ttl_sec = max(60.0, float(ttl_sec or 0))
@@ -312,6 +321,61 @@ class AnalystRatingProvider:
             source="finnhub",
         )
 
+    def _yahoo_frames(self, symbol: str) -> Iterable:
+        import yfinance as yf
+
+        ticker = yf.Ticker(symbol)
+        for attr in ("recommendations", "recommendations_summary"):
+            try:
+                value = getattr(ticker, attr, None)
+                if callable(value):
+                    value = value()
+            except Exception:
+                continue
+            if value is None:
+                continue
+            empty = getattr(value, "empty", False)
+            if empty:
+                continue
+            yield value
+
+    def _fetch_yahoo(self, symbol: str) -> Optional[AnalystRating]:
+        if (
+            not self.allow_remote
+            or self.free_source in {"", "0", "false", "none", "off", "disabled"}
+            or self.free_source not in {"yahoo", "yfinance"}
+        ):
+            return None
+
+        for frame in self._yahoo_frames(symbol):
+            try:
+                rows = frame.reset_index(drop=True).to_dict("records")
+            except Exception:
+                continue
+            latest_rating: Optional[AnalystRating] = None
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row.setdefault("symbol", symbol)
+                rating = rating_from_counts(
+                    symbol,
+                    strong_buy=_coerce_int(row, "strongBuy", "strong_buy"),
+                    buy=_coerce_int(row, "buy"),
+                    hold=_coerce_int(row, "hold"),
+                    sell=_coerce_int(row, "sell"),
+                    strong_sell=_coerce_int(row, "strongSell", "strong_sell"),
+                    period=_row_period(row),
+                    source="yahoo",
+                )
+                if rating.total <= 0:
+                    continue
+                if str(rating.period or "").strip().lower() in {"0m", "0", "latest"}:
+                    return rating
+                latest_rating = latest_rating or rating
+            if latest_rating is not None:
+                return latest_rating
+        return None
+
     def get(self, symbol: str, *, as_of: Optional[date | datetime | str] = None) -> AnalystRating:
         symbol = str(symbol or "").strip().upper()
         if not symbol or not self.enabled:
@@ -333,6 +397,11 @@ class AnalystRatingProvider:
             fetched = self._fetch_finnhub(symbol)
         except Exception:
             fetched = None
+        if fetched is None:
+            try:
+                fetched = self._fetch_yahoo(symbol)
+            except Exception:
+                fetched = None
         if fetched is None:
             return neutral_rating(symbol, source="unavailable")
         self._cache[symbol] = fetched

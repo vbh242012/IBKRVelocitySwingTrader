@@ -54,6 +54,7 @@ from src.config import (
     SWING_TIME_STOP_BARS,
     INDICATOR_SWING_MIN_SCORE,
     ANALYST_RATINGS_ENABLED,
+    ANALYST_RATINGS_FREE_SOURCE,
     ANALYST_RATING_SCORE_WEIGHT,
     ANALYST_RATING_SELL_THRESHOLD,
     ANALYST_RATING_EXIT_ENABLED,
@@ -244,6 +245,14 @@ def get_state():
             hold_h = 0.0
         unreal     = round((cur - ep) * qty, 2)
         unreal_pct = round((cur - ep) / ep * 100, 2) if ep else 0.0
+        risk_per_share = (
+            _finite_float_or_none(d.get("entry_risk_per_share"))
+            or _finite_float_or_none(d.get("stop_dist"))
+        )
+        r_multiple = (
+            round((cur - ep) / risk_per_share, 2)
+            if ep > 0 and risk_per_share and risk_per_share > 0 else None
+        )
         total_unrealized += unreal
         positions.append({
             "symbol":          sym,
@@ -259,6 +268,7 @@ def get_state():
             "total_amount":    round(ep * qty, 2),
             "unrealized":      unreal,
             "unrealized_pct":  unreal_pct,
+            "r_multiple":      r_multiple,
             "stop_loss":       sl,
             "effective_stop":  effective_sl,
             "volume":          vol,
@@ -273,6 +283,11 @@ def get_state():
             "price_vs_52w_high":      _finite_float_or_none(d.get("price_vs_52w_high")),
             "analyst_rating_score":   _finite_float_or_none(d.get("analyst_rating_score")),
             "analyst_rating_total":   _int_or_none(d.get("analyst_rating_total")),
+            "analyst_rating_strong_buy":  _int_or_none(d.get("analyst_rating_strong_buy")),
+            "analyst_rating_buy":         _int_or_none(d.get("analyst_rating_buy")),
+            "analyst_rating_hold":        _int_or_none(d.get("analyst_rating_hold")),
+            "analyst_rating_sell":        _int_or_none(d.get("analyst_rating_sell")),
+            "analyst_rating_strong_sell": _int_or_none(d.get("analyst_rating_strong_sell")),
             "analyst_rating_source":  d.get("analyst_rating_source"),
             "analyst_rating_period":  d.get("analyst_rating_period"),
             "profit_tiers_fired":     d.get("profit_tiers_fired") or [],
@@ -334,6 +349,7 @@ def get_state():
             "max_atr_pct":                   profile.max_atr_pct,
             "max_spread_pct":                profile.max_spread_pct,
             "analyst_ratings_enabled":       ANALYST_RATINGS_ENABLED,
+            "analyst_ratings_free_source":   ANALYST_RATINGS_FREE_SOURCE,
             "analyst_rating_score_weight":   ANALYST_RATING_SCORE_WEIGHT,
             "analyst_rating_sell_threshold": ANALYST_RATING_SELL_THRESHOLD,
             "analyst_rating_exit_enabled":   ANALYST_RATING_EXIT_ENABLED,
@@ -680,15 +696,17 @@ footer a{color:var(--dim);text-decoration:none;}
           <th>PROFIT TIERS</th>
           <th>TOTAL COST</th>
           <th>UNREALIZED P&amp;L</th>
+          <th>R</th>
           <th>STOP (TRAIL)</th>
           <th>RS 63D</th>
-          <th>ANALYST</th>
+          <th>ANALYST SCORE</th>
+          <th>ANALYST VOTES</th>
           <th>PROTECTION</th>
           <th>HOLD TIME</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr class="empty"><td colspan="15">Waiting for data…</td></tr>
+        <tr class="empty"><td colspan="17">Waiting for data…</td></tr>
       </tbody>
     </table>
   </div>
@@ -737,7 +755,7 @@ const EXIT_CONDITIONS = [
   ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(22) × 2.0 from peak price; IB raises the protective stop as price climbs"],
   ["2", "Profit Tiers",     "ex", "__TIERED_PROFIT_RULE__"],
   ["3", "Hard Stop",        "ex", "Software exit: 7% drawdown from fill price triggers immediate Market SELL regardless of ATR distance"],
-  ["4", "Break-Even Floor", "ex", "Software exit: once profit exceeds 4%, a retrace to fill price triggers a Market SELL"],
+  ["4", "Break-Even Floor", "ex", "Software exit: after +1R/first profit tier, a close-confirmed retrace to fill price triggers a Market SELL"],
   ["5", "Strategy Exit",    "ex", "Positions exit on the matching sleeve rule that opened them: MA bearish cross for the default profile, or the standalone research profile's own reversal rule"],
   ["6", "Swing Time Stop",  "ex", "__SWING_TIME_STOP_RULE__"],
   ["7", "Analyst Downgrade","ex", "__ANALYST_EXIT_RULE__"],
@@ -824,8 +842,9 @@ function render(d) {
   document.getElementById('strategy').textContent = label;
   const analystState = document.getElementById('analyst-state');
   const analystOn = !!strat.analyst_ratings_enabled;
+  const analystSource = (strat.analyst_ratings_free_source || 'configured').toString().toUpperCase();
   analystState.textContent = analystOn
-    ? `ON · ±${(+strat.analyst_rating_score_weight || 0).toFixed(0)} pts`
+    ? `ON · ${analystSource} · ±${(+strat.analyst_rating_score_weight || 0).toFixed(0)} pts`
     : 'OFF';
   analystState.className = 'sval ' + (analystOn ? 'g' : 'd');
 
@@ -902,7 +921,7 @@ function render(d) {
   // Portfolio
   const tb = document.getElementById('tbody');
   if (!d.positions || d.positions.length === 0) {
-    tb.innerHTML = '<tr class="empty"><td colspan="15">No open positions</td></tr>';
+    tb.innerHTML = '<tr class="empty"><td colspan="17">No open positions</td></tr>';
     return;
   }
   tb.innerHTML = d.positions.map(p => {
@@ -919,6 +938,19 @@ function render(d) {
     const arTxt = ar == null
       ? '—'
       : `${ar > 0 ? '+' : ''}${(+ar).toFixed(2)}${p.analyst_rating_total != null ? '/' + p.analyst_rating_total : ''}`;
+    const rVal = p.r_multiple;
+    const rCls = rVal == null ? 'd' : rVal >= 1 ? 'g' : rVal >= 0 ? 'y' : 'r';
+    const rTxt = rVal == null ? '—' : `${rVal >= 0 ? '+' : ''}${(+rVal).toFixed(2)}R`;
+    const buyVotes = (p.analyst_rating_strong_buy ?? null) == null && (p.analyst_rating_buy ?? null) == null
+      ? null
+      : (+p.analyst_rating_strong_buy || 0) + (+p.analyst_rating_buy || 0);
+    const holdVotes = p.analyst_rating_hold == null ? null : (+p.analyst_rating_hold || 0);
+    const sellVotes = (p.analyst_rating_sell ?? null) == null && (p.analyst_rating_strong_sell ?? null) == null
+      ? null
+      : (+p.analyst_rating_sell || 0) + (+p.analyst_rating_strong_sell || 0);
+    const votesTxt = buyVotes == null && holdVotes == null && sellVotes == null
+      ? '—'
+      : `B:${buyVotes ?? 0} H:${holdVotes ?? 0} S:${sellVotes ?? 0}`;
     const prot = cleanLabel(p.protection_status || 'unknown');
     const protCls = p.protection_status === 'confirmed' ? 'g' : p.protection_status === 'pending' ? 'y' : 'd';
     const tierRecords = Array.isArray(p.profit_tier_exits) ? p.profit_tier_exits : [];
@@ -936,9 +968,11 @@ function render(d) {
       <td class="c" style="font-size:10px">${tierTxt}</td>
       <td>${$f(p.total_amount)}</td>
       <td class="${ucls}">${usign}${$f(unr)}<br><span style="font-size:10px;opacity:.8">${usign}${unrP.toFixed(2)}%</span></td>
+      <td class="${rCls}" style="font-weight:700">${rTxt}</td>
       <td class="sl">${$f(p.effective_stop ?? p.stop_loss)}${p.effective_stop > p.stop_loss ? ' ↑' : ''}</td>
       <td class="${rsCls}">${pct(rs63, 1, true)}</td>
       <td class="${arCls}">${arTxt}</td>
+      <td class="${arCls}" style="font-size:10px">${votesTxt}</td>
       <td class="${protCls}" style="font-size:10px">${prot}</td>
       <td class="hn">${holdLabel(p.hold_hours)}</td>
     </tr>`;
@@ -1059,7 +1093,8 @@ _eod_stop_text = (
     else "protective stop confirmation is not required"
 )
 _analyst_exit_rule = (
-    f"Enabled: rating score <= {ANALYST_RATING_SELL_THRESHOLD:+.2f} triggers a Market SELL on the next risk pass"
+    f"Enabled: rating score <= {ANALYST_RATING_SELL_THRESHOLD:+.2f} can exit only when price confirms weakness "
+    "(at/below entry, below MA20, or EMA/SMA failure)"
     if ANALYST_RATING_EXIT_ENABLED
     else "Disabled: analyst ratings adjust entry ranking only; downgrade exits are not active"
 )
@@ -1069,7 +1104,7 @@ _tiered_profit_rule = (
         f"+{target_r:.1f}R -> {fraction * 100:.0f}% sold"
         for target_r, fraction in TIERED_PROFIT_EXIT_R_LEVELS
     )
-    + "; R is the original per-share Chandelier risk distance and the remaining runner stays protected by the broker trailing stop"
+    + "; R is the original per-share Chandelier risk distance; break-even exits arm after the first tier/+1R and require a close back at/below entry; the remaining runner stays protected by the broker trailing stop"
     if TIERED_PROFIT_EXIT_ENABLED
     else "Disabled: winners remain fully sized until the normal exit stack closes them"
 )

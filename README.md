@@ -25,15 +25,18 @@ been removed; `indicator_swing` is the only maintained strategy profile:
   cumulative profit tiers at +1R, +1.5R, and +2R so roughly 20%, 40%, and 60%
   of the original position has been sold. `R` is the original per-share
   Chandelier risk distance captured at entry. The remaining runner is protected
-  by the broker Chandelier stop; software hard stop, break-even protection,
-  analyst downgrade, and a 10-bar no-progress time stop remain active safety
-  exits. Position size is based on the broker-protected Chandelier distance.
+  by the broker Chandelier stop; software hard stop, close-confirmed break-even
+  protection after +1R/first tier, analyst downgrade only with price weakness,
+  and a 10-bar no-progress time stop remain active safety exits. Position size
+  is based on the broker-protected Chandelier distance.
 
-Analyst ratings are optional confirmation. With `VELOCITY_FINNHUB_API_KEY`, live
-and paper trading can fetch Finnhub recommendation trends and apply a bounded
-score bonus/penalty. Backtests do not fetch current analyst ratings; they only
-use a dated local CSV snapshot from `VELOCITY_ANALYST_RATINGS_FILE` so historical
-research does not cheat with future information.
+Analyst ratings are optional confirmation. Live and paper trading use a dated
+local CSV first, Finnhub recommendation trends when `VELOCITY_FINNHUB_API_KEY`
+is configured, and Yahoo/yfinance as the default free fallback via
+`VELOCITY_ANALYST_RATINGS_FREE_SOURCE=yahoo`. Backtests do not fetch current
+analyst ratings; they only use a dated local CSV snapshot from
+`VELOCITY_ANALYST_RATINGS_FILE` so historical research does not cheat with
+future information.
 
 ## Application Scanner
 
@@ -49,12 +52,15 @@ Trader listing files. `VELOCITY_APP_SCANNER_BATCH_SIZE` controls how many
 universe symbols are added per scan cycle. Final buy decisions still come from
 the same local screener/profile rules inside the live engine.
 
-At `VELOCITY_APP_PREFILTER_START_TIME` (`08:00 ET` by default), the app runs a
+At `VELOCITY_APP_PREFILTER_START_TIME` (`06:30 ET` by default), the app runs a
 premarket historical universe sieve. It scans the full configured universe once,
 rejects symbols that cannot satisfy static daily rules during the session
 (history length, daily liquidity, MA structure, SMA200 slope, stable daily
 momentum confirmations, and stable sleeve feasibility), and writes the surviving
 candidate list to `premarket_universe_prefilter.json` in the runtime folder.
+Startup enters the main loop immediately after the initial safety audit; the
+09:15 ET pre-entry stop audit is a scheduled checkpoint, not a blocking startup
+sleep, so the 06:30 prefilter can run on time.
 During the entry window, the scanner uses that candidate list and only checks
 rules that can still change intraday, such as live price, spread, volume pace,
 reclaims, prior-high breaks, and orderability.

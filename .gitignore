@@ -92,6 +92,8 @@ velocity_engine.lock
 
 # Backtest/download caches
 backtest/.cache/
+# Runtime analyst-ratings cache (fetched live; not source-controlled)
+analyst_ratings_cache.json
 
 # Local assistant/tool scratch directories
 .agents/

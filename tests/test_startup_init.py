@@ -73,6 +73,7 @@ def _make_engine(ib_mock=None, state=None):
     engine._daily_scan_skip    = {}
     engine._last_audit_date    = None
     engine._last_audit_at      = None
+    engine._last_pre_entry_sync_date = None
     engine._last_post_open_audit_date = None
     engine._last_premarket_readiness_date = None
     engine._last_post_close_maintenance_date = None
@@ -366,7 +367,7 @@ class TestInitialize:
         assert not hasattr(engine, 'capital_seed')
 
     def test_syncs_positions_from_ibkr(self):
-        """Phase 1 and Phase 2 each call _sync_positions_from_ibkr once (total 2)."""
+        """Startup performs the immediate source-of-truth position sync once."""
         ib = MagicMock()
         ib.accountSummary.return_value = [_nl_item('5000.0')]
         ib.positions.return_value = []
@@ -375,10 +376,10 @@ class TestInitialize:
              patch.object(engine, '_update_position_prices'),                \
              patch.object(engine, '_write_dashboard_data'):
             engine._initialize()
-        assert mock_sync.call_count == 2
+        assert mock_sync.call_count == 1
 
     def test_updates_prices_when_positions_exist(self):
-        """Prices are updated in both Phase 1 (immediate) and Phase 2 (final)."""
+        """Prices are updated during the immediate startup audit when positions exist."""
         ib = MagicMock()
         ib.accountSummary.return_value = [_nl_item('5000.0')]
         ib.positions.return_value = []
@@ -392,7 +393,7 @@ class TestInitialize:
              patch.object(engine, '_update_position_prices') as mock_up, \
              patch.object(engine, '_write_dashboard_data'):
             engine._initialize()
-        assert mock_up.call_count == 2   # once per phase
+        assert mock_up.call_count == 1
 
     def test_audits_stops_when_positions_exist(self):
         ib = MagicMock()
@@ -408,7 +409,7 @@ class TestInitialize:
              patch.object(engine, '_update_position_prices'),          \
              patch.object(engine, '_write_dashboard_data'):
             engine._initialize()
-        assert mock_audit.call_count == 2
+        assert mock_audit.call_count == 1
 
     def test_immediate_audit_when_unprotected_positions_exist(self):
         """Unprotected positions receive the immediate startup audit without waiting."""
@@ -425,8 +426,8 @@ class TestInitialize:
              patch.object(engine, '_write_dashboard_data'):
             engine._initialize()
 
-        assert mock_sync.call_count == 2
-        assert mock_audit.call_count == 2
+        assert mock_sync.call_count == 1
+        assert mock_audit.call_count == 1
 
     def test_skips_audit_when_no_positions(self):
         ib = MagicMock()
@@ -452,7 +453,7 @@ class TestInitialize:
         mock_up.assert_not_called()
 
     def test_writes_dashboard_at_end(self):
-        """Dashboard is written after Phase 1 (snapshot) and again after Phase 2 (final)."""
+        """Dashboard is written after the immediate startup snapshot."""
         ib = MagicMock()
         ib.accountSummary.return_value = [_nl_item('5000.0')]
         ib.positions.return_value = []
@@ -460,8 +461,24 @@ class TestInitialize:
         with patch.object(engine, '_sync_positions_from_ibkr'), \
              patch.object(engine, '_write_dashboard_data') as mock_wd:
             engine._initialize()
-        assert mock_wd.call_count == 2
-        mock_wd.assert_called_with(connected=True)   # both calls use connected=True
+        mock_wd.assert_called_once_with(connected=True)
+
+    def test_initialize_does_not_sleep_until_pre_entry_sync(self):
+        """Startup must enter the main loop promptly so the 06:30 prefilter can run."""
+        ib = MagicMock()
+        ib.accountSummary.return_value = [_nl_item('5000.0')]
+        ib.positions.return_value = []
+        ib.reqAllOpenOrders.return_value = []
+        engine = _make_engine(ib)
+        fake_now = pytz.timezone('US/Eastern').localize(datetime(2026, 5, 19, 6, 30, 0))
+
+        with patch.object(engine, '_write_dashboard_data'), \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine._initialize()
+
+        ib.sleep.assert_not_called()
 
     def test_initialize_called_before_run_cycle_in_run(self):
         """run() must call _initialize() before the first run_cycle()."""
@@ -551,16 +568,17 @@ class TestUnrealizedPnl:
         engine._update_position_prices()
         assert engine.state['TSLA']['current_price'] == 115.0
 
-    def test_effective_stop_floored_at_entry_after_break_even_threshold(self):
-        from src.config import BREAK_EVEN_PCT
+    def test_break_even_armed_after_r_based_threshold(self):
         engine = self._engine_with_pos(
             entry=100.0,
             qty=10,
-            cur_price=100.0 * (1 + BREAK_EVEN_PCT + 0.01),
+            cur_price=120.0,
         )
-        engine.state['TSLA']['stop_dist'] = 12.0
+        engine.state['TSLA']['stop_dist'] = 20.0
         engine._update_position_prices()
 
+        assert engine.state['TSLA']['break_even_armed'] is True
+        assert engine.state['TSLA']['break_even_target_price'] == pytest.approx(120.0)
         assert engine.state['TSLA']['effective_stop'] == pytest.approx(100.0)
 
     def test_percent_trail_keeps_broker_stop_as_effective_stop(self):
@@ -1154,70 +1172,113 @@ class TestPreflightOrder:
         assert engine._preflight_order(contract, order, 'AAPL') is True
 
 
-# ── _wait_for_pre_entry_sync ──────────────────────────────────────────────────
+# ── _maybe_pre_entry_sync_audit ───────────────────────────────────────────────
 
-class TestPreEntrySyncWait:
+class TestPreEntrySyncAudit:
     _TZ_NY = pytz.timezone('US/Eastern')
 
-    def test_sleeps_when_before_pre_entry_time(self):
-        """Engine started before pre-entry sync time → ib.sleep called with correct duration."""
+    def test_waits_until_checkpoint_time(self):
         from src.config import PRE_ENTRY_SYNC_TIME
         ib = MagicMock()
-        engine = _make_engine(ib)
+        engine = _make_engine(ib, state={'AAPL': {
+            'price': 100.0,
+            'qty': 1.0,
+            'stop_loss': 94.0,
+            'stop_dist': 6.0,
+            'time': '2026-05-19T10:00:00-04:00',
+        }})
 
         h, m = PRE_ENTRY_SYNC_TIME
-        # Simulate 'now' as 08:00 ET — well before the sync time
-        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, 8, 0, 0))
-        with patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
-            engine._wait_for_pre_entry_sync()
+        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, h, m - 1, 0))
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine._maybe_pre_entry_sync_audit()
 
-        ib.sleep.assert_called_once()
-        slept = ib.sleep.call_args[0][0]
-        expected = (h * 60 + m - 8 * 60) * 60
-        assert abs(slept - expected) < 2          # within 2 s of expected
-
-    def test_no_sleep_when_at_or_past_pre_entry_time(self):
-        """Engine started at or after pre-entry sync time → ib.sleep NOT called."""
-        ib = MagicMock()
-        engine = _make_engine(ib)
-
-        # Simulate 'now' as 10:20 ET — past both sync time and entry window
-        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, 10, 20, 0))
-        with patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
-            engine._wait_for_pre_entry_sync()
-
+        mock_sync.assert_not_called()
+        mock_audit.assert_not_called()
         ib.sleep.assert_not_called()
 
-    def test_no_sleep_on_intraday_restart(self):
-        """Intraday restart at 14:30 ET — already past pre-entry sync, no sleep."""
-        ib = MagicMock()
-        engine = _make_engine(ib)
-
-        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, 14, 30, 0))
-        with patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
-            engine._wait_for_pre_entry_sync()
-
-        ib.sleep.assert_not_called()
-
-    def test_sleep_duration_covers_gap_to_pre_entry_time(self):
-        """Sleep duration from 09:00 ET to PRE_ENTRY_SYNC_TIME should be exact."""
+    def test_runs_once_after_checkpoint(self):
         from src.config import PRE_ENTRY_SYNC_TIME
         ib = MagicMock()
-        engine = _make_engine(ib)
+        engine = _make_engine(ib, state={'AAPL': {
+            'price': 100.0,
+            'qty': 1.0,
+            'stop_loss': 94.0,
+            'stop_dist': 6.0,
+            'time': '2026-05-19T10:00:00-04:00',
+        }})
+
         h, m = PRE_ENTRY_SYNC_TIME
+        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, h, m, 0))
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch.object(engine, '_update_position_prices') as mock_prices, \
+             patch.object(engine, '_write_dashboard_data') as mock_dashboard, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine._maybe_pre_entry_sync_audit()
 
-        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, 9, 0, 0))
-        with patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
-            engine._wait_for_pre_entry_sync()
+        mock_sync.assert_called_once()
+        mock_audit.assert_called_once()
+        mock_prices.assert_called_once()
+        mock_dashboard.assert_called_once_with(connected=True)
+        assert engine._last_pre_entry_sync_date == '2026-05-19'
+        assert engine._last_audit_date == '2026-05-19'
+        ib.sleep.assert_not_called()
 
-        slept = ib.sleep.call_args[0][0]
-        expected = (h * 60 + m - 9 * 60) * 60
-        assert abs(slept - expected) < 2
+    def test_skips_duplicate_same_day_checkpoint(self):
+        from src.config import PRE_ENTRY_SYNC_TIME
+        ib = MagicMock()
+        engine = _make_engine(ib, state={'AAPL': {
+            'price': 100.0,
+            'qty': 1.0,
+            'stop_loss': 94.0,
+            'stop_dist': 6.0,
+            'time': '2026-05-19T10:00:00-04:00',
+        }})
+        engine._last_pre_entry_sync_date = '2026-05-19'
+
+        h, m = PRE_ENTRY_SYNC_TIME
+        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, h, m + 5, 0))
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine._maybe_pre_entry_sync_audit()
+
+        mock_sync.assert_not_called()
+        mock_audit.assert_not_called()
+        ib.sleep.assert_not_called()
+
+    def test_startup_audit_after_checkpoint_marks_checkpoint_covered(self):
+        from src.config import PRE_ENTRY_SYNC_TIME
+        ib = MagicMock()
+        engine = _make_engine(ib, state={'AAPL': {
+            'price': 100.0,
+            'qty': 1.0,
+            'stop_loss': 94.0,
+            'stop_dist': 6.0,
+            'time': '2026-05-19T10:00:00-04:00',
+        }})
+
+        h, m = PRE_ENTRY_SYNC_TIME
+        audit_time = self._TZ_NY.localize(datetime(2026, 5, 19, h, m + 10, 0))
+        engine._last_audit_at = audit_time
+        fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, h, m + 11, 0))
+        with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
+             patch.object(engine, '_audit_stop_orders') as mock_audit, \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine._maybe_pre_entry_sync_audit()
+
+        mock_sync.assert_not_called()
+        mock_audit.assert_not_called()
+        assert engine._last_pre_entry_sync_date == '2026-05-19'
+        ib.sleep.assert_not_called()
