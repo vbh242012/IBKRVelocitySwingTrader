@@ -45,12 +45,12 @@ def _mock_fill(commission=1.0):
     return fill
 
 
-def _mock_price_ticker(price: float, bid=None, ask=None, open=None, high=None, low=None, vwap=None):
+def _mock_price_ticker(price: float, bid=None, ask=None, open=None, high=None, low=None, vwap=None, close=None):
     """Build a ticker mock with deterministic quote fields."""
     ticker = MagicMock()
     ticker.marketPrice.return_value = price
     ticker.last = price
-    ticker.close = price
+    ticker.close = price if close is None else close
     ticker.bid = price * 0.999 if bid is None else bid
     ticker.ask = price * 1.001 if ask is None else ask
     ticker.open = price if open is None else open
@@ -134,6 +134,20 @@ def _make_engine(ib_mock):
     engine._last_eod_exit_date = None
     engine._missing_position_counts = {}
     engine._strategy_profile = get_strategy_profile("indicator_swing")
+    # New instance vars added by fixes
+    engine._ib_error_dedup      = {}
+    engine._alert_dedup_cache   = {}
+    engine._data_blackout_streak = 0
+    engine._data_blackout_alerted = False
+    engine._friday_cutoff_logged_date = None
+    engine._last_pre_entry_sync_date = None
+    engine._historical_data_health = {}
+    engine._vix_failure_count   = 0
+    engine._next_vix_retry_ts   = 0.0
+    engine._last_vix_failure_ts = 0.0
+    engine._last_vix_source     = None
+    engine._health_date = datetime.now().strftime('%Y-%m-%d')
+    engine._health_metrics = {}
     return engine
 
 
@@ -1317,7 +1331,7 @@ class TestCandidateRanking:
         assert 'GHOST' not in engine.state
 
     def test_no_entry_outside_session_window(self):
-        """Outside 10:15–15:30 ET no entry must occur even if signal passes."""
+        """Outside 09:45–15:30 ET no entry must occur even if signal passes."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
         ctx    = _ctx(price=101.0, orb=100.0)
@@ -3219,8 +3233,7 @@ class TestHardStop:
         assert not ib.placeOrder.called
 
     def test_break_even_exit_triggers_after_prior_profit_retraces_to_entry(self):
-        """Once peak exceeds break-even threshold, a retrace to entry must force exit."""
-        from src.config import BREAK_EVEN_PCT
+        """Once +1R is reached, a confirmed close back to entry must force exit."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
         tz_ny  = pytz.timezone('US/Eastern')
@@ -3228,9 +3241,10 @@ class TestHardStop:
         entry = 100.0
         cur   = 99.95
         state = self._state_entry(entry, cur, tz_ny)
-        state['peak_price'] = entry * (1 + BREAK_EVEN_PCT + 0.01)
+        state['entry_risk_per_share'] = 4.0
+        state['peak_price'] = 104.25
         engine.state = {'POS': state}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, high=104.25)]
         ib.openTrades.return_value = []
         ib.positions.return_value  = [self._make_position('POS', 5.0)]
 
@@ -3240,8 +3254,7 @@ class TestHardStop:
         assert ib.placeOrder.called
 
     def test_break_even_exit_does_not_trigger_before_profit_threshold(self):
-        """A normal small loser must not be break-even-exited before profit threshold was reached."""
-        from src.config import BREAK_EVEN_PCT
+        """A small loser must not be break-even-exited before +1R was reached."""
         ib     = _mock_ib()
         engine = _make_engine(ib)
         tz_ny  = pytz.timezone('US/Eastern')
@@ -3249,7 +3262,8 @@ class TestHardStop:
         entry = 100.0
         cur   = 99.95
         state = self._state_entry(entry, cur, tz_ny)
-        state['peak_price'] = entry * (1 + BREAK_EVEN_PCT - 0.01)
+        state['entry_risk_per_share'] = 4.0
+        state['peak_price'] = 103.95
         engine.state = {'POS': state}
         ib.reqTickers.return_value = [_mock_price_ticker(cur)]
 
@@ -3258,8 +3272,27 @@ class TestHardStop:
         assert 'pending_exit' not in engine.state['POS']
         assert not ib.placeOrder.called
 
-    def test_analyst_downgrade_exit_triggers_for_swing_without_eod_cleanup(self):
-        """Swing profile disables EOD churn, but analyst sell threshold is an independent exit."""
+    def test_break_even_exit_waits_for_close_confirmation(self):
+        """After +1R, an intraday dip below entry is ignored until a close confirms."""
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 99.95
+        state = self._state_entry(entry, cur, tz_ny)
+        state['entry_risk_per_share'] = 4.0
+        state['peak_price'] = 104.25
+        engine.state = {'POS': state}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur, high=104.25, close=101.0)]
+
+        self._run_exit_check(engine)
+
+        assert 'pending_exit' not in engine.state['POS']
+        assert not ib.placeOrder.called
+
+    def test_analyst_downgrade_exit_requires_price_confirmation(self):
+        """Bearish analyst score alone is not enough when price action is still healthy."""
         from src.strategy_profiles import get_strategy_profile
         ib     = _mock_ib()
         engine = _make_engine(ib)
@@ -3268,6 +3301,30 @@ class TestHardStop:
 
         entry = 100.0
         cur   = 101.0
+        engine.state = {'DOWN': self._state_entry(entry, cur, tz_ny)}
+        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('DOWN', 5.0)]
+
+        with patch.object(engine, '_analyst_context', return_value={
+            'analyst_rating_score': -0.50,
+            'analyst_rating_total': 12,
+        }):
+            self._run_exit_check(engine)
+
+        assert 'pending_exit' not in engine.state['DOWN']
+        assert not ib.placeOrder.called
+
+    def test_analyst_downgrade_exit_triggers_when_price_is_weak(self):
+        """Bearish analyst score can exit only after price confirms weakness."""
+        from src.strategy_profiles import get_strategy_profile
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        engine._strategy_profile = get_strategy_profile("indicator_swing")
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry = 100.0
+        cur   = 99.0
         engine.state = {'DOWN': self._state_entry(entry, cur, tz_ny)}
         ib.reqTickers.return_value = [_mock_price_ticker(cur)]
         ib.openTrades.return_value = []

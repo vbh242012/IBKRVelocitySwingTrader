@@ -30,7 +30,7 @@ from src.config import (
     TRADING_MODE, LIVE_TRADING_ACK, LIVE_TRADING_ACK_PHRASE, LIVE_IB_PORTS, PAPER_IB_PORTS,
     ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
-    VIX_THRESHOLD, BREAK_EVEN_PCT,
+    VIX_THRESHOLD, BREAK_EVEN_R_MULT,
     TIERED_PROFIT_EXIT_ENABLED, TIERED_PROFIT_EXIT_R_LEVELS,
     ENTRY_START, ENTRY_END, STOP_ACTIVATION_TIME, VOL_MULT_FRIDAY, PRE_ENTRY_SYNC_TIME,
     POST_OPEN_AUDIT_TIME, PREMARKET_READINESS_TIME, POST_CLOSE_MAINTENANCE_TIME,
@@ -67,6 +67,12 @@ from src.config import (
     ENTRY_LIMIT_ASK_CUSHION_PCT, ENTRY_LIMIT_MIN_TICK, ENTRY_LIMIT_MAX_OVER_MARKET_PCT,
     CHANDELIER_PERIOD, CHANDELIER_MULT,
     PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC, PROTECTIVE_STOP_CONFIRM_POLL_SEC,
+    RECONNECT_INITIAL_WAIT_SEC, RECONNECT_MAX_WAIT_SEC, ALERT_DEDUP_WINDOW_SEC,
+    HMDS_WARMUP_MAX_RETRIES, HMDS_WARMUP_RETRY_WAIT_SEC,
+    BREAK_EVEN_PEAK_RETAIN_FRACTION,
+    STALE_POSITION_MIN_BARS, STALE_POSITION_MAX_LOSS_PCT, STALE_POSITION_MAX_PEAK_PCT,
+    LATE_ENTRY_CUTOFF_TIME, LATE_ENTRY_MIN_SCORE,
+    DATA_BLACKOUT_RATIO_THRESHOLD, DATA_BLACKOUT_MIN_CANDIDATES, DATA_BLACKOUT_STREAK_ALERT,
 )
 from src.analyst_ratings import AnalystRatingProvider
 from src.ib_gateway import ensure_ib_gateway_ready
@@ -230,6 +236,8 @@ class VelocityEngine:
         # Last trading date a full protective stop-order audit was run.
         self._last_audit_date: Optional[str] = None
         self._last_audit_at: Optional[datetime] = None
+        # Last trading date the pre-entry confirmation sync/audit was run.
+        self._last_pre_entry_sync_date: Optional[str] = None
         # Last trading date the post-open protective audit was run.
         self._last_post_open_audit_date: Optional[str] = None
         # Last trading dates for non-trading operational jobs.
@@ -245,6 +253,16 @@ class VelocityEngine:
         # compact JSON summary instead of only raw logs.
         self._health_date = datetime.now(_TZ_NY).strftime('%Y-%m-%d')
         self._health_metrics = self._new_health_metrics()
+
+        # Fix 9: IB error deduplication — {errorCode: (last_logged_ts, suppressed_count)}
+        self._ib_error_dedup: Dict[int, tuple] = {}
+        # Fix 6: Alert deduplication — {message_key: last_sent_ts}
+        self._alert_dedup_cache: Dict[str, float] = {}
+        # Fix 1: Market data blackout tracking
+        self._data_blackout_streak: int = 0
+        self._data_blackout_alerted: bool = False
+        # Fix 8: Friday cutoff — only log the WARNING once per day
+        self._friday_cutoff_logged_date: Optional[str] = None
 
         self.connect()
 
@@ -293,6 +311,26 @@ class VelocityEngine:
             return
         self._metric_inc('ib_errors')
         self._metric_inc('ib_error_codes', subkey=str(errorCode))
+
+        # Fix 9: Deduplicate repeated error codes within a 60-second window.
+        # Reconnect storms can produce hundreds of identical errors per minute;
+        # we log the first occurrence, suppress duplicates, then log a summary
+        # when the window expires.
+        now_ts = time.time()
+        dedup = getattr(self, '_ib_error_dedup', {})
+        last_ts, suppressed = dedup.get(errorCode, (0.0, 0))
+        if now_ts - last_ts < 60:
+            dedup[errorCode] = (last_ts, suppressed + 1)
+            self._ib_error_dedup = dedup
+            return
+        if suppressed > 0:
+            logger.warning(
+                f"IB error {errorCode}: suppressed {suppressed} duplicate(s) "
+                f"in the last 60s; resuming normal logging"
+            )
+        dedup[errorCode] = (now_ts, 0)
+        self._ib_error_dedup = dedup
+
         if errorCode == 10349:
             logger.warning(f"IB preset override (10349) reqId={reqId}: {errorString}")
             return
@@ -341,8 +379,13 @@ class VelocityEngine:
                 self._warmup_historical_data(reason="reconnect")
                 return True
             except Exception as e:
-                logger.warning(f"RECONNECT: attempt {attempt}/10 failed: {e}")
-                time.sleep(5)
+                # Fix 6: Exponential backoff — doubles each attempt, capped at max.
+                wait_s = min(RECONNECT_INITIAL_WAIT_SEC * (2 ** (attempt - 1)), RECONNECT_MAX_WAIT_SEC)
+                logger.warning(
+                    f"RECONNECT: attempt {attempt}/10 failed: {e} "
+                    f"(retrying in {wait_s:.0f}s)"
+                )
+                time.sleep(wait_s)
         self._metric_inc('reconnect_failures')
         self._alert("CRITICAL", "RECONNECT: all 10 attempts failed — skipping trading cycles until restored")
         return False
@@ -527,71 +570,102 @@ class VelocityEngine:
             return []
 
     def _warmup_historical_data(self, reason: str = "manual") -> bool:
-        """Probe SPY then VIX so HMDS wakes before the entry gate depends on it."""
+        """Probe SPY then VIX so HMDS wakes before the entry gate depends on it.
+
+        Fix 7: Retries up to HMDS_WARMUP_MAX_RETRIES times with a wait between
+        attempts so a momentarily degraded HMDS farm doesn't permanently block
+        entries on every startup or reconnect.
+        """
         if not HISTORICAL_DATA_WARMUP_ENABLED:
             return True
-        try:
-            spy = Stock('SPY', 'SMART', 'USD', primaryExchange='ARCA')
-            qualified = self.ib.qualifyContracts(spy)
-            if qualified:
-                spy = qualified[0]
-        except Exception as e:
-            logger.warning(f"HMDS WARMUP[{reason}]: SPY qualification failed: {e}")
-            self._metric_inc('historical_warmup_failures')
-            return False
 
-        spy_bars = self._request_historical_bars(
-            spy,
-            label="SPY",
-            duration='5 D',
-            bar_size=DAILY_BAR_SIZE,
-            what='TRADES',
-            use_rth=True,
-            timeout=HISTORICAL_DATA_TIMEOUT_SEC,
-            metric_prefix='spy',
-        )
-        if not spy_bars:
-            logger.warning(
-                f"HMDS WARMUP[{reason}]: SPY historical failed. "
-                "IBKR historical farm is not healthy yet."
+        for attempt in range(1, HMDS_WARMUP_MAX_RETRIES + 1):
+            try:
+                spy = Stock('SPY', 'SMART', 'USD', primaryExchange='ARCA')
+                qualified = self.ib.qualifyContracts(spy)
+                if qualified:
+                    spy = qualified[0]
+            except Exception as e:
+                logger.warning(f"HMDS WARMUP[{reason}] attempt {attempt}: SPY qualification failed: {e}")
+                if attempt < HMDS_WARMUP_MAX_RETRIES:
+                    logger.info(f"HMDS WARMUP[{reason}]: retrying in {HMDS_WARMUP_RETRY_WAIT_SEC:.0f}s...")
+                    time.sleep(HMDS_WARMUP_RETRY_WAIT_SEC)
+                    continue
+                self._metric_inc('historical_warmup_failures')
+                return False
+
+            spy_bars = self._request_historical_bars(
+                spy,
+                label="SPY",
+                duration='5 D',
+                bar_size=DAILY_BAR_SIZE,
+                what='TRADES',
+                use_rth=True,
+                timeout=HISTORICAL_DATA_TIMEOUT_SEC,
+                metric_prefix='spy',
             )
-            self._metric_inc('historical_warmup_failures')
-            return False
+            if not spy_bars:
+                logger.warning(
+                    f"HMDS WARMUP[{reason}] attempt {attempt}/{HMDS_WARMUP_MAX_RETRIES}: "
+                    "SPY historical failed — IBKR historical farm not healthy yet."
+                )
+                if attempt < HMDS_WARMUP_MAX_RETRIES:
+                    logger.info(f"HMDS WARMUP[{reason}]: retrying in {HMDS_WARMUP_RETRY_WAIT_SEC:.0f}s...")
+                    time.sleep(HMDS_WARMUP_RETRY_WAIT_SEC)
+                    continue
+                self._metric_inc('historical_warmup_failures')
+                return False
 
-        if not self._ensure_vix_contract():
-            logger.warning(f"HMDS WARMUP[{reason}]: VIX contract unavailable.")
-            self._metric_inc('historical_warmup_failures')
-            return False
+            if not self._ensure_vix_contract():
+                logger.warning(f"HMDS WARMUP[{reason}] attempt {attempt}: VIX contract unavailable.")
+                if attempt < HMDS_WARMUP_MAX_RETRIES:
+                    logger.info(f"HMDS WARMUP[{reason}]: retrying in {HMDS_WARMUP_RETRY_WAIT_SEC:.0f}s...")
+                    time.sleep(HMDS_WARMUP_RETRY_WAIT_SEC)
+                    continue
+                self._metric_inc('historical_warmup_failures')
+                return False
 
-        vix_bars = self._request_historical_bars(
-            self._vix_contract,
-            label="VIX",
-            duration='5 D',
-            bar_size=DAILY_BAR_SIZE,
-            what='TRADES',
-            use_rth=False,
-            timeout=HISTORICAL_DATA_TIMEOUT_SEC,
-            metric_prefix='vix',
-        )
-        if not vix_bars:
-            logger.warning(
-                f"HMDS WARMUP[{reason}]: SPY historical OK but VIX historical failed. "
-                "Treating VIX as unavailable until a later retry succeeds."
+            vix_bars = self._request_historical_bars(
+                self._vix_contract,
+                label="VIX",
+                duration='5 D',
+                bar_size=DAILY_BAR_SIZE,
+                what='TRADES',
+                use_rth=False,
+                timeout=HISTORICAL_DATA_TIMEOUT_SEC,
+                metric_prefix='vix',
             )
-            self._record_vix_failure("warmup_vix_failed")
-            self._metric_inc('historical_warmup_failures')
-            return False
+            if not vix_bars:
+                logger.warning(
+                    f"HMDS WARMUP[{reason}] attempt {attempt}/{HMDS_WARMUP_MAX_RETRIES}: "
+                    "SPY OK but VIX historical failed."
+                )
+                if attempt < HMDS_WARMUP_MAX_RETRIES:
+                    logger.info(f"HMDS WARMUP[{reason}]: retrying in {HMDS_WARMUP_RETRY_WAIT_SEC:.0f}s...")
+                    time.sleep(HMDS_WARMUP_RETRY_WAIT_SEC)
+                    continue
+                logger.warning(
+                    f"HMDS WARMUP[{reason}]: all {HMDS_WARMUP_MAX_RETRIES} attempts exhausted; "
+                    "treating VIX as unavailable until a later retry succeeds."
+                )
+                self._record_vix_failure("warmup_vix_failed")
+                self._metric_inc('historical_warmup_failures')
+                return False
 
-        hist_price = self._coerce_positive_price(getattr(vix_bars[-1], 'close', None))
-        if hist_price is not None:
-            self._record_vix_success(hist_price, source="historical_warmup")
-        vix_text = f"{hist_price:.2f}" if hist_price is not None else "unknown"
-        logger.info(
-            f"HMDS WARMUP[{reason}]: SPY and VIX historical data OK "
-            f"(VIX={vix_text})."
-        )
-        self._metric_inc('historical_warmup_successes')
-        return True
+            hist_price = self._coerce_positive_price(getattr(vix_bars[-1], 'close', None))
+            if hist_price is not None:
+                self._record_vix_success(hist_price, source="historical_warmup")
+            vix_text = f"{hist_price:.2f}" if hist_price is not None else "unknown"
+            attempt_text = f" (attempt {attempt})" if attempt > 1 else ""
+            logger.info(
+                f"HMDS WARMUP[{reason}]{attempt_text}: SPY and VIX historical data OK "
+                f"(VIX={vix_text})."
+            )
+            self._metric_inc('historical_warmup_successes')
+            return True
+
+        self._metric_inc('historical_warmup_failures')
+        return False
 
     def _operator_halt_active(self) -> bool:
         """Manual kill switch: HALT_FILE presence blocks new entries only."""
@@ -605,6 +679,21 @@ class VelocityEngine:
         """Send high-priority operational alerts without adding external deps."""
         severity = severity.upper()
         self._metric_inc('alerts', subkey=severity.lower())
+
+        # Fix 6: Rate-limit CRITICAL/ERROR alerts so prolonged outages (e.g. a
+        # Saturday gateway crash loop) don't flood logs and webhooks.  Only the
+        # first occurrence within the deduplication window is logged and sent;
+        # the next occurrence after the window expires resets the clock.
+        if severity in {'CRITICAL', 'ERROR'} and ALERT_DEDUP_WINDOW_SEC > 0:
+            dedup = getattr(self, '_alert_dedup_cache', {})
+            alert_key = f"{severity}:{message[:100]}"
+            now_ts = time.time()
+            if now_ts - dedup.get(alert_key, 0) < ALERT_DEDUP_WINDOW_SEC:
+                self._metric_inc('alerts', subkey='deduplicated')
+                return
+            dedup[alert_key] = now_ts
+            self._alert_dedup_cache = dedup
+
         log_fn = logger.error if severity in {'CRITICAL', 'ERROR'} else logger.warning
         log_fn(f"ALERT[{severity}]: {message}")
         if not ALERT_WEBHOOK_URL:
@@ -984,6 +1073,7 @@ class VelocityEngine:
             day_open = self._coerce_positive_price(getattr(ticker, 'open', None))
             day_high = self._coerce_positive_price(getattr(ticker, 'high', None))
             day_low  = self._coerce_positive_price(getattr(ticker, 'low', None))
+            prev_close = self._coerce_positive_price(getattr(ticker, 'close', None))
             vwap     = self._coerce_positive_price(getattr(ticker, 'vwap', None))
             if day_high is not None:
                 day_high = max(day_high, price)
@@ -996,6 +1086,7 @@ class VelocityEngine:
                 'open': day_open,
                 'high': day_high,
                 'low': day_low,
+                'prev_close': prev_close,
                 'vwap': vwap,
             }
         except Exception as e:
@@ -1085,16 +1176,14 @@ class VelocityEngine:
                 return False, f"protective stop not confirmed ({protection_status or 'missing'})"
 
         if ANALYST_RATING_EXIT_ENABLED:
-            rating_score = self._analyst_context(sym).get(
-                'analyst_rating_score',
-                data.get('analyst_rating_score'),
-            )
+            rating_ctx = self._analyst_context(sym)
+            self._apply_analyst_context(data, rating_ctx)
+            rating_score = data.get('analyst_rating_score')
             try:
                 rating_score = float(rating_score)
             except (TypeError, ValueError):
                 rating_score = None
             if rating_score is not None and np.isfinite(rating_score):
-                data['analyst_rating_score'] = round(rating_score, 4)
                 if rating_score <= ANALYST_RATING_SELL_THRESHOLD:
                     return False, (
                         f"analyst rating score {rating_score:+.2f} <= "
@@ -1106,15 +1195,21 @@ class VelocityEngine:
             f"RS={rel_strength*100:.2f}% stop={data.get('protection_status', 'unknown')}"
         )
 
-    def _analyst_exit_required(self, sym: str, data: dict) -> tuple[bool, str]:
-        """Return True when current analyst consensus is bearish enough to exit."""
+    def _analyst_exit_required(
+        self,
+        sym: str,
+        data: dict,
+        current_price: float,
+        entry_price: float,
+        snapshot: Optional[Dict[str, Optional[float]]] = None,
+    ) -> tuple[bool, str]:
+        """Return True when bearish consensus is confirmed by weak price action."""
         if not ANALYST_RATING_EXIT_ENABLED:
             return False, "disabled"
 
-        rating_score = self._analyst_context(sym).get(
-            'analyst_rating_score',
-            data.get('analyst_rating_score'),
-        )
+        rating_ctx = self._analyst_context(sym)
+        self._apply_analyst_context(data, rating_ctx)
+        rating_score = data.get('analyst_rating_score')
         try:
             rating_score = float(rating_score)
         except (TypeError, ValueError):
@@ -1122,34 +1217,178 @@ class VelocityEngine:
         if not np.isfinite(rating_score):
             return False, "unavailable"
 
-        data['analyst_rating_score'] = round(rating_score, 4)
         if rating_score <= ANALYST_RATING_SELL_THRESHOLD:
-            return True, (
+            confirmed, confirm_reason = self._analyst_exit_price_confirms(
+                sym,
+                current_price=current_price,
+                entry_price=entry_price,
+                snapshot=snapshot,
+            )
+            if confirmed:
+                return True, (
+                    f"analyst rating score {rating_score:+.2f} <= "
+                    f"{ANALYST_RATING_SELL_THRESHOLD:+.2f}; {confirm_reason}"
+                )
+            return False, (
                 f"analyst rating score {rating_score:+.2f} <= "
-                f"{ANALYST_RATING_SELL_THRESHOLD:+.2f}"
+                f"{ANALYST_RATING_SELL_THRESHOLD:+.2f}, but price not weak enough "
+                f"({confirm_reason})"
             )
         return False, f"analyst rating score {rating_score:+.2f}"
 
-    def _indicator_strategy_exit_required(self, sym: str, data: dict) -> tuple[bool, str]:
-        strategy = str(data.get('entry_strategy') or '').strip().lower()
-        if strategy not in {'ma_cross', 'bollinger_reversion', 'psar_flip'}:
-            return False, "not an indicator-swing position"
+    def _first_profit_tier_r(self) -> float:
+        for target_r, _fraction in TIERED_PROFIT_EXIT_R_LEVELS:
+            try:
+                target_r = float(target_r)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(target_r) and target_r > 0:
+                return target_r
+        return max(0.0, float(BREAK_EVEN_R_MULT or 0.0)) or 1.0
 
+    def _break_even_target_price(self, data: dict, entry_price: float) -> float:
+        risk_per_share = self._profit_tier_risk_per_share(data, entry_price)
+        target_r = max(0.0, float(BREAK_EVEN_R_MULT or 0.0)) or self._first_profit_tier_r()
+        if risk_per_share <= 0 or entry_price <= 0:
+            return float('inf')
+        return entry_price + risk_per_share * target_r
+
+    def _break_even_exit_armed(
+        self,
+        data: dict,
+        entry_price: float,
+        current_price: float,
+        snapshot: Optional[Dict[str, Optional[float]]] = None,
+    ) -> bool:
+        if data.get('profit_tiers_fired') or data.get('profit_tier_exits'):
+            return True
+
+        target_price = self._break_even_target_price(data, entry_price)
+        if not math.isfinite(target_price):
+            return False
+
+        high_mark = entry_price
+        for value in (
+            current_price,
+            data.get('peak_price'),
+            (snapshot or {}).get('high'),
+        ):
+            price = self._coerce_positive_price(value)
+            if price is not None:
+                high_mark = max(high_mark, price)
+        return high_mark + 1e-9 >= target_price
+
+    def _break_even_close_confirmed(
+        self,
+        data: dict,
+        entry_price: float,
+        snapshot: Optional[Dict[str, Optional[float]]] = None,
+    ) -> tuple[bool, str]:
+        for label, value in (
+            ("previous close", (snapshot or {}).get('prev_close')),
+            ("stored close", data.get('prev_close')),
+            ("stored current price", data.get('current_price')),
+        ):
+            close = self._coerce_positive_price(value)
+            if close is None:
+                continue
+            if close <= entry_price:
+                return True, f"{label} ${close:.2f} <= entry ${entry_price:.2f}"
+            return False, f"{label} ${close:.2f} > entry ${entry_price:.2f}"
+        return False, "no close confirmation available"
+
+    def _break_even_exit_required(
+        self,
+        sym: str,
+        data: dict,
+        current_price: float,
+        entry_price: float,
+        snapshot: Optional[Dict[str, Optional[float]]] = None,
+    ) -> tuple[bool, str]:
+        # Fix 3: Rather than exiting only when price falls all the way back to
+        # entry, exit when it gives back more than (1 - RETAIN_FRACTION) of the
+        # peak gain.  This captures a meaningful portion of the move instead of
+        # riding a winner back to zero.  With RETAIN_FRACTION=0.25, exit fires
+        # when current < entry + peak_gain * 0.25 (i.e. 75% of gain surrendered).
+        peak_price = float(data.get('peak_price') or entry_price)
+        peak_gain = max(0.0, peak_price - entry_price)
+        be_floor = entry_price + peak_gain * BREAK_EVEN_PEAK_RETAIN_FRACTION
+        if current_price > be_floor:
+            return False, (
+                f"current ${current_price:.2f} above break-even floor "
+                f"${be_floor:.2f} (entry=${entry_price:.2f} + "
+                f"{BREAK_EVEN_PEAK_RETAIN_FRACTION:.0%} × peak_gain=${peak_gain:.2f})"
+            )
+        if not self._break_even_exit_armed(data, entry_price, current_price, snapshot):
+            target_price = self._break_even_target_price(data, entry_price)
+            shown = f"${target_price:.2f}" if math.isfinite(target_price) else "unavailable"
+            return False, f"+{self._first_profit_tier_r():.2f}R target {shown} not reached"
+
+        close_confirmed, close_reason = self._break_even_close_confirmed(
+            data,
+            entry_price,
+            snapshot,
+        )
+        if close_confirmed:
+            return True, close_reason
+        return False, f"awaiting close confirmation ({close_reason})"
+
+    def _daily_indicator_exit_row(self, sym: str) -> Optional[pd.Series]:
         try:
             contract = self._stock_contract(sym)
             bars = self.ib.reqHistoricalData(
                 contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
             )
             if not isinstance(bars, list) or len(bars) < MIN_CANDLES:
-                return False, "insufficient daily bars"
+                return None
             df = apply_all(
                 util.df(bars),
                 RSI_PERIOD, ATR_PERIOD, MA_FAST, MA_SLOW,
                 SMA200_SLOPE_LOOKBACK, CHANDELIER_PERIOD,
             )
-            last = df.iloc[-1]
+            return df.iloc[-1]
         except Exception as exc:
-            logger.warning(f"STRATEGY EXIT: {sym} indicator check failed: {exc}")
+            logger.warning(f"DAILY EXIT DATA: {sym} indicator check failed: {exc}")
+            return None
+
+    def _analyst_exit_price_confirms(
+        self,
+        sym: str,
+        current_price: float,
+        entry_price: float,
+        snapshot: Optional[Dict[str, Optional[float]]] = None,
+    ) -> tuple[bool, str]:
+        if entry_price > 0 and current_price <= entry_price:
+            return True, f"current ${current_price:.2f} <= entry ${entry_price:.2f}"
+
+        prev_close = self._coerce_positive_price((snapshot or {}).get('prev_close'))
+        if prev_close is not None and entry_price > 0 and prev_close <= entry_price:
+            return True, f"previous close ${prev_close:.2f} <= entry ${entry_price:.2f}"
+
+        row = self._daily_indicator_exit_row(sym)
+        if row is None:
+            return False, "daily confirmation unavailable"
+
+        close = self._coerce_positive_price(row.get('close'))
+        ma20 = self._coerce_positive_price(row.get('MA20'))
+        if close is not None and entry_price > 0 and close <= entry_price:
+            return True, f"daily close ${close:.2f} <= entry ${entry_price:.2f}"
+        if close is not None and ma20 is not None and close < ma20:
+            return True, f"daily close ${close:.2f} < MA20 ${ma20:.2f}"
+        if bool(row.get('MA_BEAR_CROSS', False)):
+            return True, "EMA20 crossed below SMA50"
+
+        close_text = f"${close:.2f}" if close is not None else "unavailable"
+        ma20_text = f"${ma20:.2f}" if ma20 is not None else "unavailable"
+        return False, f"daily close {close_text}, MA20 {ma20_text}"
+
+    def _indicator_strategy_exit_required(self, sym: str, data: dict) -> tuple[bool, str]:
+        strategy = str(data.get('entry_strategy') or '').strip().lower()
+        if strategy not in {'ma_cross', 'bollinger_reversion', 'psar_flip'}:
+            return False, "not an indicator-swing position"
+
+        last = self._daily_indicator_exit_row(sym)
+        if last is None:
             return False, "indicator check unavailable"
 
         if strategy == "ma_cross" and bool(last.get('MA_BEAR_CROSS', False)):
@@ -1412,20 +1651,16 @@ class VelocityEngine:
         """
         Startup safety gate.
 
-        Phase 1 (immediate): fetch equity, cancel orphaned orders, sync
-        positions, audit protective stops, refresh prices, and write dashboard
-        so the UI is live straight away.
+        Fetch equity, cancel orphaned orders, sync positions, audit protective
+        stops, refresh prices, and write dashboard so the UI is live straight
+        away.
 
-        Phase 2 (timed): sleep until PRE_ENTRY_SYNC_TIME (09:15 ET) so the
-        definitive position re-sync and chandelier stop audit happen with the
-        morning IBKR position/order snapshot before the configured entry window opens.
-        If the engine starts after the sync time (intraday restart, evening),
-        Phase 2 runs immediately with no sleep.
-
-        The run loop performs a separate post-open audit at POST_OPEN_AUDIT_TIME
-        after TRAIL orders are active and opening-auction broker state has settled.
+        The run loop performs the pre-entry audit at PRE_ENTRY_SYNC_TIME and a
+        separate post-open audit at POST_OPEN_AUDIT_TIME.  Startup must never
+        sleep until 09:15 ET, because the full-universe prefilter is scheduled
+        earlier and needs the main loop alive.
         """
-        # ── Phase 1: immediate startup snapshot ──────────────────────────────
+        # ── Immediate startup snapshot ───────────────────────────────────────
         logger.info("INIT: Waiting for account equity from IBKR...")
         equity = self._fetch_equity_with_retry()
         self._last_equity        = equity
@@ -1442,7 +1677,7 @@ class VelocityEngine:
         # Cancel orphaned pending orders from a previous engine session.
         # "Orphaned" = a symbol whose order is not attached to local state and
         # has no live IBKR position.  We must NOT cancel active-position stop
-        # orders — those are audited in Phase 2.
+        # orders — those are audited immediately and by scheduled checkpoints.
         open_orders = self.ib.reqAllOpenOrders()
         ibkr_symbols = {
             p.contract.symbol for p in self.ib.positions()
@@ -1470,7 +1705,7 @@ class VelocityEngine:
                     )
             self._safe_sleep(2, context="INIT orphan-cancel settle")
 
-        logger.info("INIT: Phase 1 — immediate position sync and stop-order audit...")
+        logger.info("INIT: Immediate position sync and stop-order audit...")
         self._sync_positions_from_ibkr()
         if self.state:
             logger.info("INIT: Auditing stop orders for open positions immediately...")
@@ -1480,51 +1715,9 @@ class VelocityEngine:
             self._last_audit_at = now_ny
             logger.info("INIT: Fetching live prices for open positions...")
             self._update_position_prices()
-        self._write_dashboard_data(connected=True)
-
-        # ── Phase 2: pre-entry definitive sync + stop audit ──────────────────
-        self._wait_for_pre_entry_sync()
-
-        logger.info("INIT: Phase 2 — pre-entry re-sync and stop-order audit...")
-        self._sync_positions_from_ibkr()
-        if self.state:
-            logger.info("INIT: Auditing stop orders for open positions...")
-            self._audit_stop_orders()
-            now_ny = datetime.now(_TZ_NY)
-            self._last_audit_date = now_ny.strftime('%Y-%m-%d')
-            self._last_audit_at = now_ny
-            logger.info("INIT: Fetching live prices for open positions...")
-            self._update_position_prices()
 
         self._log_startup_summary(equity)
         self._write_dashboard_data(connected=True)
-
-    def _wait_for_pre_entry_sync(self):
-        """
-        Sleep until PRE_ENTRY_SYNC_TIME (default 09:15 ET) so the definitive
-        position re-sync and stop audit run before the configured entry window.
-
-        If the engine starts after the sync time (intraday restart, evening run),
-        the method returns immediately without sleeping.
-        """
-        h, m    = PRE_ENTRY_SYNC_TIME
-        now_ny  = datetime.now(_TZ_NY)
-        target  = now_ny.replace(hour=h, minute=m, second=0, microsecond=0)
-
-        if now_ny >= target:
-            logger.info(
-                f"INIT: Already at or past {h:02d}:{m:02d} ET — "
-                f"running pre-entry sync immediately."
-            )
-            return
-
-        wait_s = (target - now_ny).total_seconds()
-        logger.info(
-            f"INIT: Waiting {wait_s / 60:.1f} min until {h:02d}:{m:02d} ET "
-            f"for pre-entry position sync & stop audit "
-            f"(entry window opens at {ENTRY_START[0]:02d}:{ENTRY_START[1]:02d} ET)."
-        )
-        self._safe_sleep(wait_s, context="INIT pre-entry wait")
 
     def _entry_good_after_time(self) -> str:
         """Return an entry-window activation string only while that time is still future."""
@@ -2194,14 +2387,68 @@ class VelocityEngine:
                 f"positions may be unprotected ({e})",
             )
 
+    def _maybe_pre_entry_sync_audit(self):
+        """
+        Run one confirmation position sync and stop audit before new entries.
+
+        This used to be a blocking startup sleep until 09:15 ET.  Keeping it as
+        a scheduled checkpoint lets earlier premarket jobs, especially the
+        full-universe prefilter, run on time while preserving the same stop
+        safety check before the entry window.
+        """
+        today_dt = datetime.now(_TZ_NY)
+        if today_dt.weekday() >= 5:
+            return
+
+        today = today_dt.strftime('%Y-%m-%d')
+        if getattr(self, '_last_pre_entry_sync_date', None) == today:
+            return
+
+        h, m = PRE_ENTRY_SYNC_TIME
+        sync_time = today_dt.replace(hour=h, minute=m, second=0, microsecond=0)
+        if today_dt < sync_time:
+            return
+
+        last_audit_at = getattr(self, '_last_audit_at', None)
+        if last_audit_at is not None and last_audit_at >= sync_time:
+            self._last_pre_entry_sync_date = today
+            logger.info(
+                "AUDIT: pre-entry checkpoint already covered by a protective "
+                f"stop audit at {last_audit_at.strftime('%H:%M:%S %Z')}"
+            )
+            return
+
+        logger.info(
+            f"AUDIT: running pre-entry position sync and stop audit "
+            f"({h:02d}:{m:02d} ET checkpoint)"
+        )
+        try:
+            self._sync_positions_from_ibkr()
+            if self.state:
+                self._audit_stop_orders()
+                self._update_position_prices()
+            else:
+                logger.info("AUDIT: pre-entry checkpoint found no open positions")
+            now_ny = datetime.now(_TZ_NY)
+            self._last_pre_entry_sync_date = today
+            self._last_audit_date = today
+            self._last_audit_at = now_ny
+            self._write_dashboard_data(connected=True)
+        except Exception as e:
+            self._alert(
+                "CRITICAL",
+                f"AUDIT: pre-entry protective stop audit failed unexpectedly; "
+                f"positions may be unprotected ({e})",
+            )
+
     def _maybe_post_open_stop_audit(self):
         """
         Run one extra position sync and stop audit after the market opens.
 
-        The 09:15 ET startup audit catches stale state early, but TRAIL orders
-        and broker order status can change after the 09:30 opening auction. This
-        audit is intentionally separate from the daily audit so it cannot be
-        skipped just because the early audit already ran.
+        The 09:15 ET pre-entry audit catches stale state early, but TRAIL
+        orders and broker order status can change after the 09:30 opening
+        auction. This audit is intentionally separate from the daily audit so
+        it cannot be skipped just because the early audit already ran.
         """
         today_dt = datetime.now(_TZ_NY)
         if today_dt.weekday() >= 5:
@@ -2539,6 +2786,31 @@ class VelocityEngine:
             self._analyst_provider = AnalystRatingProvider(allow_remote=True)
             provider = self._analyst_provider
         return provider.get(symbol).as_context()
+
+    @staticmethod
+    def _apply_analyst_context(data: dict, ctx: dict) -> None:
+        if not isinstance(data, dict) or not isinstance(ctx, dict):
+            return
+        for key in (
+            'analyst_rating_score',
+            'analyst_rating_raw_score',
+            'analyst_rating_total',
+            'analyst_rating_strong_buy',
+            'analyst_rating_buy',
+            'analyst_rating_hold',
+            'analyst_rating_sell',
+            'analyst_rating_strong_sell',
+            'analyst_rating_source',
+            'analyst_rating_period',
+        ):
+            if key in ctx:
+                data[key] = ctx.get(key)
+        try:
+            score = float(data.get('analyst_rating_score'))
+        except (TypeError, ValueError):
+            return
+        if np.isfinite(score):
+            data['analyst_rating_score'] = round(score, 4)
 
     def _get_sector(self, symbol: str, contract) -> str:
         """Return IB industry string for symbol.  Cached; returns 'Unknown' on error."""
@@ -3437,6 +3709,7 @@ class VelocityEngine:
                 ('day_open', 'open'),
                 ('day_high', 'high'),
                 ('day_low', 'low'),
+                ('prev_close', 'prev_close'),
                 ('vwap', 'vwap'),
             ):
                 value = snapshot.get(snapshot_key) if snapshot else None
@@ -3477,16 +3750,30 @@ class VelocityEngine:
                 if tier_result == 'skipped':
                     changed = True
 
-            if peak_price >= entry_price * (1 + BREAK_EVEN_PCT) and cur <= entry_price:
+            break_even_exit, break_even_reason = self._break_even_exit_required(
+                sym,
+                self.state[sym],
+                current_price=cur,
+                entry_price=entry_price,
+                snapshot=snapshot,
+            )
+            if break_even_exit:
                 logger.warning(
                     f"BREAK-EVEN EXIT: {sym} gave back a prior "
-                    f"{BREAK_EVEN_PCT*100:.0f}%+ profit "
-                    f"(peak=${peak_price:.2f}, current=${cur:.2f}, entry=${entry_price:.2f})."
+                    f"+{self._first_profit_tier_r():.2f}R/first-tier move "
+                    f"(peak=${peak_price:.2f}, current=${cur:.2f}, entry=${entry_price:.2f}; "
+                    f"{break_even_reason})."
                 )
                 self.liquidate(sym)
                 continue
 
-            analyst_exit, analyst_reason = self._analyst_exit_required(sym, data)
+            analyst_exit, analyst_reason = self._analyst_exit_required(
+                sym,
+                data,
+                current_price=cur,
+                entry_price=entry_price,
+                snapshot=snapshot,
+            )
             if analyst_exit:
                 logger.warning(
                     f"ANALYST DOWNGRADE EXIT: {sym} {analyst_reason}. Closing."
@@ -3562,6 +3849,34 @@ class VelocityEngine:
                     self.liquidate(sym)
                     continue
                 logger.info(f"EOD QUALITY HOLD: {sym} held overnight ({hold_reason}).")
+
+            # ── 4. Stale losing position exit ───────────────────────────────
+            # Fix 4: A position held for ≥ STALE_POSITION_MIN_BARS trading
+            # sessions that has never exceeded +STALE_POSITION_MAX_PEAK_PCT
+            # and is currently losing more than STALE_POSITION_MAX_LOSS_PCT is
+            # dead weight.  Close at EOD to recycle capital.  This fires as a
+            # standalone check so it catches positions regardless of whether the
+            # EOD quality cleanup already ran today.  Positions liquidated above
+            # (hard stop, quality hold, etc.) have already `continue`d, so they
+            # won't reach this point.
+            if (
+                is_eod_window
+                and trading_bars_held >= STALE_POSITION_MIN_BARS
+                and (cur - entry_price) / entry_price < STALE_POSITION_MAX_LOSS_PCT
+                and float(data.get('peak_price') or entry_price) / entry_price - 1
+                    < STALE_POSITION_MAX_PEAK_PCT
+            ):
+                profit_pct = (cur - entry_price) / entry_price * 100
+                peak_pct = (float(data.get('peak_price') or entry_price) / entry_price - 1) * 100
+                logger.warning(
+                    f"STALE LOSING EXIT: {sym} held {trading_bars_held} bars, "
+                    f"profit={profit_pct:.1f}% (< {STALE_POSITION_MAX_LOSS_PCT*100:.0f}%), "
+                    f"peak={peak_pct:.1f}% (never reached "
+                    f"+{STALE_POSITION_MAX_PEAK_PCT*100:.0f}%). "
+                    "Closing stale loser to recycle capital."
+                )
+                self.liquidate(sym)
+                continue
 
         # Mark EOD exit as done only after at least one live-price evaluation.
         if eod_exit_due and eod_exit_checked:
@@ -4248,8 +4563,11 @@ class VelocityEngine:
                                 self.state[sym]['effective_stop'] = round(initial_sl, 2)
                         else:
                             trail_floor = peak - sd
-                            if ep > 0 and peak >= ep * (1 + BREAK_EVEN_PCT):
-                                trail_floor = max(trail_floor, ep)
+                            if ep > 0 and self._break_even_exit_armed(self.state[sym], ep, cur, {'high': peak}):
+                                self.state[sym]['break_even_armed'] = True
+                                be_target = self._break_even_target_price(self.state[sym], ep)
+                                if math.isfinite(be_target):
+                                    self.state[sym]['break_even_target_price'] = round(be_target, 4)
                             self.state[sym]['effective_stop'] = round(max(initial_sl, trail_floor), 2)
                     changed = True
 
@@ -4305,6 +4623,7 @@ class VelocityEngine:
         # off-hours jobs also audit stops and set _last_audit_date, so this call
         # naturally skips duplicate same-day audits.
         self._maybe_audit_stop_orders()
+        self._maybe_pre_entry_sync_audit()
         self._maybe_post_open_stop_audit()
 
         now_ny = datetime.now(_TZ_NY)
@@ -4369,6 +4688,17 @@ class VelocityEngine:
             self._prefilter_status = "not_started"
             self._prefilter_candidates = []
             self._prefilter_stats = {}
+            # Fix 2: After resetting prefilter state (e.g. engine restart
+            # mid-day), immediately try to restore today's candidates from the
+            # on-disk cache so we don't re-run a 2.5-hour sieve unnecessarily.
+            _pf_profile = getattr(self, "_strategy_profile", get_strategy_profile(STRATEGY_PROFILE))
+            _cached = self._read_prefilter_cache(today_str, _pf_profile.name)
+            if _cached and self._prefilter_status in {"complete", "partial"}:
+                logger.info(
+                    f"DAY RESET: restored {len(self._prefilter_candidates)} prefilter "
+                    f"candidates from today's {self._prefilter_status} cache "
+                    f"(skipping re-run)"
+                )
         elif (self._day_start_equity is not None
               and equity < self._day_start_equity * (1 - MAX_DAILY_LOSS_PCT)):
             logger.warning(
@@ -4413,11 +4743,16 @@ class VelocityEngine:
             is_friday = (now_ny.weekday() == 4)
             if is_friday and (now_ny.hour, now_ny.minute) >= FRIDAY_ENTRY_CUTOFF_TIME:
                 self._metric_inc('scanner_skipped_friday_cutoff')
-                logger.warning(
-                    f"FRIDAY ENTRY CUTOFF: no new entries after "
-                    f"{FRIDAY_ENTRY_CUTOFF_TIME[0]:02d}:{FRIDAY_ENTRY_CUTOFF_TIME[1]:02d} ET. "
-                    "Managing existing positions only."
-                )
+                # Fix 8: Log the cutoff warning exactly once per trading day so
+                # it doesn't flood the log at every 60-second cycle.
+                _cutoff_today = now_ny.strftime('%Y-%m-%d')
+                if getattr(self, '_friday_cutoff_logged_date', None) != _cutoff_today:
+                    self._friday_cutoff_logged_date = _cutoff_today
+                    logger.warning(
+                        f"FRIDAY ENTRY CUTOFF: no new entries after "
+                        f"{FRIDAY_ENTRY_CUTOFF_TIME[0]:02d}:{FRIDAY_ENTRY_CUTOFF_TIME[1]:02d} ET. "
+                        "Managing existing positions only."
+                    )
                 self._update_position_prices()
                 return
             dol_vol_threshold = profile.min_dollar_vol * (VOL_MULT_FRIDAY if is_friday else 1.0)
@@ -4628,6 +4963,21 @@ class VelocityEngine:
                             f"{float(profile.min_score):.1f}"
                         )
                         continue
+
+                    # Fix 5: Late-session quality gate — after LATE_ENTRY_CUTOFF_TIME
+                    # (default 14:30 ET) the remaining session is too short to
+                    # develop a full swing move.  Only allow high-conviction setups
+                    # to avoid holding mediocre positions overnight.
+                    if (now_ny.hour, now_ny.minute) >= LATE_ENTRY_CUTOFF_TIME:
+                        if score < LATE_ENTRY_MIN_SCORE:
+                            reject_counts['entry_filter'] += 1
+                            logger.debug(
+                                f"SCAN {sym}: SKIP — late entry after "
+                                f"{LATE_ENTRY_CUTOFF_TIME[0]:02d}:{LATE_ENTRY_CUTOFF_TIME[1]:02d} ET; "
+                                f"score {score:.1f} < {LATE_ENTRY_MIN_SCORE:.0f} required"
+                            )
+                            continue
+
                     signals.append((score, sym, ctx))
                     logger.info(scan_detail)
                     logger.info(
@@ -4657,7 +5007,45 @@ class VelocityEngine:
                     f"filtered={filtered} "
                     f"rejects[{reject_summary}]"
                 )
-                if not signals:
+
+                # Fix 1: Market data blackout detection.
+                # If ≥ DATA_BLACKOUT_RATIO_THRESHOLD of a meaningful watchlist
+                # returned no live price for DATA_BLACKOUT_STREAK_ALERT
+                # consecutive cycles, the IBKR real-time data farm is likely
+                # down.  Emit one CRITICAL alert (deduped by _alert) and skip
+                # new entries until data recovers.
+                _blackout_ratio = (
+                    reject_counts['no_technical_data'] / len(watchlist)
+                    if len(watchlist) >= DATA_BLACKOUT_MIN_CANDIDATES else 0.0
+                )
+                if _blackout_ratio >= DATA_BLACKOUT_RATIO_THRESHOLD:
+                    self._data_blackout_streak += 1
+                    if (self._data_blackout_streak >= DATA_BLACKOUT_STREAK_ALERT
+                            and not self._data_blackout_alerted):
+                        self._alert(
+                            "CRITICAL",
+                            f"MARKET DATA BLACKOUT: {reject_counts['no_technical_data']}/"
+                            f"{len(watchlist)} scanner candidates missing live price "
+                            f"for {self._data_blackout_streak} consecutive cycles. "
+                            "New entries suspended until data restores."
+                        )
+                        self._data_blackout_alerted = True
+                else:
+                    if self._data_blackout_alerted:
+                        logger.info(
+                            f"MARKET DATA: live prices restored after "
+                            f"{self._data_blackout_streak} cycle blackout; "
+                            "entries re-enabled."
+                        )
+                    self._data_blackout_streak = 0
+                    self._data_blackout_alerted = False
+
+                if self._data_blackout_streak >= DATA_BLACKOUT_STREAK_ALERT:
+                    logger.warning(
+                        f"MARKET DATA BLACKOUT: skipping new entries this cycle "
+                        f"(streak={self._data_blackout_streak})."
+                    )
+                elif not signals:
                     logger.info("SCAN: No signals this cycle")
                 else:
                     signals.sort(key=lambda x: x[0], reverse=True)

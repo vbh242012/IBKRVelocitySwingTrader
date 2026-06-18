@@ -99,6 +99,23 @@ def _make_engine_patched(ib_mock):
             engine._last_post_close_maintenance_date = None
             engine._missing_position_counts = {}
             engine._strategy_profile = get_strategy_profile("indicator_swing")
+            # New instance vars added by fixes
+            engine._ib_error_dedup      = {}
+            engine._alert_dedup_cache   = {}
+            engine._data_blackout_streak = 0
+            engine._data_blackout_alerted = False
+            engine._friday_cutoff_logged_date = None
+            engine._last_eod_exit_date  = None
+            engine._last_pre_entry_sync_date = None
+            engine._last_premarket_prefilter_date = None
+            engine._historical_data_health = {}
+            engine._vix_failure_count   = 0
+            engine._next_vix_retry_ts   = 0.0
+            engine._last_vix_failure_ts = 0.0
+            engine._last_vix_source     = None
+            engine._equity_initialized  = False
+            engine._health_date = datetime.now().strftime('%Y-%m-%d')
+            engine._health_metrics = {}
             return engine
 
 
@@ -677,19 +694,34 @@ class TestHistoricalDataWarmup:
         ib = _mock_ib()
         engine = _make_engine_patched(ib)
         ib.qualifyContracts.return_value = [MagicMock()]
+        # SPY fails on every attempt — return [] for all retries
         ib.reqHistoricalData.return_value = []
 
-        assert engine._warmup_historical_data(reason="test") is False
+        # Fix 7 retries HMDS_WARMUP_MAX_RETRIES times; patch sleep so test is fast
+        with patch('src.engine.time.sleep'), \
+             patch('src.engine.HMDS_WARMUP_MAX_RETRIES', 3):
+            assert engine._warmup_historical_data(reason="test") is False
+
         assert engine._historical_data_health['SPY']['ok'] is False
-        assert ib.reqHistoricalData.call_count == 1
+        # With retries, SPY is requested HMDS_WARMUP_MAX_RETRIES times
+        assert ib.reqHistoricalData.call_count == 3
 
     def test_warmup_marks_vix_specific_failure_after_spy_success(self):
         ib = _mock_ib()
         engine = _make_engine_patched(ib)
-        ib.qualifyContracts.side_effect = [[MagicMock()], [MagicMock()]]
-        ib.reqHistoricalData.side_effect = [[MagicMock(close=450.0)], []]
+        # SPY succeeds every attempt, VIX fails every attempt (3 retries)
+        ib.qualifyContracts.return_value = [MagicMock()]
+        spy_bar = MagicMock(close=450.0)
+        ib.reqHistoricalData.side_effect = [
+            [spy_bar], [],  # attempt 1: SPY ok, VIX fail
+            [spy_bar], [],  # attempt 2
+            [spy_bar], [],  # attempt 3
+        ]
 
-        assert engine._warmup_historical_data(reason="test") is False
+        with patch('src.engine.time.sleep'), \
+             patch('src.engine.HMDS_WARMUP_MAX_RETRIES', 3):
+            assert engine._warmup_historical_data(reason="test") is False
+
         assert engine._historical_data_health['SPY']['ok'] is True
         assert engine._historical_data_health['VIX']['ok'] is False
         assert engine._vix_failure_count == 1
@@ -697,13 +729,15 @@ class TestHistoricalDataWarmup:
     def test_warmup_success_caches_vix(self):
         ib = _mock_ib()
         engine = _make_engine_patched(ib)
-        ib.qualifyContracts.side_effect = [[MagicMock()], [MagicMock()]]
+        ib.qualifyContracts.return_value = [MagicMock()]
         ib.reqHistoricalData.side_effect = [
             [MagicMock(close=450.0)],
             [MagicMock(close=16.25)],
         ]
 
-        assert engine._warmup_historical_data(reason="test") is True
+        with patch('src.engine.time.sleep'):
+            assert engine._warmup_historical_data(reason="test") is True
+
         assert engine._last_vix == pytest.approx(16.25)
         assert engine._last_vix_source == "historical_warmup"
 

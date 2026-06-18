@@ -108,7 +108,6 @@ MAX_DAILY_LOSS_PCT   = 0.03    # 3% intraday equity drawdown halts new entries f
 ATR_PCT_MAX         = 0.07     # ATR_CHAND / price cap; filters excessively noisy names while preserving enough trade count
 HARD_STOP_PCT        = 0.07    # 7% drawdown from entry triggers forced market exit regardless of ATR
 RISK_PER_TRADE_PCT   = 0.02    # risk 2% of current equity per trade (ATR-based position sizing)
-BREAK_EVEN_PCT       = 0.04    # once profit exceeds 4%, floor stop at entry — improves WR +4pp vs 3% threshold
 TIERED_PROFIT_EXIT_ENABLED = os.getenv(
     "VELOCITY_TIERED_PROFIT_EXIT_ENABLED", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
@@ -120,6 +119,10 @@ TIERED_PROFIT_EXIT_R_LEVELS = (
     (1.5, 0.40),
     (2.0, 0.60),
 )
+BREAK_EVEN_R_MULT = float(os.getenv(
+    "VELOCITY_BREAK_EVEN_R_MULT",
+    str(TIERED_PROFIT_EXIT_R_LEVELS[0][0] if TIERED_PROFIT_EXIT_R_LEVELS else 1.0),
+))
 FRIDAY_CLOSE_HOUR    = 15      # ET hour after which Friday positions are evaluated for early close
 FRIDAY_MIN_PROFIT_PCT = 0.03   # Friday close: exit if profit < 3% to avoid carrying weekend gap risk
 EOD_EXIT_TIME        = (15, 50)  # ET — same-day EOD quality cleanup before overnight carry
@@ -140,7 +143,7 @@ BEAR_PHASE_RISK_MULT       = 0.35   # 2% base risk → 0.7% risk in hostile tape
 BEAR_PHASE_DOLLAR_VOL_MULT = 1.50   # require deeper liquidity in bear tape
 
 # ── Session timing ────────────────────────────────────────────────────────────
-ENTRY_START          = (10, 15)  # first valid new-entry time — wait past the noisy opening rotation
+ENTRY_START          = (9, 45)  # first valid new-entry time — wait past the noisy opening rotation
 ENTRY_END            = (15, 30)
 STOP_ACTIVATION_TIME = (9, 32)   # protective TRAIL stops activate after the first 2 opening minutes
 VOL_MULT_FRIDAY      = 2.0   # Friday liquidity gate: 2× normal dollar-volume threshold
@@ -220,8 +223,8 @@ APP_PREFILTER_ENABLED = os.getenv(
     "VELOCITY_APP_PREFILTER_ENABLED", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
 APP_PREFILTER_START_TIME = _parse_hhmm(
-    os.getenv("VELOCITY_APP_PREFILTER_START_TIME", "08:00"),
-    (8, 0),
+    os.getenv("VELOCITY_APP_PREFILTER_START_TIME", "06:30"),
+    (6, 30),
 )
 APP_PREFILTER_CACHE_FILE = os.getenv(
     "VELOCITY_APP_PREFILTER_CACHE_FILE",
@@ -332,12 +335,16 @@ INDICATOR_SWING_STRATEGIES = tuple(
 )
 
 # ── Analyst rating integration ───────────────────────────────────────────────
-# Live ratings use Finnhub's recommendation-trends endpoint when an API key is
-# configured. Backtests use only local dated snapshots to avoid look-ahead bias.
+# Live ratings use a local CSV first, then Finnhub when a key is configured, and
+# finally Yahoo/yfinance as a free fallback. Backtests use only dated local CSV
+# snapshots to avoid look-ahead bias.
 ANALYST_RATINGS_ENABLED = os.getenv(
     "VELOCITY_ANALYST_RATINGS_ENABLED", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
 FINNHUB_API_KEY = os.getenv("VELOCITY_FINNHUB_API_KEY", "").strip()
+ANALYST_RATINGS_FREE_SOURCE = os.getenv(
+    "VELOCITY_ANALYST_RATINGS_FREE_SOURCE", "yahoo"
+).strip().lower()
 ANALYST_RATINGS_FILE = os.getenv("VELOCITY_ANALYST_RATINGS_FILE", "").strip()
 ANALYST_RATINGS_CACHE_FILE = os.getenv(
     "VELOCITY_ANALYST_RATINGS_CACHE_FILE",
@@ -356,3 +363,37 @@ SCAN_INTERVAL          = 60    # seconds between cycles (1 minute)
 ERROR_WAIT             = 60
 LOG_BACKUP_COUNT       = 30   # keep 30 daily log files
 EQUITY_RETRY_INTERVAL  = 5     # seconds between retries when equity fetch fails at startup
+
+# ── Reconnect behavior ────────────────────────────────────────────────────────
+RECONNECT_INITIAL_WAIT_SEC = float(os.getenv("VELOCITY_RECONNECT_INITIAL_WAIT_SEC", "5"))
+RECONNECT_MAX_WAIT_SEC = float(os.getenv("VELOCITY_RECONNECT_MAX_WAIT_SEC", "300"))
+# Suppress identical CRITICAL/ERROR alerts within this window (seconds) to
+# prevent webhook and log floods during prolonged outages.
+ALERT_DEDUP_WINDOW_SEC = float(os.getenv("VELOCITY_ALERT_DEDUP_WINDOW_SEC", "600"))
+
+# ── HMDS warmup retry ─────────────────────────────────────────────────────────
+HMDS_WARMUP_MAX_RETRIES = int(os.getenv("VELOCITY_HMDS_WARMUP_MAX_RETRIES", "3"))
+HMDS_WARMUP_RETRY_WAIT_SEC = float(os.getenv("VELOCITY_HMDS_WARMUP_RETRY_WAIT_SEC", "60"))
+
+# ── Break-even exit ────────────────────────────────────────────────────────────
+# Exit fires when current price falls below entry + (peak_gain × this fraction).
+# 0.25 means we keep at least 25% of the peak gain before exiting (vs. 0.0 = exit at entry).
+BREAK_EVEN_PEAK_RETAIN_FRACTION = float(os.getenv("VELOCITY_BREAK_EVEN_PEAK_RETAIN_FRACTION", "0.25"))
+
+# ── Stale losing position exit ────────────────────────────────────────────────
+STALE_POSITION_MIN_BARS = int(os.getenv("VELOCITY_STALE_POSITION_MIN_BARS", "3"))
+STALE_POSITION_MAX_LOSS_PCT = float(os.getenv("VELOCITY_STALE_POSITION_MAX_LOSS_PCT", "-0.02"))
+STALE_POSITION_MAX_PEAK_PCT = float(os.getenv("VELOCITY_STALE_POSITION_MAX_PEAK_PCT", "0.01"))
+
+# ── Late entry gate ────────────────────────────────────────────────────────────
+LATE_ENTRY_CUTOFF_TIME = _parse_hhmm(
+    os.getenv("VELOCITY_LATE_ENTRY_CUTOFF_TIME", "14:30"), (14, 30)
+)
+LATE_ENTRY_MIN_SCORE = float(os.getenv("VELOCITY_LATE_ENTRY_MIN_SCORE", "92.0"))
+
+# ── Market data blackout detection ────────────────────────────────────────────
+# If ≥ RATIO of scanner candidates miss live price for ≥ STREAK consecutive
+# cycles, emit one CRITICAL alert and suspend new entries until data restores.
+DATA_BLACKOUT_RATIO_THRESHOLD = float(os.getenv("VELOCITY_DATA_BLACKOUT_RATIO_THRESHOLD", "0.70"))
+DATA_BLACKOUT_MIN_CANDIDATES = int(os.getenv("VELOCITY_DATA_BLACKOUT_MIN_CANDIDATES", "5"))
+DATA_BLACKOUT_STREAK_ALERT = int(os.getenv("VELOCITY_DATA_BLACKOUT_STREAK_ALERT", "2"))
