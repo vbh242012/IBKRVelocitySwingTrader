@@ -42,6 +42,8 @@ from src.config import (
     EOD_HOLD_DAY_RANGE_LOCATION_MIN,
     EOD_HOLD_RELATIVE_STRENGTH_MIN,
     EOD_HOLD_REQUIRE_STOP_CONFIRMED,
+    CHANDELIER_MULT,
+    CHANDELIER_PERIOD,
     SWING_RS_MIN_63D,
     SWING_RS_MIN_126D,
     SWING_MIN_13W_RETURN,
@@ -557,7 +559,6 @@ tbody tr:last-child{border-bottom:none;}
 td{padding:8px 8px;text-align:right;white-space:nowrap;}
 td:first-child{text-align:center;font-weight:700;color:var(--cyan);font-size:13px;}
 .sl{color:var(--red);font-weight:600;}
-.tp{color:var(--green);font-weight:600;}
 .hw{color:var(--yellow);font-weight:600;}
 .hn{color:var(--dim);}
 .up{color:var(--green);font-weight:600;}
@@ -696,7 +697,7 @@ footer a{color:var(--dim);text-decoration:none;}
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr class="empty"><td colspan="17">Waiting for data…</td></tr>
+        <tr class="empty"><td colspan="16">Waiting for data…</td></tr>
       </tbody>
     </table>
   </div>
@@ -728,21 +729,21 @@ footer a{color:var(--dim);text-decoration:none;}
 <script>
 // ── Entry / Exit conditions ─────────────────────────────────────────────────
 const ENTRY_CONDITIONS = [
-  ["1",  "RS Trend Gate",     "en", "Stock must pass weekly uptrend, 3/6-month relative strength, 13/26-week return, 52-week-high proximity, MA50>MA200, and rising SMA200 checks before any sleeve can buy"],
-  ["2",  "MA Timing",         "en", "Default timing sleeve: EMA20 must be above SMA50; a fresh cross, MA reclaim, or prior-high break can time entry only after the RS trend gate passes"],
-  ["3",  "Bollinger Research","en", "Bollinger lower-band reclaim remains available as a standalone research profile, but it is not enabled in the default live profile"],
-  ["4",  "PSAR Research",     "en", "PSAR three-dot bull state remains available as a standalone research profile and confirmation input, but it is not a default primary buy trigger"],
-  ["5",  "Momentum Confirm",  "en", "RSI must show momentum or recovery, and at least two confirmations must agree: MACD, OBV, PSAR, stochastic, or volume pace"],
-  ["6",  "Volume Confirm",    "en", "Volume pace must meet the profile floor; OBV and volume acceleration improve score but do not override weak price action"],
-  ["7",  "Analyst Weight",    "en", "Analyst consensus can add or subtract up to __ANALYST_WEIGHT__ score points, but it cannot create a buy by itself"],
-  ["8",  "Risk / Liquidity",  "en", "ATR%, spread, price, share volume, and 20-day dollar volume must pass the selected profile limits"],
-  ["9",  "Market Regime",     "en", "VIX must be available and ≤ threshold; SPY weakness blocks fresh swing entries"],
-  ["10", "Portfolio Fit",     "en", "Settled-cash bucket required; max 2 names per sector; daily-return correlation must stay ≤ 0.70 versus open positions"],
-  ["11", "Score Threshold",   "en", "Eligible candidates need an indicator-swing score of at least __ACTIVE_MIN_SCORE__ before execution"],
-  ["12", "Ranked Execution",  "en", "Only passing candidates are ranked highest-first, then rechecked at live price before order placement"],
+  ["1",  "RS Trend Gate",     "en", "Weekly uptrend required; RS 63d ≥ __SWING_RS_63D__, RS 126d ≥ __SWING_RS_126D__, 13w return ≥ __SWING_RET_13W__, 26w return ≥ __SWING_RET_26W__, price ≥ __SWING_52W__ of 52-week high; MA50 > MA200, rising SMA200"],
+  ["2",  "MA Timing",         "en", "Default sleeve: EMA20 > SMA50 trend required; entry timed by fresh EMA/SMA cross, MA20/MA50 reclaim, or prior-high break; price must not exceed __SWING_MA20_EXT__ above MA20"],
+  ["3",  "Bollinger Sleeve",  "en", "Optional sleeve: Bollinger lower-band reclaim signals a mean-reversion entry; enabled only when VELOCITY_INDICATOR_SWING_STRATEGIES includes bollinger_reversion"],
+  ["4",  "PSAR Sleeve",       "en", "Optional sleeve: three-dot PSAR bull state can time entry and adds a confirmation point; enabled only when VELOCITY_INDICATOR_SWING_STRATEGIES includes psar_flip"],
+  ["5",  "Momentum Confirm",  "en", "RSI ≥ 50 (or recovering from oversold for Bollinger sleeve); at least 2 confirmations must agree from: MACD delta, OBV uptrend, PSAR, stochastic bull-exit, volume pace"],
+  ["6",  "Volume Confirm",    "en", "Volume pace must be ≥ __SWING_VOL_PACE__ of average; OBV trend and dollar volume ≥ $75M/day; weak volume overrides strong price signals"],
+  ["7",  "Analyst Weight",    "en", "Analyst consensus adjusts score by up to ±__ANALYST_WEIGHT__ pts; cannot create a buy on its own — all structural gates must pass first"],
+  ["8",  "Risk / Liquidity",  "en", "ATR% ≤ 12%, bid/ask spread ≤ 1%, price ≥ $10, volume ≥ 1M shares, 20-day dollar volume ≥ $75M; any failure skips the candidate"],
+  ["9",  "Market Regime",     "en", "VIX must be available and ≤ threshold; SPY must be above SMA50 and SMA200 with rising SMA200; bear regime blocks all fresh entries"],
+  ["10", "Portfolio Fit",     "en", "Settled-cash bucket required; max 2 names per sector; daily-return correlation ≤ 0.70 vs. open positions; no duplicate symbols"],
+  ["11", "Score Threshold",   "en", "Candidate must score ≥ __ACTIVE_MIN_SCORE__ on the indicator-swing model after all gate checks pass"],
+  ["12", "Ranked Execution",  "en", "Passing candidates ranked highest-score-first; each rechecked at live price immediately before order placement"],
 ];
 const EXIT_CONDITIONS = [
-  ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(22) × 1.0 from peak price; IB raises the protective stop as price climbs"],
+  ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(__CHANDELIER_PERIOD__) × __CHANDELIER_MULT__ from peak price; broker ratchets the stop up as price climbs — never down"],
   ["2", "Hard Stop",        "ex", "Software exit: 7% drawdown from fill price triggers immediate Market SELL regardless of ATR distance"],
   ["3", "Strategy Exit",    "ex", "Positions exit on the matching sleeve rule that opened them: MA bearish cross for the default profile, or the standalone research profile's own reversal rule"],
   ["4", "Swing Time Stop",  "ex", "__SWING_TIME_STOP_RULE__"],
@@ -909,7 +910,7 @@ function render(d) {
   // Portfolio
   const tb = document.getElementById('tbody');
   if (!d.positions || d.positions.length === 0) {
-    tb.innerHTML = '<tr class="empty"><td colspan="17">No open positions</td></tr>';
+    tb.innerHTML = '<tr class="empty"><td colspan="16">No open positions</td></tr>';
     return;
   }
   tb.innerHTML = d.positions.map(p => {
@@ -1104,6 +1105,13 @@ _HTML = (
     _HTML
     .replace("__PROFILE_LABEL__", _ACTIVE_PROFILE.label)
     .replace("__SCORING_MODEL__", _ACTIVE_SCORING_MODEL)
+    .replace("__ACTIVE_MIN_SCORE__", f"{(_ACTIVE_PROFILE.min_score or INDICATOR_SWING_MIN_SCORE):.0f}")
+    .replace("__ANALYST_WEIGHT__", f"{ANALYST_RATING_SCORE_WEIGHT:.0f}")
+    .replace("__EOD_PROFIT_CLEANUP_RULE__", _eod_rule)
+    .replace("__SWING_TIME_STOP_RULE__", _time_stop_rule)
+    .replace("__ANALYST_EXIT_RULE__", _analyst_exit_rule)
+    .replace("__CHANDELIER_PERIOD__", str(CHANDELIER_PERIOD))
+    .replace("__CHANDELIER_MULT__", f"{CHANDELIER_MULT:g}")
     .replace("__SWING_RS_63D__", _pct_text(SWING_RS_MIN_63D, signed=True))
     .replace("__SWING_RS_126D__", _pct_text(SWING_RS_MIN_126D, signed=True))
     .replace("__SWING_RET_13W__", _pct_text(SWING_MIN_13W_RETURN))
@@ -1111,11 +1119,6 @@ _HTML = (
     .replace("__SWING_52W__", _pct_text(SWING_MIN_PRICE_VS_52W_HIGH))
     .replace("__SWING_MA20_EXT__", _pct_text(SWING_MAX_MA20_EXTENSION))
     .replace("__SWING_VOL_PACE__", f"{SWING_MIN_VOLUME_PACE:.2f}x")
-    .replace("__ACTIVE_MIN_SCORE__", f"{(_ACTIVE_PROFILE.min_score or INDICATOR_SWING_MIN_SCORE):.0f}")
-    .replace("__ANALYST_WEIGHT__", f"{ANALYST_RATING_SCORE_WEIGHT:.0f}")
-    .replace("__EOD_PROFIT_CLEANUP_RULE__", _eod_rule)
-    .replace("__SWING_TIME_STOP_RULE__", _time_stop_rule)
-    .replace("__ANALYST_EXIT_RULE__", _analyst_exit_rule)
 )
 
 

@@ -140,9 +140,9 @@ def test_dashboard_equity_chart_uses_intraday_time_labels():
     assert "toLocaleDateString" in html
     assert "Multi-Indicator Swing" in html
     assert "normal positions are not churned out" in html
-    assert "EMA20 must be above SMA50" in html
-    assert "Bollinger Research" in html
-    assert "PSAR Research" in html
+    assert "EMA20 > SMA50" in html
+    assert "Bollinger Sleeve" in html
+    assert "PSAR Sleeve" in html
     assert "No EOD Churn" in html
     assert "Swing Time Stop" in html
     assert "Analyst Downgrade" in html
