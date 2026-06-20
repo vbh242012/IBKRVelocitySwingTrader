@@ -3,9 +3,8 @@
 The backtester intentionally mirrors the live swing-entry code path:
 candidate rows are enriched with the same indicator fields, screened through
 ``evaluate_entry_rules``, ranked with the shared scorer, and exited with the
-same tiered profit trim, Chandelier, hard-stop, R-based close-confirmed
-break-even, analyst-downgrade-with-price-confirmation, strategy-exit, and
-time-stop stack.
+same Chandelier trailing stop, hard-stop, analyst-downgrade-with-price-confirmation,
+strategy-exit, and time-stop stack.
 
 Daily bars cannot know the intraday fill sequence, so entries fill no better
 than the completed signal-day close plus the configured slippage. Stop fills
@@ -52,8 +51,7 @@ from src.config import (
     ATR_PCT_MAX, HARD_STOP_PCT,
     SMA200_SLOPE_LOOKBACK,
     SPREAD_MAX_PCT,
-    RISK_PER_TRADE_PCT, BREAK_EVEN_R_MULT,
-    TIERED_PROFIT_EXIT_ENABLED, TIERED_PROFIT_EXIT_R_LEVELS,
+    RISK_PER_TRADE_PCT,
     BACKTEST_COMMISSION_PER_ORDER,
     BEAR_PHASE_TRADING_ENABLED, BEAR_PHASE_RISK_MULT,
     BEAR_PHASE_DOLLAR_VOL_MULT,
@@ -178,7 +176,6 @@ class VelocityBacktest:
     use_vix_filter  : if True, skip new entries when VIX is missing or > VIX_THRESHOLD
     vix_delay_bars  : daily-bar proxy for delayed VIX data; 0=current bar,
                       1=prior available VIX bar (used for 15-minute delayed research)
-    break_even_r         : once profit reaches this R multiple, a close back at/below entry exits
     chandelier_mult      : ATR multiplier for trailing stop
     use_cache            : load/save downloaded data from backtest/.cache/
     """
@@ -196,7 +193,6 @@ class VelocityBacktest:
         use_spy_filter: bool  = True,
         use_vix_filter: bool  = True,
         vix_delay_bars: int   = 0,
-        break_even_r:         float = BREAK_EVEN_R_MULT,
         chandelier_mult:      float = CHANDELIER_MULT,
         bear_phase_trading:   bool  = BEAR_PHASE_TRADING_ENABLED,
         commission_per_order: float = BACKTEST_COMMISSION_PER_ORDER,
@@ -217,7 +213,6 @@ class VelocityBacktest:
         self._use_spy_filter       = use_spy_filter
         self._use_vix_filter       = use_vix_filter
         self._vix_delay_bars       = max(0, int(vix_delay_bars or 0))
-        self._break_even_r         = max(0.0, float(break_even_r or 0.0)) or 1.0
         self._chandelier_mult      = chandelier_mult
         self._bear_phase_trading   = bear_phase_trading
         self._round_trip_cost      = max(0.0, float(commission_per_order)) * 2.0
@@ -1313,30 +1308,6 @@ class VelocityBacktest:
 
         return True
 
-    def _break_even_target_price(self, trade: Trade) -> float:
-        risk_per_share = self._entry_risk_per_share(trade)
-        if risk_per_share <= 0 or trade.entry_price <= 0:
-            return float('inf')
-        return float(trade.entry_price) + risk_per_share * self._break_even_r
-
-    def _break_even_exit_armed(self, trade: Trade, row: pd.Series) -> bool:
-        if trade.__dict__.get('_profit_tiers_fired') or trade.__dict__.get('_profit_tier_sold_qty', 0):
-            return True
-        target = self._break_even_target_price(trade)
-        if not np.isfinite(target):
-            return False
-        high_mark = max(
-            float(trade.__dict__.get('_peak_high', trade.entry_price) or trade.entry_price),
-            float(row.get('high', trade.entry_price) or trade.entry_price),
-        )
-        return high_mark + 1e-9 >= target
-
-    def _break_even_exit_required(self, trade: Trade, row: pd.Series) -> bool:
-        if not self._break_even_exit_armed(trade, row):
-            return False
-        close = float(row.get('close', np.nan))
-        return bool(np.isfinite(close) and close <= trade.entry_price)
-
     def _analyst_price_confirms_exit(self, trade: Trade, row: pd.Series) -> bool:
         close = float(row.get('close', np.nan))
         ma20 = float(row.get('MA20', np.nan))
@@ -1380,91 +1351,6 @@ class VelocityBacktest:
         qty_risk     = int(risk_dollars / risk_stop_dist)
         qty_bucket   = int(bucket / entry_price)
         return max(0, min(qty_risk, qty_bucket))
-
-    @staticmethod
-    def _nearest_whole_share(value: float) -> int:
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return 0
-        if not math.isfinite(value) or value <= 0:
-            return 0
-        return int(math.floor(value + 0.5))
-
-    @staticmethod
-    def _profit_tier_id(target_r: float) -> str:
-        return f"{float(target_r):.2f}R"
-
-    def _entry_risk_per_share(self, trade: Trade) -> float:
-        for key in ('_entry_risk_per_share', '_risk_per_share', '_stop_dist'):
-            try:
-                risk = float(trade.__dict__.get(key, 0) or 0)
-            except (TypeError, ValueError):
-                risk = 0.0
-            if np.isfinite(risk) and risk > 0:
-                return risk
-        try:
-            atr_chand = float(trade.__dict__.get('_atr_chand', 0) or 0)
-        except (TypeError, ValueError):
-            atr_chand = 0.0
-        risk = atr_chand * self._chandelier_mult
-        if np.isfinite(risk) and risk > 0:
-            return risk
-        fallback = trade.entry_price * HARD_STOP_PCT
-        return fallback if np.isfinite(fallback) and fallback > 0 else 0.0
-
-    def _profit_tier_exit_plan(self, trade: Trade, row: pd.Series) -> Optional[dict]:
-        if not TIERED_PROFIT_EXIT_ENABLED or trade.entry_price <= 0 or trade.qty <= 0:
-            return None
-
-        row_high = float(row['high'])
-        risk_per_share = self._entry_risk_per_share(trade)
-        if risk_per_share <= 0:
-            return None
-        fired = {
-            str(tier_id)
-            for tier_id in (trade.__dict__.get('_profit_tiers_fired') or [])
-        }
-        entry_qty = float(trade.__dict__.get('_entry_qty', trade.qty) or trade.qty)
-        sold_so_far = float(trade.__dict__.get('_profit_tier_sold_qty', 0.0) or 0.0)
-        available_whole = int(math.floor(max(float(trade.qty), 0.0)))
-        planned = []
-        remaining_available = available_whole
-
-        for target_r, cumulative_fraction in TIERED_PROFIT_EXIT_R_LEVELS:
-            target_r = float(target_r)
-            tier_id = self._profit_tier_id(target_r)
-            if tier_id in fired:
-                continue
-            target_price = trade.entry_price + risk_per_share * target_r
-            if row_high + 1e-9 < target_price:
-                break
-
-            cumulative_target = self._nearest_whole_share(
-                entry_qty * float(cumulative_fraction)
-            )
-            tier_qty = max(0, cumulative_target - self._nearest_whole_share(sold_so_far))
-            tier_qty = min(tier_qty, remaining_available)
-            fill_price = max(target_price, float(row['open']))
-            planned.append({
-                'tier_id': tier_id,
-                'target_r': target_r,
-                'target_price': round(float(target_price), 4),
-                'target_pct': round((risk_per_share * target_r) / trade.entry_price, 6),
-                'cumulative_fraction': float(cumulative_fraction),
-                'planned_qty': int(tier_qty),
-                'fill_price': round(float(fill_price), 4),
-            })
-            sold_so_far += tier_qty
-            remaining_available -= tier_qty
-
-        if not planned:
-            return None
-        return {
-            'risk_per_share': risk_per_share,
-            'sell_qty': int(sum(item['planned_qty'] for item in planned)),
-            'tiers': planned,
-        }
 
     def _allocated_commission(self, trade: Trade, qty: float) -> float:
         entry_qty = float(trade.__dict__.get('_entry_qty', trade.qty) or trade.qty)
@@ -1632,69 +1518,7 @@ class VelocityBacktest:
                     exit_reason = exit_stop_reason
                     exit_price = self._stop_fill_price(row, effective_stop)
 
-                if exit_reason is None:
-                    tier_plan = self._profit_tier_exit_plan(t, row)
-                    if tier_plan:
-                        fired = list(t.__dict__.get('_profit_tiers_fired') or [])
-                        sold_qty = 0.0
-                        for tier in tier_plan.get('tiers') or []:
-                            tier_id = str(tier.get('tier_id'))
-                            planned_qty = int(tier.get('planned_qty') or 0)
-                            if planned_qty <= 0:
-                                if tier_id not in fired:
-                                    fired.append(tier_id)
-                                continue
-
-                            partial_qty = min(float(planned_qty), float(t.qty))
-                            if partial_qty <= 0:
-                                break
-                            fill_price = float(tier.get('fill_price') or row['close'])
-                            partial = Trade(
-                                symbol=t.symbol,
-                                entry_date=t.entry_date,
-                                entry_price=t.entry_price,
-                                exit_date=today.date() if hasattr(today, 'date') else today,
-                                exit_price=fill_price,
-                                exit_reason=(
-                                    f"profit_tier_"
-                                    f"{str(tier.get('tier_id') or '').replace('.', '_').lower()}"
-                                ),
-                                entry_strategy=t.entry_strategy,
-                                qty=partial_qty,
-                                round_trip_commission=self._allocated_commission(t, partial_qty),
-                            )
-                            partial.__dict__['_bars_held'] = bars_held
-                            partial.__dict__['_regime'] = t.__dict__.get('_regime', 'unknown')
-                            partial.__dict__['_partial_exit'] = True
-                            sale_proceeds = partial.exit_price * partial.qty - partial.round_trip_commission
-                            settle_date = next_trading_session(today)
-                            pending_settlements[settle_date] = (
-                                pending_settlements.get(settle_date, 0.0) + sale_proceeds
-                            )
-                            self._filter_stats['total_commissions'] += partial.round_trip_commission
-                            trades.append(partial)
-                            t.qty = max(0.0, float(t.qty) - partial_qty)
-                            sold_qty += partial_qty
-                            t.__dict__['_profit_tier_sold_qty'] = (
-                                float(t.__dict__.get('_profit_tier_sold_qty', 0.0) or 0.0)
-                                + partial_qty
-                            )
-                            if tier_id not in fired:
-                                fired.append(tier_id)
-
-                        if fired:
-                            t.__dict__['_profit_tiers_fired'] = fired
-                        if sold_qty > 0:
-                            if t.qty < 1:
-                                del open_positions[sym]
-                            else:
-                                t.__dict__['_peak_high'] = max(peak_high, float(row['high']))
-                            continue
-
-                if exit_reason is None and self._break_even_exit_required(t, row):
-                    exit_reason = "break_even_close"
-                    exit_price = float(row['close'])
-                elif exit_reason is None and self._analyst_exit_required(t, today, row):
+                if exit_reason is None and self._analyst_exit_required(t, today, row):
                     exit_reason = "analyst_downgrade"
                     exit_price = float(row['close'])
                 elif exit_reason is None and t.entry_strategy == "ma_cross" and bool(row.get('MA_BEAR_CROSS', False)):
@@ -1899,8 +1723,6 @@ class VelocityBacktest:
                         t.__dict__['_initial_stop_loss'] = entry_price - float(risk_stop_dist)
                         t.__dict__['_entry_commission_total'] = self._round_trip_cost / 2.0
                         t.__dict__['_sell_commission_per_exit'] = self._round_trip_cost / 2.0
-                        t.__dict__['_profit_tiers_fired'] = []
-                        t.__dict__['_profit_tier_sold_qty'] = 0.0
                         # A daily close-fill is modeled after the live EOD audit
                         # point.  Auditing it against the same close would make
                         # carry impossible because entry includes slippage.

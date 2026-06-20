@@ -8,7 +8,7 @@ Key assumptions baked in:
   • The maintained strategy profile is indicator_swing
   • Shared live/backtest entry rules and scorer
   • ATR-based position sizing (2% equity risk per trade)
-  • Break-even exit after the configured R target and a close back at/below entry
+  • Chandelier trailing stop as the primary exit mechanism
   • T+1 cash settlement: sale proceeds cannot fund same-day replacement buys
   • VIX regime gate enabled by default to match live-entry risk control
   • Gap-aware stop fills and no same-bar stop ratchet look-ahead
@@ -41,7 +41,6 @@ from backtest.strategy import VelocityBacktest
 from src.config import (
     BACKTEST_SCAN_COUNT, BACKTEST_INITIAL_CAPITAL, BACKTEST_COMMISSION_PER_ORDER,
     BACKTEST_MAX_SYMBOLS,
-    BREAK_EVEN_R_MULT,
     CHANDELIER_MULT, CHANDELIER_PERIOD,
     EOD_HOLD_MIN_PROFIT_PCT, EOD_HOLD_DAY_RANGE_LOCATION_MIN,
     EOD_HOLD_RELATIVE_STRENGTH_MIN,
@@ -71,8 +70,6 @@ def parse_args():
                    help="Override the selected profile's scanner minimum daily volume")
     p.add_argument("--min-dollar-vol", default=None, type=float,
                    help="Override the selected profile's 20-day average dollar-volume floor")
-    p.add_argument("--break-even-r",  default=BREAK_EVEN_R_MULT,       type=float,
-                   help=f"Break-even close-confirmation activation in R multiples (default: {BREAK_EVEN_R_MULT:.2f}R)")
     p.add_argument("--chandelier-mult", default=CHANDELIER_MULT,      type=float,
                    help=f"ATR multiple for Chandelier trailing stop (default: {CHANDELIER_MULT})")
     p.add_argument("--no-spy-filter",   action="store_true",
@@ -136,7 +133,6 @@ def _build_backtest(args, *, start: str, end: str, use_cache: bool) -> VelocityB
         scan_count     = args.scan_count,
         commission_per_order = args.commission_per_order,
         max_symbols    = args.max_symbols,
-        break_even_r   = args.break_even_r,
         chandelier_mult= args.chandelier_mult,
         use_spy_filter = not args.no_spy_filter,
         use_vix_filter = args.vix_filter,
@@ -218,7 +214,7 @@ def main():
     print(f"  Entry rules   : {profile.description}")
     scoring_model = _effective_scoring_model(args)
     print(f"  Scoring model : {scoring_model}")
-    print(f"  Exit          : Chandelier (ATR{CHANDELIER_PERIOD}×{args.chandelier_mult}) + 7% hard stop + close-confirmed {args.break_even_r:.2f}R break-even + confirmed analyst downgrade")
+    print(f"  Exit          : Chandelier (ATR{CHANDELIER_PERIOD}×{args.chandelier_mult}) trailing stop + 7% hard stop + confirmed analyst downgrade")
     if profile.eod_quality_cleanup:
         print(
             "  EOD cleanup   : same-day quality hold "

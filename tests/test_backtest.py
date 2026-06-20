@@ -102,9 +102,9 @@ def test_removed_backtest_kwargs_are_not_accepted():
 
 def test_optimizer_params_only_cover_active_exit_knobs():
     params = OptimizationParams()
-    assert set(params.__dataclass_fields__) == {"break_even_r", "chandelier_mult"}
-    assert all(set(p.__dataclass_fields__) == {"break_even_r", "chandelier_mult"} for p in quick_grid())
-    assert all(set(p.__dataclass_fields__) == {"break_even_r", "chandelier_mult"} for p in default_grid())
+    assert set(params.__dataclass_fields__) == {"chandelier_mult"}
+    assert all(set(p.__dataclass_fields__) == {"chandelier_mult"} for p in quick_grid())
+    assert all(set(p.__dataclass_fields__) == {"chandelier_mult"} for p in default_grid())
 
 
 def test_run_backtest_scoring_model_is_profile_owned():
@@ -149,59 +149,6 @@ def test_trade_net_pnl_includes_round_trip_commission():
     )
     assert trade.gross_pnl == pytest.approx(20.0)
     assert trade.net_pnl == pytest.approx(18.0)
-
-
-def test_backtest_tiered_profit_plan_uses_cumulative_rounding():
-    bt = VelocityBacktest()
-    trade = Trade(
-        symbol="AAPL",
-        entry_date=pd.Timestamp("2026-01-02").date(),
-        entry_price=100.0,
-        qty=6,
-    )
-    trade.__dict__['_entry_qty'] = 6.0
-    trade.__dict__['_entry_risk_per_share'] = 4.0
-    trade.__dict__['_profit_tiers_fired'] = []
-    trade.__dict__['_profit_tier_sold_qty'] = 0.0
-    plan = bt._profit_tier_exit_plan(trade, pd.Series({"open": 100.5, "high": 108.5}))
-
-    assert plan["sell_qty"] == 4
-    assert [tier["planned_qty"] for tier in plan["tiers"]] == [1, 1, 2]
-    assert [tier["tier_id"] for tier in plan["tiers"]] == ['1.00R', '1.50R', '2.00R']
-
-
-def test_backtest_tiered_profit_plan_sells_remaining_delta_only():
-    bt = VelocityBacktest()
-    trade = Trade(
-        symbol="AAPL",
-        entry_date=pd.Timestamp("2026-01-02").date(),
-        entry_price=100.0,
-        qty=4,
-    )
-    trade.__dict__['_entry_qty'] = 6.0
-    trade.__dict__['_entry_risk_per_share'] = 4.0
-    trade.__dict__['_profit_tiers_fired'] = ['1.00R', '1.50R']
-    trade.__dict__['_profit_tier_sold_qty'] = 2.0
-    plan = bt._profit_tier_exit_plan(trade, pd.Series({"open": 107.0, "high": 108.5}))
-
-    assert plan["sell_qty"] == 2
-    assert [tier["tier_id"] for tier in plan["tiers"]] == ['2.00R']
-    assert plan["tiers"][0]["planned_qty"] == 2
-
-
-def test_backtest_break_even_requires_r_target_and_close_confirmation():
-    bt = VelocityBacktest()
-    trade = Trade(
-        symbol="AAPL",
-        entry_date=pd.Timestamp("2026-01-02").date(),
-        entry_price=100.0,
-        qty=5,
-    )
-    trade.__dict__['_entry_risk_per_share'] = 4.0
-
-    assert not bt._break_even_exit_required(trade, pd.Series({"high": 103.9, "close": 99.0}))
-    assert not bt._break_even_exit_required(trade, pd.Series({"high": 104.1, "close": 101.0}))
-    assert bt._break_even_exit_required(trade, pd.Series({"high": 104.1, "close": 100.0}))
 
 
 def test_backtest_analyst_exit_requires_price_confirmation():

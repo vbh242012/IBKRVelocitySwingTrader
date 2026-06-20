@@ -9,7 +9,6 @@ import pandas as pd
 
 from backtest.strategy import BacktestResult, VelocityBacktest
 from src.config import (
-    BREAK_EVEN_R_MULT,
     BACKTEST_INITIAL_CAPITAL,
     BACKTEST_COMMISSION_PER_ORDER,
     CHANDELIER_MULT,
@@ -20,7 +19,6 @@ from src.config import (
 
 @dataclass(frozen=True)
 class OptimizationParams:
-    break_even_r: float = BREAK_EVEN_R_MULT
     chandelier_mult: float = CHANDELIER_MULT
 
 
@@ -37,26 +35,16 @@ class OptimizationRun:
 def default_grid() -> List[OptimizationParams]:
     """Small robustness grid over active indicator_swing exit parameters."""
     return [
-        OptimizationParams(
-            break_even_r=break_even_r,
-            chandelier_mult=chandelier_mult,
-        )
-        for break_even_r, chandelier_mult
-        in product(
-            [1.0, 1.25],
-            [1.8, 2.0, 2.2],
-        )
+        OptimizationParams(chandelier_mult=chandelier_mult)
+        for chandelier_mult in [0.8, 1.0, 1.2]
     ]
 
 
 def quick_grid() -> List[OptimizationParams]:
     """Very small grid for a fast smoke-test optimization pass."""
     return [
-        OptimizationParams(
-            break_even_r=BREAK_EVEN_R_MULT,
-            chandelier_mult=chandelier_mult,
-        )
-        for chandelier_mult in [1.8, 2.0]
+        OptimizationParams(chandelier_mult=chandelier_mult)
+        for chandelier_mult in [0.8, 1.0]
     ]
 
 
@@ -168,7 +156,6 @@ def _run_with_params(
         min_dollar_vol=base._min_dollar_vol,
         use_spy_filter=base._use_spy_filter,
         use_vix_filter=base._use_vix_filter,
-        break_even_r=params.break_even_r,
         chandelier_mult=params.chandelier_mult,
         bear_phase_trading=base._bear_phase_trading,
         commission_per_order=base._round_trip_cost / 2.0,
@@ -246,7 +233,7 @@ def run_optimization(
             print(
                 f"  [{idx:>2}/{len(candidates)}] robust={robust_score:.2f} "
                 f"forward={forward_score:.2f} trades_f={forward.metrics.get('total_trades', 0)} "
-                f"beR={params.break_even_r:.2f} chand={params.chandelier_mult}",
+                f"chand={params.chandelier_mult}",
                 flush=True,
             )
     runs.sort(key=lambda r: (r.robust_score, r.forward_score, r.train_score), reverse=True)
@@ -268,7 +255,7 @@ def format_optimization_table(runs: Iterable[OptimizationRun]) -> str:
             f"{fm.get('total_return_pct', 0.0):>6.1f}% "
             f"{fm.get('sharpe_ratio', 0.0):>7.2f} "
             f"{fm.get('max_drawdown_pct', 0.0):>6.1f}% "
-            f"beR={p.break_even_r:.2f}, chand={p.chandelier_mult}, "
+            f"chand={p.chandelier_mult}, "
             f"train_trades={tm.get('total_trades', 0)}"
         )
     return "\n".join(lines)

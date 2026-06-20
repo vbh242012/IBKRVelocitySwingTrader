@@ -42,8 +42,6 @@ from src.config import (
     EOD_HOLD_DAY_RANGE_LOCATION_MIN,
     EOD_HOLD_RELATIVE_STRENGTH_MIN,
     EOD_HOLD_REQUIRE_STOP_CONFIRMED,
-    TIERED_PROFIT_EXIT_ENABLED,
-    TIERED_PROFIT_EXIT_R_LEVELS,
     SWING_RS_MIN_63D,
     SWING_RS_MIN_126D,
     SWING_MIN_13W_RETURN,
@@ -290,8 +288,6 @@ def get_state():
             "analyst_rating_strong_sell": _int_or_none(d.get("analyst_rating_strong_sell")),
             "analyst_rating_source":  d.get("analyst_rating_source"),
             "analyst_rating_period":  d.get("analyst_rating_period"),
-            "profit_tiers_fired":     d.get("profit_tiers_fired") or [],
-            "profit_tier_exits":      d.get("profit_tier_exits") or [],
             "protection_status":      d.get("protection_status"),
             "protection_reason":      d.get("protection_reason"),
         })
@@ -353,11 +349,6 @@ def get_state():
             "analyst_rating_score_weight":   ANALYST_RATING_SCORE_WEIGHT,
             "analyst_rating_sell_threshold": ANALYST_RATING_SELL_THRESHOLD,
             "analyst_rating_exit_enabled":   ANALYST_RATING_EXIT_ENABLED,
-            "tiered_profit_exit_enabled":    TIERED_PROFIT_EXIT_ENABLED,
-            "tiered_profit_exit_levels": [
-                {"target_r": target_r, "cumulative_fraction": fraction}
-                for target_r, fraction in TIERED_PROFIT_EXIT_R_LEVELS
-            ],
         },
         "last_scan":         dash_data.get("last_scan"),
         "next_scan":         dash_data.get("next_scan"),
@@ -551,19 +542,19 @@ body{
 
 /* ── PORTFOLIO TABLE ── */
 .port-title{color:#9b7fe8;}
-.tbl-wrap{overflow-x:auto;border-radius:6px;}
+.tbl-wrap{overflow-x:hidden;border-radius:6px;}
 table{width:100%;border-collapse:collapse;font-size:12px;}
 thead tr{background:var(--bg4);}
 th{
-  padding:10px 14px;text-align:right;font-size:9px;
-  letter-spacing:2px;color:var(--dim);font-weight:600;
+  padding:8px 8px;text-align:right;font-size:9px;
+  letter-spacing:1px;color:var(--dim);font-weight:600;
   border-bottom:2px solid var(--border2);white-space:nowrap;
 }
 th:first-child{text-align:center;}
 tbody tr{border-bottom:1px solid var(--border);transition:background .12s;}
 tbody tr:hover{background:var(--bg4);}
 tbody tr:last-child{border-bottom:none;}
-td{padding:11px 14px;text-align:right;white-space:nowrap;}
+td{padding:8px 8px;text-align:right;white-space:nowrap;}
 td:first-child{text-align:center;font-weight:700;color:var(--cyan);font-size:13px;}
 .sl{color:var(--red);font-weight:600;}
 .tp{color:var(--green);font-weight:600;}
@@ -693,7 +684,6 @@ footer a{color:var(--dim);text-decoration:none;}
           <th>UNIT PRICE</th>
           <th>CURRENT PRICE</th>
           <th>QTY</th>
-          <th>PROFIT TIERS</th>
           <th>TOTAL COST</th>
           <th>UNREALIZED P&amp;L</th>
           <th>R</th>
@@ -752,16 +742,14 @@ const ENTRY_CONDITIONS = [
   ["12", "Ranked Execution",  "en", "Only passing candidates are ranked highest-first, then rechecked at live price before order placement"],
 ];
 const EXIT_CONDITIONS = [
-  ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(22) × 2.0 from peak price; IB raises the protective stop as price climbs"],
-  ["2", "Profit Tiers",     "ex", "__TIERED_PROFIT_RULE__"],
-  ["3", "Hard Stop",        "ex", "Software exit: 7% drawdown from fill price triggers immediate Market SELL regardless of ATR distance"],
-  ["4", "Break-Even Floor", "ex", "Software exit: after +1R/first profit tier, a close-confirmed retrace to fill price triggers a Market SELL"],
-  ["5", "Strategy Exit",    "ex", "Positions exit on the matching sleeve rule that opened them: MA bearish cross for the default profile, or the standalone research profile's own reversal rule"],
-  ["6", "Swing Time Stop",  "ex", "__SWING_TIME_STOP_RULE__"],
-  ["7", "Analyst Downgrade","ex", "__ANALYST_EXIT_RULE__"],
-  ["8", "No EOD Churn",     "ex", "__EOD_PROFIT_CLEANUP_RULE__"],
-  ["9", "Entry Halts",      "ex", "VIX risk-off, SPY bear regime, and 3% daily equity drawdown halt fresh swing buys; open positions still exit through stops"],
-  ["10", "Manual Controls",  "ex", "HALT_TRADING blocks new entries; FORCE_EXIT_ALL requests a full market-exit pass"],
+  ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(22) × 1.0 from peak price; IB raises the protective stop as price climbs"],
+  ["2", "Hard Stop",        "ex", "Software exit: 7% drawdown from fill price triggers immediate Market SELL regardless of ATR distance"],
+  ["3", "Strategy Exit",    "ex", "Positions exit on the matching sleeve rule that opened them: MA bearish cross for the default profile, or the standalone research profile's own reversal rule"],
+  ["4", "Swing Time Stop",  "ex", "__SWING_TIME_STOP_RULE__"],
+  ["5", "Analyst Downgrade","ex", "__ANALYST_EXIT_RULE__"],
+  ["6", "No EOD Churn",     "ex", "__EOD_PROFIT_CLEANUP_RULE__"],
+  ["7", "Entry Halts",      "ex", "VIX risk-off, SPY bear regime, and 3% daily equity drawdown halt fresh swing buys; open positions still exit through stops"],
+  ["8", "Manual Controls",  "ex", "HALT_TRADING blocks new entries; FORCE_EXIT_ALL requests a full market-exit pass"],
 ];
 function renderConds(arr, containerId) {
   document.getElementById(containerId).innerHTML = arr.map(([n,name,cls,desc]) =>
@@ -953,10 +941,6 @@ function render(d) {
       : `B:${buyVotes ?? 0} H:${holdVotes ?? 0} S:${sellVotes ?? 0}`;
     const prot = cleanLabel(p.protection_status || 'unknown');
     const protCls = p.protection_status === 'confirmed' ? 'g' : p.protection_status === 'pending' ? 'y' : 'd';
-    const tierRecords = Array.isArray(p.profit_tier_exits) ? p.profit_tier_exits : [];
-    const tierTxt = tierRecords.length
-      ? tierRecords.map(t => `${(+t.target_r || 0).toFixed(1)}R:${(+t.sold_qty || 0).toFixed(0)}`).join(' ')
-      : '—';
     return `<tr>
       <td>${p.symbol}</td>
       <td style="font-size:10px">${cleanLabel(p.entry_strategy_label || p.entry_strategy || p.strategy_profile || '—')}</td>
@@ -964,8 +948,7 @@ function render(d) {
       <td>${$f(p.entry_price)}</td>
       <td class="c" style="font-size:11px">${p.unit_price != null ? $f(p.unit_price) : '<span style="color:var(--dim)">pending</span>'}</td>
       <td>${$f(p.current_price)}</td>
-      <td>${(+p.qty).toFixed(4)}</td>
-      <td class="c" style="font-size:10px">${tierTxt}</td>
+      <td>${Math.round(+p.qty)}</td>
       <td>${$f(p.total_amount)}</td>
       <td class="${ucls}">${usign}${$f(unr)}<br><span style="font-size:10px;opacity:.8">${usign}${unrP.toFixed(2)}%</span></td>
       <td class="${rCls}" style="font-weight:700">${rTxt}</td>
@@ -1098,16 +1081,6 @@ _analyst_exit_rule = (
     if ANALYST_RATING_EXIT_ENABLED
     else "Disabled: analyst ratings adjust entry ranking only; downgrade exits are not active"
 )
-_tiered_profit_rule = (
-    "Enabled: sell nearest whole-share cumulative trims at "
-    + ", ".join(
-        f"+{target_r:.1f}R -> {fraction * 100:.0f}% sold"
-        for target_r, fraction in TIERED_PROFIT_EXIT_R_LEVELS
-    )
-    + "; R is the original per-share Chandelier risk distance; break-even exits arm after the first tier/+1R and require a close back at/below entry; the remaining runner stays protected by the broker trailing stop"
-    if TIERED_PROFIT_EXIT_ENABLED
-    else "Disabled: winners remain fully sized until the normal exit stack closes them"
-)
 _eod_rule = (
     (
         f"Enabled for this profile: same-day at/after "
@@ -1141,7 +1114,6 @@ _HTML = (
     .replace("__ACTIVE_MIN_SCORE__", f"{(_ACTIVE_PROFILE.min_score or INDICATOR_SWING_MIN_SCORE):.0f}")
     .replace("__ANALYST_WEIGHT__", f"{ANALYST_RATING_SCORE_WEIGHT:.0f}")
     .replace("__EOD_PROFIT_CLEANUP_RULE__", _eod_rule)
-    .replace("__TIERED_PROFIT_RULE__", _tiered_profit_rule)
     .replace("__SWING_TIME_STOP_RULE__", _time_stop_rule)
     .replace("__ANALYST_EXIT_RULE__", _analyst_exit_rule)
 )

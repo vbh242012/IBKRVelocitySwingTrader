@@ -2,7 +2,7 @@
 Comprehensive validation of three critical VelocityEngine subsystems:
 
   1. Chandelier trailing stop order construction (standalone BUY + post-fill TRAIL)
-     - chandelier_dist = ATR_CHAND × CHANDELIER_MULT (2.0)
+     - chandelier_dist = ATR_CHAND × CHANDELIER_MULT (1.0)
      - goodAfterTime is omitted after the configured entry start so IBKR cannot reject a past activation time
      - BUY order: transmit=True; TRAIL stop: standalone GTC transmit=True after fill
      - state.stop_loss  = fill - chandelier_dist
@@ -31,7 +31,21 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, call
 import pytz
 
+from contextlib import contextmanager
 from src.scoring import score_candidate, volume_pace_from_intraday
+
+
+@contextmanager
+def _freeze_all_datetimes(fake_now):
+    """Freeze datetime.now() in all engine mixin modules to fake_now."""
+    with patch('src.engine.datetime') as m0, \
+         patch('src.engine_entries.datetime') as m1, \
+         patch('src.engine_orders.datetime') as m2, \
+         patch('src.engine_market.datetime') as m3:
+        for m in (m0, m1, m2, m3):
+            m.now.return_value = fake_now
+            m.fromisoformat = datetime.fromisoformat
+        yield m0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,7 +153,8 @@ def _make_engine(ib_mock):
     engine._alert_dedup_cache   = {}
     engine._data_blackout_streak = 0
     engine._data_blackout_alerted = False
-    engine._friday_cutoff_logged_date = None
+    engine._log_once_cache      = {}
+    engine._indicator_row_cache = {}
     engine._last_pre_entry_sync_date = None
     engine._historical_data_health = {}
     engine._vix_failure_count   = 0
@@ -261,9 +276,7 @@ def _run_entry_cycle(ib, engine, ctx, sym='TSLA'):
     with patch.object(engine, 'get_institutional_scan', return_value=[sym]), \
          patch.object(engine, 'get_technical_context', return_value=ctx), \
          patch.object(engine, '_update_position_prices'), \
-         patch('src.engine.datetime') as mock_dt:
-        mock_dt.now.return_value  = fake_now
-        mock_dt.fromisoformat     = datetime.fromisoformat
+         _freeze_all_datetimes(fake_now):
         engine.run_cycle()
 
     return buy_trade, stop_trade
@@ -278,19 +291,19 @@ class TestBracketOrderMath:
     Verify chandelier stop distance, GTC 2-order structure, and state persistence.
 
     Config values used (from src/config.py):
-        CHANDELIER_MULT = 2.0   →  chandelier_dist = ATR_CHAND × 2.0
+        CHANDELIER_MULT = 1.0   →  chandelier_dist = ATR_CHAND × 1.0
 
     With atr_chandelier = 3.00:
-        chandelier_dist = 6.00
-        stop_loss (state) = fill - 6.00 = 94.00
+        chandelier_dist = 3.00
+        stop_loss (state) = fill - 3.00 = 97.00
         No take-profit order or state key.
     """
 
     ATR_CHAND   = 3.00
     ENTRY       = 100.00
     LIMIT       = 100.15                         # ask 100.10 + 5 bps cushion, capped by 0.2%
-    CHAND_DIST  = round(3.00 * 2.0, 2)           # 6.00
-    INIT_STOP   = round(100.00 - 3.00 * 2.0, 2) # 94.00
+    CHAND_DIST  = round(3.00 * 1.0, 2)           # 3.00
+    INIT_STOP   = round(100.00 - 3.00 * 1.0, 2) # 97.00
 
     def _setup(self):
         ib      = _mock_ib()
@@ -307,14 +320,14 @@ class TestBracketOrderMath:
 
     def test_chandelier_dist_equals_atr_chandelier_times_mult(self):
         from src.config import CHANDELIER_MULT
-        assert CHANDELIER_MULT == 2.0, "CHANDELIER_MULT must be 2.0 (gap-aware forward-validated)"
+        assert CHANDELIER_MULT == 1.0, "CHANDELIER_MULT must be 1.0"
         chandelier_dist = round(self.ATR_CHAND * CHANDELIER_MULT, 2)
         assert chandelier_dist == self.CHAND_DIST
 
     def test_chandelier_dist_is_rounded_to_2_decimals(self):
         from src.config import CHANDELIER_MULT
-        # Verify rounding behaviour — result should use current multiplier (2.0)
-        assert round(3.123 * CHANDELIER_MULT, 2) == round(3.123 * 2.0, 2)
+        # Verify rounding behaviour — result should use current multiplier (1.0)
+        assert round(3.123 * CHANDELIER_MULT, 2) == round(3.123 * 1.0, 2)
 
     # ── Order count and structure ─────────────────────────────────────────────
 
@@ -533,9 +546,7 @@ class TestBracketOrderMath:
         with patch.object(engine, 'get_institutional_scan', return_value=['TSLA']), \
              patch.object(engine, 'get_technical_context', return_value=ctx), \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         assert 'TSLA' in engine.state
@@ -544,12 +555,22 @@ class TestBracketOrderMath:
 
     def test_unconfirmed_protective_stop_halts_additional_entries_this_cycle(self):
         """After a filled BUY, no second entry is allowed until protection is confirmed."""
+        from src.config import (
+            CHANDELIER_MULT, MAX_POSITIONS_CAP, MIN_BUCKET_SIZE,
+            RISK_PER_TRADE_PCT, SETTLED_CASH_DEPLOYMENT_PCT,
+        )
         ib, engine, ctx = self._setup()
+
+        equity, settled = 1400.0, 5000.0
+        max_pos = min(int(equity / MIN_BUCKET_SIZE), MAX_POSITIONS_CAP)
+        bucket_size = (settled * SETTLED_CASH_DEPLOYMENT_PCT) / max_pos
+        risk_dist = round(self.ATR_CHAND * CHANDELIER_MULT, 2)
+        expected_qty = min(int(bucket_size / self.LIMIT), int((equity * RISK_PER_TRADE_PCT) / risk_dist))
 
         buy_trade = MagicMock()
         buy_trade.order.orderId = 11
         buy_trade.orderStatus.status = 'Filled'
-        buy_trade.orderStatus.filled = 4.0
+        buy_trade.orderStatus.filled = float(expected_qty)
         buy_trade.orderStatus.avgFillPrice = self.ENTRY
         buy_trade.fills = [_mock_fill(1.0)]
 
@@ -566,9 +587,7 @@ class TestBracketOrderMath:
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
              patch.object(engine, '_alert') as mock_alert, \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value = fake_now
-            mock_dt.fromisoformat = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         assert ib.placeOrder.call_count == 2
@@ -602,9 +621,7 @@ class TestBracketOrderMath:
              patch.object(engine, 'get_technical_context', return_value=ctx), \
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         stop_order = ib.placeOrder.call_args_list[1].args[1]
@@ -756,7 +773,7 @@ class TestGetInstitutionalScan:
     """
 
     def setup_method(self):
-        self._source_patch = patch("src.engine.APP_SCANNER_SOURCE", "ibkr")
+        self._source_patch = patch("src.engine_scanner.APP_SCANNER_SOURCE", "ibkr")
         self._source_patch.start()
 
     def teardown_method(self):
@@ -895,7 +912,7 @@ class TestGetInstitutionalScan:
 
     def test_universe_source_returns_rotating_application_batch(self, monkeypatch):
         """Application scanner can source candidates from the full-symbol universe."""
-        import src.engine as engine_module
+        import src.engine_scanner as engine_module
 
         ib = _mock_ib()
         engine = _make_engine(ib)
@@ -914,7 +931,7 @@ class TestGetInstitutionalScan:
 
     def test_hybrid_source_dedupes_ibkr_and_universe_candidates(self, monkeypatch):
         """Hybrid source keeps IBKR scanner hits and walks the broader universe."""
-        import src.engine as engine_module
+        import src.engine_scanner as engine_module
 
         ib = _mock_ib()
         engine = _make_engine(ib)
@@ -935,7 +952,7 @@ class TestGetInstitutionalScan:
 
     def test_prefiltered_cache_becomes_the_day_watchlist(self, monkeypatch):
         """Once the premarket sieve exists, do not re-add raw IBKR/universe symbols."""
-        import src.engine as engine_module
+        import src.engine_scanner as engine_module
 
         ib = _mock_ib()
         engine = _make_engine(ib)
@@ -945,7 +962,7 @@ class TestGetInstitutionalScan:
         monkeypatch.setattr(engine_module, "APP_SCANNER_SOURCE", "hybrid")
         fake_now = pytz.timezone('US/Eastern').localize(datetime(2024, 6, 5, 10, 30))
 
-        with patch("src.engine.datetime") as mock_dt:
+        with patch("src.engine_scanner.datetime") as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             result = engine.get_institutional_scan()
@@ -981,7 +998,7 @@ class TestGetInstitutionalScan:
 
     def test_premarket_prefilter_writes_candidate_cache(self, tmp_path, monkeypatch):
         import json
-        import src.engine as engine_module
+        import src.engine_scanner as engine_module
 
         ib = _mock_ib()
         engine = _make_engine(ib)
@@ -1017,7 +1034,7 @@ class TestGetInstitutionalScan:
 
     def test_premarket_prefilter_stops_with_partial_cache_at_entry_window(self, tmp_path, monkeypatch):
         import json
-        import src.engine as engine_module
+        import src.engine_scanner as engine_module
 
         ib = _mock_ib()
         engine = _make_engine(ib)
@@ -1034,7 +1051,8 @@ class TestGetInstitutionalScan:
         )
 
         entry_h, entry_m = engine_module.ENTRY_START
-        fake_now = engine_module._TZ_NY.localize(datetime(2024, 6, 5, entry_h, entry_m, 0))
+        tz_ny = pytz.timezone('US/Eastern')
+        fake_now = tz_ny.localize(datetime(2024, 6, 5, entry_h, entry_m, 0))
 
         def fake_prefilter(sym, _profile, _today):
             return True, (), ("volume_pace>=1.2x",)
@@ -1067,7 +1085,13 @@ class TestCashBucketBuffer:
     def test_cash_entry_slots_use_deployable_settled_cash(self):
         engine = _make_engine(_mock_ib())
 
-        assert engine._calc_cash_entry_slots(500.0) == 0
+        # Below MIN_BUCKET_FLOOR (150): settled=$100 → deployable=95 < 150 → 0 slots
+        assert engine._calc_cash_entry_slots(100.0) == 0
+        # Between floor and MIN_BUCKET_SIZE: settled=$500 → deployable=$475, which
+        # is below MIN_BUCKET_SIZE (500) but above MIN_BUCKET_FLOOR (150) → 1 slot
+        # (prevents small accounts from being permanently frozen on T+1 settlement).
+        assert engine._calc_cash_entry_slots(500.0) == 1
+        # Above MIN_BUCKET_SIZE: settled=$530 → deployable≈$503 ≥ $500 → 1 full slot
         assert engine._calc_cash_entry_slots(530.0) == 1
 
     def test_entry_allocation_dynamically_recomputes_slots_and_bucket(self):
@@ -1183,9 +1207,7 @@ class TestCandidateRanking:
              patch.object(engine, '_audit_stop_orders'), \
              patch.object(engine, 'manage_position_exits'), \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         # Return the state keys that were added (= symbols entered)
@@ -1429,9 +1451,7 @@ class TestCandidateRanking:
         with patch.object(engine, 'get_institutional_scan', return_value=['CHEAP']), \
              patch.object(engine, 'get_technical_context', return_value=ctx), \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         assert 'CHEAP' in engine.state, "Order must proceed when settled covers full order cost"
@@ -1491,9 +1511,7 @@ class TestCandidateRanking:
         with patch.object(engine, 'get_institutional_scan', return_value=['NOSTOP']), \
              patch.object(engine, 'get_technical_context', return_value=ctx), \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         assert ib.placeOrder.call_count == 1
@@ -1555,9 +1573,7 @@ class TestCandidateRanking:
              patch.object(engine, '_audit_stop_orders'), \
              patch.object(engine, 'manage_position_exits'), \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         assert 'HIGH' not in engine.state, "Cancelled rank-1 must NOT be written to state"
@@ -1609,9 +1625,7 @@ class TestCandidateRanking:
              patch.object(engine, '_audit_stop_orders'), \
              patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value = fake_now
-            mock_dt.fromisoformat = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         assert {'ALPHA', 'BETA'} <= set(engine.state)
@@ -1633,9 +1647,7 @@ class TestDailyScanSkip:
     def _run_cycle_at(self, engine, fake_now):
         with patch.object(engine, 'manage_position_exits'), \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value = fake_now
-            mock_dt.fromisoformat = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
     def test_low_dollar_volume_is_cached_for_rest_of_day(self):
@@ -1742,9 +1754,7 @@ class TestDailyScanSkip:
              patch.object(engine, 'manage_position_exits'), \
              patch.object(engine, '_update_position_prices'), \
              patch('src.engine.logger') as mock_logger, \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value = fake_now
-            mock_dt.fromisoformat = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         summary_lines = [
@@ -1870,7 +1880,7 @@ class TestRuntimeProtectiveStopAudit:
         with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
              patch.object(engine, '_write_dashboard_data'), \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_post_open_stop_audit()
@@ -1900,7 +1910,7 @@ class TestRuntimeProtectiveStopAudit:
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
              patch.object(engine, '_update_position_prices') as mock_prices, \
              patch.object(engine, '_write_dashboard_data') as mock_dashboard, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_post_open_stop_audit()
@@ -1932,7 +1942,7 @@ class TestRuntimeProtectiveStopAudit:
         with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
              patch.object(engine, '_write_dashboard_data'), \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_post_open_stop_audit()
@@ -1956,7 +1966,7 @@ class TestRuntimeProtectiveStopAudit:
         fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, 10, 30))
 
         with patch.object(engine, '_audit_stop_orders') as mock_audit, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_audit_stop_orders()
@@ -1979,7 +1989,7 @@ class TestRuntimeProtectiveStopAudit:
         fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, 10, 30))
 
         with patch.object(engine, '_audit_stop_orders') as mock_audit, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_audit_stop_orders()
@@ -2010,9 +2020,7 @@ class TestRuntimeProtectiveStopAudit:
              patch.object(engine, '_update_position_prices'), \
              patch.object(engine, '_write_dashboard_data'), \
              patch.object(engine, 'save_state'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value = fake_now
-            mock_dt.fromisoformat = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         mock_audit.assert_called_once()
@@ -2071,7 +2079,7 @@ class TestExitOrders:
 
     def _run_exit_check(self, engine, now=None):
         now = now or self._et(2024, 6, 5, 15, 50)
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_exits.datetime') as mock_dt:
             mock_dt.now.return_value = now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine.manage_position_exits()
@@ -2265,76 +2273,6 @@ class TestExitOrders:
         assert order.tif == 'DAY'
         assert order.goodAfterTime == ''
 
-    def test_tiered_profit_exit_sells_first_rounded_share_and_rebuilds_stop(self):
-        """Six shares trim one share at +1R; protection is rebuilt for the remainder."""
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        qty    = 6.0
-        entry  = 100.0
-        cur    = 102.10
-        filled = MagicMock()
-        filled.orderStatus.status = 'Filled'
-        filled.orderStatus.filled = 1.0
-        ib.placeOrder.return_value = filled
-        ib.openTrades.return_value = []
-        ib.positions.return_value = [self._make_position('TIER', qty)]
-        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=101.0, high=102.25, low=101.0)]
-        state = self._make_state_entry(price=entry, qty=qty)
-        state['entry_qty'] = qty
-        state['entry_risk_per_share'] = 2.0
-        state['initial_stop_loss'] = 98.0
-        state['profit_tiers_fired'] = []
-        state['profit_tier_exits'] = []
-        engine.state = {'TIER': state}
-
-        with patch.object(engine, '_audit_stop_orders') as mock_audit:
-            self._run_exit_check(engine, now=self._et(2024, 6, 5, 10, 30))
-
-        order = ib.placeOrder.call_args[0][1]
-        assert order.action == 'SELL'
-        assert order.orderType == 'MKT'
-        assert order.totalQuantity == pytest.approx(1.0)
-        assert engine.state['TIER']['qty'] == pytest.approx(5.0)
-        assert engine.state['TIER']['profit_tiers_fired'] == ['1.00R']
-        assert engine.state['TIER']['profit_tier_exits'][0]['target_r'] == pytest.approx(1.0)
-        assert engine.state['TIER']['profit_tier_exits'][0]['sold_qty'] == pytest.approx(1.0)
-        assert 'pending_exit' not in engine.state['TIER']
-        mock_audit.assert_called_once()
-
-    def test_tiered_profit_exit_uses_cumulative_rounding_for_final_trim(self):
-        """Six original shares sell two more at +2R, leaving the intended runner."""
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        entry  = 100.0
-        cur    = 106.10
-        filled = MagicMock()
-        filled.orderStatus.status = 'Filled'
-        filled.orderStatus.filled = 2.0
-        ib.placeOrder.return_value = filled
-        ib.openTrades.return_value = []
-        ib.positions.return_value = [self._make_position('RUN', 4.0)]
-        ib.reqTickers.return_value = [_mock_price_ticker(cur, open=104.0, high=106.25, low=104.0)]
-        state = self._make_state_entry(price=entry, qty=4.0)
-        state['entry_qty'] = 6.0
-        state['entry_risk_per_share'] = 3.0
-        state['initial_stop_loss'] = 97.0
-        state['profit_tiers_fired'] = ['1.00R', '1.50R']
-        state['profit_tier_exits'] = [
-            {'tier_id': '1.00R', 'target_r': 1.0, 'sold_qty': 1.0},
-            {'tier_id': '1.50R', 'target_r': 1.5, 'sold_qty': 1.0},
-        ]
-        engine.state = {'RUN': state}
-
-        with patch.object(engine, '_audit_stop_orders'):
-            self._run_exit_check(engine, now=self._et(2024, 6, 5, 10, 30))
-
-        order = ib.placeOrder.call_args[0][1]
-        assert order.totalQuantity == pytest.approx(2.0)
-        assert engine.state['RUN']['qty'] == pytest.approx(2.0)
-        assert engine.state['RUN']['profit_tiers_fired'] == ['1.00R', '1.50R', '2.00R']
-        assert engine.state['RUN']['profit_tier_exits'][-1]['target_r'] == pytest.approx(2.0)
-        assert engine.state['RUN']['profit_tier_exits'][-1]['sold_qty'] == pytest.approx(2.0)
-
     # ── manage_position_exits() ──────────────────────────────────────────────
 
     def test_eod_quality_cleanup_is_disabled_for_indicator_swing_profile(self):
@@ -2457,6 +2395,17 @@ class TestEdgeCases:
 
     # ── State persistence ────────────────────────────────────────────────────
 
+    def _bare_engine(self):
+        """Minimal VelocityEngine via __new__ with only the attrs needed for load_state."""
+        import src.engine as eng_mod
+        engine = eng_mod.VelocityEngine.__new__(eng_mod.VelocityEngine)
+        engine._alert_dedup_cache = {}
+        engine._ib_error_dedup = {}
+        engine._log_once_cache = {}
+        engine._indicator_row_cache = {}
+        engine._health_metrics = {}
+        return engine
+
     def test_load_state_returns_empty_on_corrupt_json(self, tmp_path):
         """Corrupt STATE_FILE must not crash the engine — returns empty dict."""
         import src.engine as eng_mod
@@ -2466,7 +2415,7 @@ class TestEdgeCases:
         original = eng_mod.STATE_FILE
         eng_mod.STATE_FILE = str(state_path)
         try:
-            engine = eng_mod.VelocityEngine.__new__(eng_mod.VelocityEngine)
+            engine = self._bare_engine()
             result = engine.load_state()
         finally:
             eng_mod.STATE_FILE = original
@@ -2479,7 +2428,7 @@ class TestEdgeCases:
         original = eng_mod.STATE_FILE
         eng_mod.STATE_FILE = str(tmp_path / "nonexistent.json")
         try:
-            engine = eng_mod.VelocityEngine.__new__(eng_mod.VelocityEngine)
+            engine = self._bare_engine()
             result = engine.load_state()
         finally:
             eng_mod.STATE_FILE = original
@@ -2560,9 +2509,7 @@ class TestEdgeCases:
         with patch.object(engine, 'get_institutional_scan', return_value=['SYM']), \
              patch.object(engine, 'get_technical_context', return_value=ctx), \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         return engine
@@ -2970,9 +2917,7 @@ class TestDailyLossCircuitBreaker:
         with patch.object(engine, 'get_institutional_scan', return_value=['TSLA']), \
              patch.object(engine, 'get_technical_context', return_value=passing_ctx), \
              patch.object(engine, '_update_position_prices'), \
-             patch('src.engine.datetime') as mock_dt:
-            mock_dt.now.return_value  = fake_now
-            mock_dt.fromisoformat     = datetime.fromisoformat
+             _freeze_all_datetimes(fake_now):
             engine.run_cycle()
 
         # Day start should now be June 5 with fresh equity
@@ -3232,65 +3177,6 @@ class TestHardStop:
         assert 'POS' in engine.state, "Position within loss threshold must not be force-closed"
         assert not ib.placeOrder.called
 
-    def test_break_even_exit_triggers_after_prior_profit_retraces_to_entry(self):
-        """Once +1R is reached, a confirmed close back to entry must force exit."""
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        tz_ny  = pytz.timezone('US/Eastern')
-
-        entry = 100.0
-        cur   = 99.95
-        state = self._state_entry(entry, cur, tz_ny)
-        state['entry_risk_per_share'] = 4.0
-        state['peak_price'] = 104.25
-        engine.state = {'POS': state}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur, high=104.25)]
-        ib.openTrades.return_value = []
-        ib.positions.return_value  = [self._make_position('POS', 5.0)]
-
-        self._run_exit_check(engine)
-
-        assert engine.state['POS']['pending_exit'] is True
-        assert ib.placeOrder.called
-
-    def test_break_even_exit_does_not_trigger_before_profit_threshold(self):
-        """A small loser must not be break-even-exited before +1R was reached."""
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        tz_ny  = pytz.timezone('US/Eastern')
-
-        entry = 100.0
-        cur   = 99.95
-        state = self._state_entry(entry, cur, tz_ny)
-        state['entry_risk_per_share'] = 4.0
-        state['peak_price'] = 103.95
-        engine.state = {'POS': state}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur)]
-
-        self._run_exit_check(engine)
-
-        assert 'pending_exit' not in engine.state['POS']
-        assert not ib.placeOrder.called
-
-    def test_break_even_exit_waits_for_close_confirmation(self):
-        """After +1R, an intraday dip below entry is ignored until a close confirms."""
-        ib     = _mock_ib()
-        engine = _make_engine(ib)
-        tz_ny  = pytz.timezone('US/Eastern')
-
-        entry = 100.0
-        cur   = 99.95
-        state = self._state_entry(entry, cur, tz_ny)
-        state['entry_risk_per_share'] = 4.0
-        state['peak_price'] = 104.25
-        engine.state = {'POS': state}
-        ib.reqTickers.return_value = [_mock_price_ticker(cur, high=104.25, close=101.0)]
-
-        self._run_exit_check(engine)
-
-        assert 'pending_exit' not in engine.state['POS']
-        assert not ib.placeOrder.called
-
     def test_analyst_downgrade_exit_requires_price_confirmation(self):
         """Bearish analyst score alone is not enough when price action is still healthy."""
         from src.strategy_profiles import get_strategy_profile
@@ -3474,7 +3360,7 @@ class TestEodFlat:
         eod_time = tz_ny.localize(
             datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
         )
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_exits.datetime') as mock_dt:
             mock_dt.now.return_value = eod_time
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
@@ -3526,7 +3412,7 @@ class TestEodFlat:
         eod_time = tz_ny.localize(
             datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
         )
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_exits.datetime') as mock_dt:
             mock_dt.now.return_value = eod_time
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
@@ -3606,7 +3492,7 @@ class TestEodFlat:
         eod_time = tz_ny.localize(
             datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
         )
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_exits.datetime') as mock_dt:
             mock_dt.now.return_value = eod_time
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()
@@ -3657,7 +3543,7 @@ class TestEodFlat:
         eod_time = tz_ny.localize(
             datetime(2024, 6, 5, EOD_EXIT_TIME[0], EOD_EXIT_TIME[1] + 5)
         )
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_exits.datetime') as mock_dt:
             mock_dt.now.return_value = eod_time
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()   # first call — fires
@@ -3667,7 +3553,7 @@ class TestEodFlat:
         engine.state['ONCE'] = self._state_entry(entry, cur, tz_ny, same_day_entry)
         place_count_after_first = ib.placeOrder.call_count
 
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_exits.datetime') as mock_dt:
             mock_dt.now.return_value = eod_time
             mock_dt.fromisoformat    = datetime.fromisoformat
             engine.manage_position_exits()   # second call same day — must not re-fire

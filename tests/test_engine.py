@@ -104,7 +104,8 @@ def _make_engine_patched(ib_mock):
             engine._alert_dedup_cache   = {}
             engine._data_blackout_streak = 0
             engine._data_blackout_alerted = False
-            engine._friday_cutoff_logged_date = None
+            engine._log_once_cache      = {}
+            engine._indicator_row_cache = {}
             engine._last_eod_exit_date  = None
             engine._last_pre_entry_sync_date = None
             engine._last_premarket_prefilter_date = None
@@ -213,7 +214,7 @@ class TestEodProfitCleanup:
 
     def _run_exit_check(self, engine, hour=15, minute=50):
         check_time = self._TZ_NY.localize(datetime(2024, 6, 5, hour, minute))
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_exits.datetime') as mock_dt:
             mock_dt.now.return_value = check_time
             mock_dt.fromisoformat = datetime.fromisoformat
             engine.manage_position_exits()
@@ -630,7 +631,7 @@ class TestConnectionSafety:
         with patch.object(engine, '_validate_deployment_mode'), \
              patch.object(engine, '_write_dashboard_data') as mock_dash, \
              patch.object(engine, '_warmup_historical_data') as mock_warmup, \
-             patch.object(eng_mod, 'ensure_ib_gateway_ready', return_value=True) as mock_ready:
+             patch('src.engine_base.ensure_ib_gateway_ready', return_value=True) as mock_ready:
             engine.connect()
 
         mock_ready.assert_called_once()
@@ -640,7 +641,6 @@ class TestConnectionSafety:
 
     def test_connect_fails_closed_when_gateway_unavailable(self):
         from src.engine import VelocityEngine
-        import src.engine as eng_mod
 
         ib = _mock_ib()
         engine = VelocityEngine.__new__(VelocityEngine)
@@ -648,12 +648,18 @@ class TestConnectionSafety:
 
         with patch.object(engine, '_validate_deployment_mode'), \
              patch.object(engine, '_alert') as mock_alert, \
-             patch.object(eng_mod, 'ensure_ib_gateway_ready', return_value=False), \
+             patch('src.engine_base.ensure_ib_gateway_ready', return_value=False), \
              pytest.raises(SystemExit):
             engine.connect()
 
         ib.connect.assert_not_called()
-        mock_alert.assert_called_once()
+        # Alert is raised once per retry attempt; verify it was raised at least once
+        # with the expected CRITICAL severity.
+        assert mock_alert.called
+        assert any(
+            args[0] == 'CRITICAL' and 'CONNECTION FAILED' in args[1]
+            for args, _ in mock_alert.call_args_list
+        )
 
     def test_run_cycle_skips_when_reconnect_fails(self):
         ib     = _mock_ib()
@@ -697,14 +703,16 @@ class TestHistoricalDataWarmup:
         # SPY fails on every attempt — return [] for all retries
         ib.reqHistoricalData.return_value = []
 
-        # Fix 7 retries HMDS_WARMUP_MAX_RETRIES times; patch sleep so test is fast
-        with patch('src.engine.time.sleep'), \
-             patch('src.engine.HMDS_WARMUP_MAX_RETRIES', 3):
+        # Fix 7 retries HMDS_WARMUP_MAX_RETRIES times; _safe_sleep calls
+        # ib.sleep() (a mock), so no real blocking occurs.
+        with patch('src.engine_market.HMDS_WARMUP_MAX_RETRIES', 3):
             assert engine._warmup_historical_data(reason="test") is False
 
         assert engine._historical_data_health['SPY']['ok'] is False
         # With retries, SPY is requested HMDS_WARMUP_MAX_RETRIES times
         assert ib.reqHistoricalData.call_count == 3
+        # _safe_sleep routes through ib.sleep — verify it was called for retries
+        assert ib.sleep.call_count == 2  # attempt 1 and 2 sleep; attempt 3 exits
 
     def test_warmup_marks_vix_specific_failure_after_spy_success(self):
         ib = _mock_ib()
@@ -718,8 +726,7 @@ class TestHistoricalDataWarmup:
             [spy_bar], [],  # attempt 3
         ]
 
-        with patch('src.engine.time.sleep'), \
-             patch('src.engine.HMDS_WARMUP_MAX_RETRIES', 3):
+        with patch('src.engine_market.HMDS_WARMUP_MAX_RETRIES', 3):
             assert engine._warmup_historical_data(reason="test") is False
 
         assert engine._historical_data_health['SPY']['ok'] is True
@@ -735,8 +742,7 @@ class TestHistoricalDataWarmup:
             [MagicMock(close=16.25)],
         ]
 
-        with patch('src.engine.time.sleep'):
-            assert engine._warmup_historical_data(reason="test") is True
+        assert engine._warmup_historical_data(reason="test") is True
 
         assert engine._last_vix == pytest.approx(16.25)
         assert engine._last_vix_source == "historical_warmup"
@@ -748,7 +754,7 @@ class TestIbErrorLogging:
         engine = _make_engine_patched(ib)
 
         with patch.object(engine, '_metric_inc') as mock_metric, \
-             patch('src.engine.logger') as mock_logger:
+             patch('src.engine_base.logger') as mock_logger:
             engine._on_ib_error(
                 123,
                 165,
@@ -764,7 +770,7 @@ class TestIbErrorLogging:
         engine = _make_engine_patched(ib)
 
         with patch.object(engine, '_metric_inc') as mock_metric, \
-             patch('src.engine.logger') as mock_logger:
+             patch('src.engine_base.logger') as mock_logger:
             engine._on_ib_error(123, 165, "Historical data request failed", None)
 
         mock_metric.assert_any_call('ib_errors')
@@ -802,9 +808,15 @@ class TestOffHoursMaintenance:
              patch.object(engine, '_fetch_spy_trend', return_value=True), \
              patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, 'get_institutional_scan') as mock_scan, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine.datetime') as mock_dt, \
+             patch('src.engine_entries.datetime') as mock_dt_entries, \
+             patch('src.engine_orders.datetime') as mock_dt_orders:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt_entries.now.return_value = fake_now
+            mock_dt_entries.fromisoformat = datetime.fromisoformat
+            mock_dt_orders.now.return_value = fake_now
+            mock_dt_orders.fromisoformat = datetime.fromisoformat
             engine.run_cycle()
 
         # One source-of-truth sync at cycle start, then one confirmation sync
@@ -847,9 +859,15 @@ class TestOffHoursMaintenance:
              patch.object(engine, '_fetch_spy_trend', return_value=False), \
              patch.object(engine, 'manage_position_exits') as mock_exits, \
              patch.object(engine, 'get_institutional_scan') as mock_scan, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine.datetime') as mock_dt, \
+             patch('src.engine_entries.datetime') as mock_dt_entries, \
+             patch('src.engine_orders.datetime') as mock_dt_orders:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
+            mock_dt_entries.now.return_value = fake_now
+            mock_dt_entries.fromisoformat = datetime.fromisoformat
+            mock_dt_orders.now.return_value = fake_now
+            mock_dt_orders.fromisoformat = datetime.fromisoformat
             engine.run_cycle()
 
         # One source-of-truth sync at cycle start, then one confirmation sync
@@ -874,7 +892,7 @@ class TestOffHoursMaintenance:
         fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, h, m + 5, 0))
 
         with patch.object(engine, '_run_operational_maintenance') as mock_job, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_entries.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             assert engine._maybe_run_off_hours_jobs() is False
@@ -890,7 +908,7 @@ class TestOffHoursMaintenance:
 
         with patch.object(engine, '_run_premarket_universe_prefilter', return_value={}) as mock_prefilter, \
              patch.object(engine, '_run_operational_maintenance') as mock_maintenance, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_entries.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             assert engine._maybe_run_off_hours_jobs() is True

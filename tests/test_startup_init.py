@@ -78,6 +78,25 @@ def _make_engine(ib_mock=None, state=None):
     engine._last_premarket_readiness_date = None
     engine._last_post_close_maintenance_date = None
     engine._missing_position_counts = {}
+    engine._ib_error_dedup      = {}
+    engine._alert_dedup_cache   = {}
+    engine._data_blackout_streak = 0
+    engine._data_blackout_alerted = False
+    engine._log_once_cache      = {}
+    engine._indicator_row_cache = {}
+    engine._vix_failure_count   = 0
+    engine._next_vix_retry_ts   = 0.0
+    engine._last_vix_failure_ts = 0.0
+    engine._last_vix_source     = None
+    engine._last_vix_ts         = 0.0
+    engine._prefilter_date      = None
+    engine._prefilter_status    = "not_started"
+    engine._prefilter_candidates = []
+    engine._prefilter_stats     = {}
+    engine._last_premarket_prefilter_date = None
+    engine._historical_data_health = {}
+    engine._health_date = datetime.now().strftime('%Y-%m-%d')
+    engine._health_metrics = {}
     return engine
 
 
@@ -252,8 +271,8 @@ class TestDeploymentSafety:
     def test_paper_mode_refuses_live_ib_port(self):
         engine = _make_engine(MagicMock())
 
-        with patch.object(eng_mod, 'TRADING_MODE', 'paper'), \
-             patch.object(eng_mod, 'IB_PORT', 4001), \
+        with patch('src.engine_base.TRADING_MODE', 'paper'), \
+             patch('src.engine_base.IB_PORT', 4001), \
              patch.object(engine, '_alert') as mock_alert:
             with pytest.raises(SystemExit):
                 engine._validate_deployment_mode()
@@ -263,9 +282,9 @@ class TestDeploymentSafety:
     def test_live_mode_requires_explicit_acknowledgement(self):
         engine = _make_engine(MagicMock())
 
-        with patch.object(eng_mod, 'TRADING_MODE', 'live'), \
-             patch.object(eng_mod, 'IB_PORT', 4001), \
-             patch.object(eng_mod, 'LIVE_TRADING_ACK', ''), \
+        with patch('src.engine_base.TRADING_MODE', 'live'), \
+             patch('src.engine_base.IB_PORT', 4001), \
+             patch('src.engine_base.LIVE_TRADING_ACK', ''), \
              patch.object(engine, '_alert') as mock_alert:
             with pytest.raises(SystemExit):
                 engine._validate_deployment_mode()
@@ -275,9 +294,9 @@ class TestDeploymentSafety:
     def test_live_mode_allows_explicit_acknowledgement(self):
         engine = _make_engine(MagicMock())
 
-        with patch.object(eng_mod, 'TRADING_MODE', 'live'), \
-             patch.object(eng_mod, 'IB_PORT', 4001), \
-             patch.object(eng_mod, 'LIVE_TRADING_ACK', eng_mod.LIVE_TRADING_ACK_PHRASE), \
+        with patch('src.engine_base.TRADING_MODE', 'live'), \
+             patch('src.engine_base.IB_PORT', 4001), \
+             patch('src.engine_base.LIVE_TRADING_ACK', eng_mod.LIVE_TRADING_ACK_PHRASE), \
              patch.object(engine, '_alert') as mock_alert:
             engine._validate_deployment_mode()
 
@@ -286,9 +305,9 @@ class TestDeploymentSafety:
     def test_live_mode_refuses_paper_ib_port_even_with_acknowledgement(self):
         engine = _make_engine(MagicMock())
 
-        with patch.object(eng_mod, 'TRADING_MODE', 'live'), \
-             patch.object(eng_mod, 'IB_PORT', 4002), \
-             patch.object(eng_mod, 'LIVE_TRADING_ACK', eng_mod.LIVE_TRADING_ACK_PHRASE), \
+        with patch('src.engine_base.TRADING_MODE', 'live'), \
+             patch('src.engine_base.IB_PORT', 4002), \
+             patch('src.engine_base.LIVE_TRADING_ACK', eng_mod.LIVE_TRADING_ACK_PHRASE), \
              patch.object(engine, '_alert') as mock_alert:
             with pytest.raises(SystemExit):
                 engine._validate_deployment_mode()
@@ -473,7 +492,7 @@ class TestInitialize:
         fake_now = pytz.timezone('US/Eastern').localize(datetime(2026, 5, 19, 6, 30, 0))
 
         with patch.object(engine, '_write_dashboard_data'), \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_entries.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._initialize()
@@ -567,19 +586,6 @@ class TestUnrealizedPnl:
         engine = self._engine_with_pos(entry=100.0, qty=10, cur_price=115.0)
         engine._update_position_prices()
         assert engine.state['TSLA']['current_price'] == 115.0
-
-    def test_break_even_armed_after_r_based_threshold(self):
-        engine = self._engine_with_pos(
-            entry=100.0,
-            qty=10,
-            cur_price=120.0,
-        )
-        engine.state['TSLA']['stop_dist'] = 20.0
-        engine._update_position_prices()
-
-        assert engine.state['TSLA']['break_even_armed'] is True
-        assert engine.state['TSLA']['break_even_target_price'] == pytest.approx(120.0)
-        assert engine.state['TSLA']['effective_stop'] == pytest.approx(100.0)
 
     def test_percent_trail_keeps_broker_stop_as_effective_stop(self):
         engine = self._engine_with_pos(entry=100.0, qty=10, cur_price=110.0)
@@ -901,7 +907,7 @@ class TestAuditStopOrders:
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
 
         before_gate = tz_ny.localize(datetime(2024, 6, 5, 9, 31))
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = before_gate
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._audit_stop_orders()
@@ -916,7 +922,7 @@ class TestAuditStopOrders:
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
 
         after_gate = tz_ny.localize(datetime(2024, 6, 5, 9, 33))
-        with patch('src.engine.datetime') as mock_dt:
+        with patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = after_gate
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._audit_stop_orders()
@@ -1192,7 +1198,7 @@ class TestPreEntrySyncAudit:
         fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, h, m - 1, 0))
         with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_pre_entry_sync_audit()
@@ -1218,7 +1224,7 @@ class TestPreEntrySyncAudit:
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
              patch.object(engine, '_update_position_prices') as mock_prices, \
              patch.object(engine, '_write_dashboard_data') as mock_dashboard, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_pre_entry_sync_audit()
@@ -1247,7 +1253,7 @@ class TestPreEntrySyncAudit:
         fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, h, m + 5, 0))
         with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_pre_entry_sync_audit()
@@ -1273,7 +1279,7 @@ class TestPreEntrySyncAudit:
         fake_now = self._TZ_NY.localize(datetime(2026, 5, 19, h, m + 11, 0))
         with patch.object(engine, '_sync_positions_from_ibkr') as mock_sync, \
              patch.object(engine, '_audit_stop_orders') as mock_audit, \
-             patch('src.engine.datetime') as mock_dt:
+             patch('src.engine_orders.datetime') as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.fromisoformat = datetime.fromisoformat
             engine._maybe_pre_entry_sync_audit()

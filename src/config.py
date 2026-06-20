@@ -95,12 +95,16 @@ BACKTEST_COMMISSION_PER_ORDER = float(os.getenv("VELOCITY_BACKTEST_COMMISSION_PE
 # account never spends unsettled sale proceeds.  Only a configurable fraction
 # of settled cash is deployed into buckets; the rest stays as a broker buffer.
 MIN_BUCKET_SIZE      = float(os.getenv("VELOCITY_MIN_BUCKET_SIZE", "500.0"))
+# Absolute cash floor below which no new entry is attempted, regardless of MIN_BUCKET_SIZE.
+# For small accounts whose deployable settled cash sits between this floor and MIN_BUCKET_SIZE,
+# one entry slot is granted using the full deployable amount as the bucket.
+MIN_BUCKET_FLOOR     = float(os.getenv("VELOCITY_MIN_BUCKET_FLOOR", "150.0"))
 MAX_POSITIONS_CAP    = int(os.getenv("VELOCITY_MAX_POSITIONS_CAP", "20"))
 SETTLED_CASH_DEPLOYMENT_PCT = float(os.getenv("VELOCITY_SETTLED_CASH_DEPLOYMENT_PCT", "0.95"))
 
 # ── Chandelier Exit trailing stop ─────────────────────────────────────────────
 CHANDELIER_PERIOD = 22     # lookback for ATR and highest-high (standard setting)
-CHANDELIER_MULT   = 2.0    # ATR multiplier — kept after rule-combo sweep; 1.9 improved DD but gave up total return
+CHANDELIER_MULT   = 1.0    # ATR multiplier
 
 # ── Risk rules ────────────────────────────────────────────────────────────────
 VIX_THRESHOLD        = 35
@@ -108,21 +112,6 @@ MAX_DAILY_LOSS_PCT   = 0.03    # 3% intraday equity drawdown halts new entries f
 ATR_PCT_MAX         = 0.07     # ATR_CHAND / price cap; filters excessively noisy names while preserving enough trade count
 HARD_STOP_PCT        = 0.07    # 7% drawdown from entry triggers forced market exit regardless of ATR
 RISK_PER_TRADE_PCT   = 0.02    # risk 2% of current equity per trade (ATR-based position sizing)
-TIERED_PROFIT_EXIT_ENABLED = os.getenv(
-    "VELOCITY_TIERED_PROFIT_EXIT_ENABLED", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-# Each tuple is (R-multiple target, cumulative position fraction that should be sold).
-# R is the original per-share risk distance captured from the entry Chandelier stop.
-# Example: a 6-share entry trims 1 share at +1R, 1 more at +1.5R, and 2 more at +2R.
-TIERED_PROFIT_EXIT_R_LEVELS = (
-    (1.0, 0.20),
-    (1.5, 0.40),
-    (2.0, 0.60),
-)
-BREAK_EVEN_R_MULT = float(os.getenv(
-    "VELOCITY_BREAK_EVEN_R_MULT",
-    str(TIERED_PROFIT_EXIT_R_LEVELS[0][0] if TIERED_PROFIT_EXIT_R_LEVELS else 1.0),
-))
 FRIDAY_CLOSE_HOUR    = 15      # ET hour after which Friday positions are evaluated for early close
 FRIDAY_MIN_PROFIT_PCT = 0.03   # Friday close: exit if profit < 3% to avoid carrying weekend gap risk
 EOD_EXIT_TIME        = (15, 50)  # ET — same-day EOD quality cleanup before overnight carry
@@ -367,18 +356,18 @@ EQUITY_RETRY_INTERVAL  = 5     # seconds between retries when equity fetch fails
 # ── Reconnect behavior ────────────────────────────────────────────────────────
 RECONNECT_INITIAL_WAIT_SEC = float(os.getenv("VELOCITY_RECONNECT_INITIAL_WAIT_SEC", "5"))
 RECONNECT_MAX_WAIT_SEC = float(os.getenv("VELOCITY_RECONNECT_MAX_WAIT_SEC", "300"))
+# Maximum in-process connection attempts before giving up and calling sys.exit().
+# Each retry uses exponential backoff (RECONNECT_INITIAL_WAIT_SEC × 2^attempt).
+CONNECT_MAX_ATTEMPTS = int(os.getenv("VELOCITY_CONNECT_MAX_ATTEMPTS", "5"))
 # Suppress identical CRITICAL/ERROR alerts within this window (seconds) to
 # prevent webhook and log floods during prolonged outages.
 ALERT_DEDUP_WINDOW_SEC = float(os.getenv("VELOCITY_ALERT_DEDUP_WINDOW_SEC", "600"))
+# Suppress repeated IB error callbacks with the same error code within this window.
+IB_ERROR_DEDUP_WINDOW_SEC = float(os.getenv("VELOCITY_IB_ERROR_DEDUP_WINDOW_SEC", "60"))
 
 # ── HMDS warmup retry ─────────────────────────────────────────────────────────
 HMDS_WARMUP_MAX_RETRIES = int(os.getenv("VELOCITY_HMDS_WARMUP_MAX_RETRIES", "3"))
 HMDS_WARMUP_RETRY_WAIT_SEC = float(os.getenv("VELOCITY_HMDS_WARMUP_RETRY_WAIT_SEC", "60"))
-
-# ── Break-even exit ────────────────────────────────────────────────────────────
-# Exit fires when current price falls below entry + (peak_gain × this fraction).
-# 0.25 means we keep at least 25% of the peak gain before exiting (vs. 0.0 = exit at entry).
-BREAK_EVEN_PEAK_RETAIN_FRACTION = float(os.getenv("VELOCITY_BREAK_EVEN_PEAK_RETAIN_FRACTION", "0.25"))
 
 # ── Stale losing position exit ────────────────────────────────────────────────
 STALE_POSITION_MIN_BARS = int(os.getenv("VELOCITY_STALE_POSITION_MIN_BARS", "3"))
@@ -397,3 +386,18 @@ LATE_ENTRY_MIN_SCORE = float(os.getenv("VELOCITY_LATE_ENTRY_MIN_SCORE", "92.0"))
 DATA_BLACKOUT_RATIO_THRESHOLD = float(os.getenv("VELOCITY_DATA_BLACKOUT_RATIO_THRESHOLD", "0.70"))
 DATA_BLACKOUT_MIN_CANDIDATES = int(os.getenv("VELOCITY_DATA_BLACKOUT_MIN_CANDIDATES", "5"))
 DATA_BLACKOUT_STREAK_ALERT = int(os.getenv("VELOCITY_DATA_BLACKOUT_STREAK_ALERT", "2"))
+
+# ── Position-level price blackout detection ───────────────────────────────────
+# When a held position's fresh-price fetch fails for this many consecutive
+# management cycles, emit a CRITICAL alert. Software exits remain disabled
+# (broker trailing stop is the only active protection) but the operator is
+# notified rather than left unaware.
+POSITION_PRICE_BLACKOUT_STREAK_ALERT = int(os.getenv(
+    "VELOCITY_POSITION_PRICE_BLACKOUT_STREAK_ALERT", "3"
+))
+# Maximum age of a cached price (seconds) before it is considered too stale
+# to use for the degraded-mode hard-stop check.
+PRICE_STALE_MAX_AGE_SEC = float(os.getenv("VELOCITY_PRICE_STALE_MAX_AGE_SEC", "3600"))
+# Additional buffer applied to HARD_STOP_PCT when using a stale cached price,
+# to account for adverse moves since the last successful quote.
+HARD_STOP_STALE_BUFFER_PCT = float(os.getenv("VELOCITY_HARD_STOP_STALE_BUFFER_PCT", "0.02"))
