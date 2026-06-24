@@ -47,7 +47,8 @@ from src.config import (
     STRATEGY_PROFILE,
     VIX_THRESHOLD,
     MIN_CANDLES,
-    CHANDELIER_PERIOD, CHANDELIER_MULT,
+    CHANDELIER_PERIOD,
+    TRAIL_PCT,
     ATR_PCT_MAX, HARD_STOP_PCT,
     SMA200_SLOPE_LOOKBACK,
     SPREAD_MAX_PCT,
@@ -176,7 +177,7 @@ class VelocityBacktest:
     use_vix_filter  : if True, skip new entries when VIX is missing or > VIX_THRESHOLD
     vix_delay_bars  : daily-bar proxy for delayed VIX data; 0=current bar,
                       1=prior available VIX bar (used for 15-minute delayed research)
-    chandelier_mult      : ATR multiplier for trailing stop
+    trail_pct            : flat % trailing stop distance from peak (e.g. 0.04 = 4%)
     use_cache            : load/save downloaded data from backtest/.cache/
     """
 
@@ -193,7 +194,7 @@ class VelocityBacktest:
         use_spy_filter: bool  = True,
         use_vix_filter: bool  = True,
         vix_delay_bars: int   = 0,
-        chandelier_mult:      float = CHANDELIER_MULT,
+        trail_pct:            float = TRAIL_PCT,
         bear_phase_trading:   bool  = BEAR_PHASE_TRADING_ENABLED,
         commission_per_order: float = BACKTEST_COMMISSION_PER_ORDER,
         max_symbols:          int   = BACKTEST_MAX_SYMBOLS,
@@ -213,7 +214,7 @@ class VelocityBacktest:
         self._use_spy_filter       = use_spy_filter
         self._use_vix_filter       = use_vix_filter
         self._vix_delay_bars       = max(0, int(vix_delay_bars or 0))
-        self._chandelier_mult      = chandelier_mult
+        self._trail_pct            = trail_pct
         self._bear_phase_trading   = bear_phase_trading
         self._round_trip_cost      = max(0.0, float(commission_per_order)) * 2.0
         self._max_symbols          = max(0, int(max_symbols or 0))
@@ -1289,12 +1290,8 @@ class VelocityBacktest:
             return False
 
         if EOD_HOLD_REQUIRE_STOP_CONFIRMED:
-            atr_chand = trade.__dict__.get('_atr_chand', np.nan)
-            try:
-                atr_chand = float(atr_chand)
-            except (TypeError, ValueError):
-                return False
-            if not np.isfinite(atr_chand) or atr_chand <= 0:
+            # With percent trail, stop is always computable; just confirm entry price is valid.
+            if trade.entry_price <= 0:
                 return False
 
         if ANALYST_RATING_EXIT_ENABLED:
@@ -1492,21 +1489,19 @@ class VelocityBacktest:
                 t.__dict__['_bars_held'] = t.__dict__.get('_bars_held', 0) + 1
                 bars_held = t.__dict__['_bars_held']
 
-                atr_chand = t.__dict__.get('_atr_chand', float(row['ATR']))
-
                 # Use the stop known at the start of the bar. With daily data we
                 # cannot know whether today's high happened before today's low,
                 # so ratcheting from same-bar highs would introduce look-ahead.
                 peak_high = t.__dict__.get('_peak_high', t.entry_price)
 
-                # Chandelier stop: peak_high - ATR_CHAND × multiplier
-                chand_stop = peak_high - atr_chand * self._chandelier_mult
+                # Percent trail stop: peak × (1 - TRAIL_PCT), mirrors IBKR percent TRAIL behaviour
+                trail_stop = peak_high * (1 - self._trail_pct)
 
                 # Hard stop: flat 7% below entry
                 hard_stop = t.entry_price * (1 - HARD_STOP_PCT)
 
                 stop_candidates = [
-                    ("chandelier_stop", chand_stop),
+                    ("trail_stop", trail_stop),
                     ("hard_stop", hard_stop),
                 ]
                 exit_stop_reason, effective_stop = max(stop_candidates, key=lambda item: item[1])
@@ -1683,11 +1678,8 @@ class VelocityBacktest:
                             continue
                         entry_price = round(raw_entry * 1.001, 4)
 
-                        # ATR-based position sizing: risk 2% of equity per trade
-                        atr_chand_val   = float(row['ATR_CHAND'])
-                        chand_dist      = round(atr_chand_val * self._chandelier_mult, 2)
-                        # Size from the broker-protected Chandelier distance.
-                        # Hard/break-even exits are software overlays.
+                        # Percent-trail position sizing: stop = entry × TRAIL_PCT
+                        chand_dist      = round(entry_price * self._trail_pct, 2)
                         risk_stop_dist  = chand_dist
                         risk_stop_dist  = max(risk_stop_dist, 0.01)  # floor at 1¢
 
@@ -1713,7 +1705,7 @@ class VelocityBacktest:
                             qty         = qty,
                             round_trip_commission = self._round_trip_cost,
                         )
-                        t.__dict__['_atr_chand']  = atr_chand_val
+                        t.__dict__['_trail_pct']  = self._trail_pct
                         t.__dict__['_peak_high']  = entry_price
                         t.__dict__['_last_close'] = entry_price
                         t.__dict__['_bars_held']  = 0

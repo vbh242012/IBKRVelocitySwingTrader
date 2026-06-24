@@ -52,8 +52,8 @@
    - Analyst ratings are bounded scoring/exit inputs only. Analyst consensus may improve or reduce rank, but it must never create a buy by itself or force an exit without weak price action confirming the downgrade.
    - Live/paper analyst ratings resolve in this order: dated local CSV, Finnhub when `VELOCITY_FINNHUB_API_KEY` is set, then Yahoo/yfinance when `VELOCITY_ANALYST_RATINGS_FREE_SOURCE=yahoo` is enabled. Backtests use only dated local CSV snapshots to avoid look-ahead.
    - Default minimum entry score is 50.
-   - Exit logic: Chandelier ATR trailing stop (primary, broker-side), hard stop, analyst downgrade exit with price confirmation, matching-sleeve exit, swing time stop, and emergency liquidation. Tiered profit exits and break-even exit were removed on 2026-06-20. Do not reintroduce them.
-   - `CHANDELIER_MULT = 1.0` and `CHANDELIER_PERIOD = 22`. Changed from 2.0 to 1.0 on 2026-06-20 for a live evaluation period. Plan to revisit after ~2 weeks of live data. Optimizer grid is `[0.8, 1.0, 1.2]`.
+   - Exit logic: Flat percent trailing stop (primary, broker-side IBKR TRAIL order using `trailingPercent`), hard stop, analyst downgrade exit with price confirmation, matching-sleeve exit, swing time stop, and emergency liquidation. Tiered profit exits and break-even exit were removed on 2026-06-20. Chandelier ATR-based stop was replaced by percent trail on 2026-06-24. Do not reintroduce any of them.
+   - `TRAIL_PCT = 0.04` (4% flat percent trailing stop from peak price). `CHANDELIER_PERIOD = 22` is retained only for the ATR volatility entry filter (ATR_CHAND / price for ATR_PCT_MAX gate). Optimizer grid is `[0.03, 0.04, 0.05]`.
    - Default swing time stop is 10 trading bars when the position is not above breakeven. The maintained profile disables same-day EOD churn and Friday cleanup by default.
    - The VIX risk filter is mandatory for live entries. If VIX market data is missing, invalid, or above the configured threshold, the engine must skip new entries while still managing existing positions.
    - Stock entries require real-time equity market data. VIX may use delayed IBKR market data as a regime-only safety input via `VELOCITY_VIX_MARKET_DATA_TYPE=3`; the engine must restore real-time stock data mode before scanning/ordering.
@@ -157,7 +157,7 @@
    - `liquidate()` cancels active SELL protection before a cash-account market exit, then catches IBKR `placeOrder()` exceptions, clears `pending_exit`, retains state, alerts, and runs `_audit_stop_orders()` so protection is rebuilt if the exit cannot be placed or is rejected.
    - After IBKR confirms a symbol is flat, `_sync_positions_from_ibkr()` must cancel any leftover SELL exit orders before removing local state. This prevents orphaned trailing stops from becoming unintended future sell orders.
    - Liquidation state removal remains confirmation-based: one missing IBKR snapshot only defers removal unless `FORCE_EXIT_ALL` is active.
-   - `backtest/optimizer.py` must optimize only the active `indicator_swing` exit parameter: `chandelier_mult`. Break-even R was removed on 2026-06-20.
+   - `backtest/optimizer.py` must optimize only the active `indicator_swing` exit parameter: `trail_pct`. Chandelier ATR mult was replaced by `trail_pct` on 2026-06-24.
    - `run_backtest.py` must expose only current live/backtest strategy controls.
 
 12. Latest validation record
@@ -1337,3 +1337,29 @@
    ```
 
    Results: 342 passed.
+
+1. Replaced ATR trailing stop with flat percent trailing stop, 2026-06-24
+
+   Decision: remove ATR/Chandelier-based stop; use a simple flat 4% percent trailing
+   stop (`TRAIL_PCT = 0.04`) that is price-proportional and requires no ATR calculation
+   at entry time. IBKR TRAIL order uses `trailingPercent` instead of `auxPrice`.
+
+   Changes:
+   - Removed `CHANDELIER_MULT` from `src/config.py`; added `TRAIL_PCT = 0.04`.
+   - `CHANDELIER_PERIOD` retained for entry volatility filter (ATR_CHAND/price gate),
+     not for stop distance.
+   - `src/engine.py`: `trail_dist = round(limit_price * TRAIL_PCT, 2)`, TRAIL order
+     uses `trailingPercent` instead of `auxPrice`. State includes `stop_mode='percent'`
+     and `trailing_percent=4.0`.
+   - `src/engine_orders.py`: audit no longer fetches historical bars; computes
+     `trail_dist` from `entry_px * TRAIL_PCT` and places with `trailingPercent`.
+     `_trail_order_protection` updated to handle `trailingPercent`-only orders
+     (where `trailStopPrice` is UNSET until broker populates it).
+   - `src/engine_entries.py`: `effective_stop` display uses `peak × (1 - TRAIL_PCT)`
+     instead of static initial_sl.
+   - `backtest/strategy.py`: stop = `peak_high × (1 - trail_pct)`. Position sizing
+     uses `entry_price × trail_pct` for stop distance.
+   - `backtest/optimizer.py`: `chandelier_mult` → `trail_pct`, grid `[0.03, 0.04, 0.05]`.
+   - `run_backtest.py`: `--chandelier-mult` → `--trail-pct`.
+   - `dashboard_server.py`: "Percent Trail" row with `__TRAIL_PCT__%` token.
+   - All tests updated; 164 passed.

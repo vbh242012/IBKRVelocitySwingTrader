@@ -27,7 +27,7 @@ from src.config import (
     ENTRY_START, ENTRY_END,
     FRIDAY_ENTRY_CUTOFF_TIME,
     MAX_DAILY_LOSS_PCT,
-    CHANDELIER_MULT, HARD_STOP_PCT,
+    TRAIL_PCT, HARD_STOP_PCT,
     RISK_PER_TRADE_PCT, BEAR_PHASE_RISK_MULT, BEAR_PHASE_DOLLAR_VOL_MULT,
     BEAR_PHASE_TRADING_ENABLED,
     ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE,
@@ -665,14 +665,13 @@ class VelocityEngine(
                             logger.warning(f"SKIP {sym}: ATR invalid ({atr:.4f}), skipping")
                             continue
 
-                        atr_chandelier  = ctx.get('atr_chandelier', atr)
-                        chandelier_dist = round(atr_chandelier * CHANDELIER_MULT, 2)
-                        hard_stop_dist  = round(price * HARD_STOP_PCT, 2)
-                        risk_stop_dist  = chandelier_dist
+                        trail_dist     = round(limit_price * TRAIL_PCT, 2)
+                        hard_stop_dist = round(price * HARD_STOP_PCT, 2)
+                        risk_stop_dist = trail_dist
                         if np.isnan(risk_stop_dist) or risk_stop_dist <= 0:
                             logger.warning(
                                 f"SKIP {sym}: invalid risk stop distance "
-                                f"(broker_chandelier=${chandelier_dist:.2f}, "
+                                f"(trail_dist=${trail_dist:.2f}, "
                                 f"software_hard=${hard_stop_dist:.2f})"
                             )
                             continue
@@ -774,10 +773,12 @@ class VelocityEngine(
                             'time':           datetime.now(_TZ_NY).isoformat(),
                             'qty':            filled_qty,
                             'entry_qty':      filled_qty,
-                            'entry_risk_per_share': chandelier_dist,
-                            'initial_stop_loss': round(fill_price - chandelier_dist, 4),
-                            'stop_loss':      round(fill_price - chandelier_dist, 2),
-                            'stop_dist':      chandelier_dist,
+                            'entry_risk_per_share': trail_dist,
+                            'initial_stop_loss': round(fill_price - trail_dist, 4),
+                            'stop_loss':      round(fill_price - trail_dist, 2),
+                            'stop_dist':      trail_dist,
+                            'stop_mode':      'percent',
+                            'trailing_percent': round(TRAIL_PCT * 100, 4),
                             'peak_price':     fill_price,
                             'volume':         ctx.get('volume', 0),
                             'score':          score,
@@ -820,7 +821,7 @@ class VelocityEngine(
                         stop_order.action        = 'SELL'
                         stop_order.orderType     = 'TRAIL'
                         stop_order.totalQuantity = filled_qty
-                        stop_order.auxPrice      = chandelier_dist
+                        stop_order.trailingPercent = round(TRAIL_PCT * 100, 2)
                         stop_order.tif           = 'GTC'
                         stop_order.goodAfterTime = self._stop_good_after_time()
                         stop_order.transmit      = True
@@ -925,8 +926,8 @@ class VelocityEngine(
                             f"ScanPrice=${price:.2f} Limit=${limit_price:.2f} "
                             f"FillPrice=${fill_price:.2f} "
                             f"Commission={'$'+str(self.state[sym]['commission']) if 'commission' in self.state[sym] else 'pending'} "
-                            f"ChandelierStop=${round(fill_price-chandelier_dist,2):.2f} "
-                            f"(broker_dist=${chandelier_dist:.2f}, software_hard=${hard_stop_dist:.2f}, "
+                            f"TrailStop=${round(fill_price * (1 - TRAIL_PCT), 2):.2f} "
+                            f"(trail_pct={TRAIL_PCT*100:.1f}%, software_hard=${hard_stop_dist:.2f}, "
                             f"risk={risk_per_trade_pct*100:.1f}%) | "
                             f"Protection={'confirmed' if protection_confirmed else 'UNCONFIRMED'} | "
                             f"Settled remaining=${settled:.2f}"

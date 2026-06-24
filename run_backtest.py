@@ -41,7 +41,8 @@ from backtest.strategy import VelocityBacktest
 from src.config import (
     BACKTEST_SCAN_COUNT, BACKTEST_INITIAL_CAPITAL, BACKTEST_COMMISSION_PER_ORDER,
     BACKTEST_MAX_SYMBOLS,
-    CHANDELIER_MULT, CHANDELIER_PERIOD,
+    CHANDELIER_PERIOD,
+    TRAIL_PCT,
     EOD_HOLD_MIN_PROFIT_PCT, EOD_HOLD_DAY_RANGE_LOCATION_MIN,
     EOD_HOLD_RELATIVE_STRENGTH_MIN,
     MAX_POSITIONS_CAP, MIN_BUCKET_SIZE, SETTLED_CASH_DEPLOYMENT_PCT,
@@ -70,8 +71,8 @@ def parse_args():
                    help="Override the selected profile's scanner minimum daily volume")
     p.add_argument("--min-dollar-vol", default=None, type=float,
                    help="Override the selected profile's 20-day average dollar-volume floor")
-    p.add_argument("--chandelier-mult", default=CHANDELIER_MULT,      type=float,
-                   help=f"ATR multiple for Chandelier trailing stop (default: {CHANDELIER_MULT})")
+    p.add_argument("--trail-pct", default=TRAIL_PCT, type=float,
+                   help=f"Flat %% trailing stop distance from peak (default: {TRAIL_PCT:.0%})")
     p.add_argument("--no-spy-filter",   action="store_true",
                    help="Disable SPY regime filter (allow entries in bear market)")
     p.set_defaults(vix_filter=True)
@@ -133,7 +134,7 @@ def _build_backtest(args, *, start: str, end: str, use_cache: bool) -> VelocityB
         scan_count     = args.scan_count,
         commission_per_order = args.commission_per_order,
         max_symbols    = args.max_symbols,
-        chandelier_mult= args.chandelier_mult,
+        trail_pct      = args.trail_pct,
         use_spy_filter = not args.no_spy_filter,
         use_vix_filter = args.vix_filter,
         vix_delay_bars = args.vix_delay_bars,
@@ -214,7 +215,7 @@ def main():
     print(f"  Entry rules   : {profile.description}")
     scoring_model = _effective_scoring_model(args)
     print(f"  Scoring model : {scoring_model}")
-    print(f"  Exit          : Chandelier (ATR{CHANDELIER_PERIOD}×{args.chandelier_mult}) trailing stop + 7% hard stop + confirmed analyst downgrade")
+    print(f"  Exit          : Percent trail ({args.trail_pct:.0%} from peak) + 7% hard stop + confirmed analyst downgrade")
     if profile.eod_quality_cleanup:
         print(
             "  EOD cleanup   : same-day quality hold "

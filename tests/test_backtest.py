@@ -102,9 +102,9 @@ def test_removed_backtest_kwargs_are_not_accepted():
 
 def test_optimizer_params_only_cover_active_exit_knobs():
     params = OptimizationParams()
-    assert set(params.__dataclass_fields__) == {"chandelier_mult"}
-    assert all(set(p.__dataclass_fields__) == {"chandelier_mult"} for p in quick_grid())
-    assert all(set(p.__dataclass_fields__) == {"chandelier_mult"} for p in default_grid())
+    assert set(params.__dataclass_fields__) == {"trail_pct"}
+    assert all(set(p.__dataclass_fields__) == {"trail_pct"} for p in quick_grid())
+    assert all(set(p.__dataclass_fields__) == {"trail_pct"} for p in default_grid())
 
 
 def test_run_backtest_scoring_model_is_profile_owned():

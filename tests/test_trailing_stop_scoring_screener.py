@@ -1,11 +1,12 @@
 """
 Comprehensive validation of three critical VelocityEngine subsystems:
 
-  1. Chandelier trailing stop order construction (standalone BUY + post-fill TRAIL)
-     - chandelier_dist = ATR_CHAND × CHANDELIER_MULT (1.0)
+  1. Percent trailing stop order construction (standalone BUY + post-fill TRAIL)
+     - trail_dist = limit_price × TRAIL_PCT (0.04 = 4%)
+     - trailingPercent on TRAIL order = TRAIL_PCT × 100
      - goodAfterTime is omitted after the configured entry start so IBKR cannot reject a past activation time
      - BUY order: transmit=True; TRAIL stop: standalone GTC transmit=True after fill
-     - state.stop_loss  = fill - chandelier_dist
+     - state.stop_loss  = fill - trail_dist
      - No take-profit order or state key
 
   2. Screener (IB ScannerSubscription parameters)
@@ -246,14 +247,14 @@ def _run_entry_cycle(ib, engine, ctx, sym='TSLA'):
     fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))   # Wed 10:30 — inside window
 
     fill_price = ctx['live_price']
-    from src.config import CHANDELIER_MULT, RISK_PER_TRADE_PCT
+    from src.config import TRAIL_PCT, RISK_PER_TRADE_PCT
 
     summary = {item.tag: float(item.value) for item in ib.accountSummary.return_value}
     equity = summary.get('NetLiquidation', 1400.0)
     settled = summary.get('SettledCash', 5000.0)
     limit_price = engine._calc_entry_limit_price(ctx['live_price'], ctx['bid'], ctx['ask'])
     allocation = engine._calc_entry_allocation(equity, settled, len(engine.state))
-    risk_dist = round(ctx.get('atr_chandelier', ctx['atr']) * CHANDELIER_MULT, 2)
+    risk_dist = round(limit_price * TRAIL_PCT, 2) if limit_price else 0
     expected_qty = 0
     if limit_price and risk_dist > 0:
         expected_qty = min(
@@ -288,46 +289,47 @@ def _run_entry_cycle(ib, engine, ctx, sym='TSLA'):
 
 class TestBracketOrderMath:
     """
-    Verify chandelier stop distance, GTC 2-order structure, and state persistence.
+    Verify percent trail stop distance, GTC 2-order structure, and state persistence.
 
     Config values used (from src/config.py):
-        CHANDELIER_MULT = 1.0   →  chandelier_dist = ATR_CHAND × 1.0
+        TRAIL_PCT = 0.04  →  trail_dist = limit_price × 0.04
 
-    With atr_chandelier = 3.00:
-        chandelier_dist = 3.00
-        stop_loss (state) = fill - 3.00 = 97.00
+    With entry=100.00, limit=100.15, TRAIL_PCT=0.04:
+        trail_dist  = round(100.15 × 0.04, 2) = 4.01
+        stop_loss (state) = fill - trail_dist = 100.00 - 4.01 = 95.99
+        trailingPercent on TRAIL order = 4.0
         No take-profit order or state key.
     """
 
-    ATR_CHAND   = 3.00
     ENTRY       = 100.00
     LIMIT       = 100.15                         # ask 100.10 + 5 bps cushion, capped by 0.2%
-    CHAND_DIST  = round(3.00 * 1.0, 2)           # 3.00
-    INIT_STOP   = round(100.00 - 3.00 * 1.0, 2) # 97.00
+    TRAIL_DIST  = round(100.15 * 0.04, 2)        # 4.01 (4% of limit price)
+    INIT_STOP   = round(100.00 - round(100.15 * 0.04, 2), 2)  # 95.99
 
     def _setup(self):
         ib      = _mock_ib()
         engine  = _make_engine(ib)
-        context = _ctx(price=self.ENTRY, atr=self.ATR_CHAND,
-                       atr_chandelier=self.ATR_CHAND,
+        context = _ctx(price=self.ENTRY,
                        orb=self.ENTRY - 5,
                        ma50=self.ENTRY - 3,
                        ma200=self.ENTRY - 15,
                        rsi=62.0, rsi_prev=57.0)
         return ib, engine, context
 
-    # ── chandelier_dist computation ───────────────────────────────────────────
+    # ── trail_dist computation ───────────────────────────────────────────────
 
-    def test_chandelier_dist_equals_atr_chandelier_times_mult(self):
-        from src.config import CHANDELIER_MULT
-        assert CHANDELIER_MULT == 1.0, "CHANDELIER_MULT must be 1.0"
-        chandelier_dist = round(self.ATR_CHAND * CHANDELIER_MULT, 2)
-        assert chandelier_dist == self.CHAND_DIST
+    def test_trail_pct_is_four_percent(self):
+        from src.config import TRAIL_PCT
+        assert TRAIL_PCT == pytest.approx(0.04, abs=1e-6), "TRAIL_PCT must be 0.04 (4%)"
 
-    def test_chandelier_dist_is_rounded_to_2_decimals(self):
-        from src.config import CHANDELIER_MULT
-        # Verify rounding behaviour — result should use current multiplier (1.0)
-        assert round(3.123 * CHANDELIER_MULT, 2) == round(3.123 * 1.0, 2)
+    def test_trail_dist_equals_limit_price_times_trail_pct(self):
+        from src.config import TRAIL_PCT
+        trail_dist = round(self.LIMIT * TRAIL_PCT, 2)
+        assert trail_dist == self.TRAIL_DIST
+
+    def test_trail_dist_is_rounded_to_2_decimals(self):
+        from src.config import TRAIL_PCT
+        assert round(100.333 * TRAIL_PCT, 2) == round(100.333 * 0.04, 2)
 
     # ── Order count and structure ─────────────────────────────────────────────
 
@@ -414,12 +416,13 @@ class TestBracketOrderMath:
         stop_order = ib.placeOrder.call_args_list[1][0][1]
         assert stop_order.orderType == 'TRAIL'
 
-    def test_stop_order_aux_price_equals_chandelier_dist(self):
-        """auxPrice (trail amount in $) = ATR_CHAND × CHANDELIER_MULT."""
+    def test_stop_order_trailing_percent_equals_trail_pct(self):
+        """trailingPercent on TRAIL order = TRAIL_PCT × 100 (broker-managed percent trail)."""
+        from src.config import TRAIL_PCT
         ib, engine, ctx = self._setup()
         _run_entry_cycle(ib, engine, ctx)
         stop_order = ib.placeOrder.call_args_list[1][0][1]
-        assert stop_order.auxPrice == pytest.approx(self.CHAND_DIST, abs=0.01)
+        assert stop_order.trailingPercent == pytest.approx(TRAIL_PCT * 100, abs=0.01)
 
     def test_stop_order_tif_is_gtc(self):
         ib, engine, ctx = self._setup()
@@ -440,23 +443,22 @@ class TestBracketOrderMath:
         assert stop_order.transmit == True
 
     def test_buy_order_qty_uses_dynamic_cash_bucket_and_risk_cap(self):
-        """qty is whole shares sized by settled-cash bucket and broker Chandelier risk."""
+        """qty is whole shares sized by settled-cash bucket and percent trail risk."""
         from src.config import (
-            CHANDELIER_MULT,
+            TRAIL_PCT,
             MAX_POSITIONS_CAP,
             MIN_BUCKET_SIZE,
             RISK_PER_TRADE_PCT,
             SETTLED_CASH_DEPLOYMENT_PCT,
         )
         ib, engine, ctx = self._setup()
-        ctx['atr_chandelier'] = 5.0  # Chandelier risk > 7% hard stop; broker risk must win.
         _run_entry_cycle(ib, engine, ctx)
         buy_order = ib.placeOrder.call_args_list[0][0][1]
         equity = 1400.0
         settled = 5000.0
         max_pos = min(int(equity / MIN_BUCKET_SIZE), MAX_POSITIONS_CAP)
         bucket_size = (settled * SETTLED_CASH_DEPLOYMENT_PCT) / max_pos
-        risk_stop_dist = round(ctx['atr_chandelier'] * CHANDELIER_MULT, 2)
+        risk_stop_dist = round(self.LIMIT * TRAIL_PCT, 2)
         bucket_qty = int(bucket_size / self.LIMIT)
         risk_qty = int((equity * RISK_PER_TRADE_PCT) / risk_stop_dist)
         expected_qty = min(bucket_qty, risk_qty)
@@ -472,19 +474,19 @@ class TestBracketOrderMath:
         ctx['spread_pct']     = (ctx['ask'] - ctx['bid']) / ((ctx['ask'] + ctx['bid']) / 2)
         ctx['day_open']       = ctx['orb_high']
         ctx['atr']            = 10.0
-        ctx['atr_chandelier'] = 10.0
+        ctx['atr'] = 10.0
         _run_entry_cycle(ib, engine, ctx)
         assert ib.placeOrder.call_count == 0, "Stock above bucket price must be skipped (int qty = 0)"
         assert 'TSLA' not in engine.state
 
     # ── State persistence ────────────────────────────────────────────────────
 
-    def test_state_stop_loss_equals_fill_minus_chandelier_dist(self):
+    def test_state_stop_loss_equals_fill_minus_trail_dist(self):
         ib, engine, ctx = self._setup()
         _run_entry_cycle(ib, engine, ctx, sym='TSLA')
         assert 'TSLA' in engine.state
         sl = engine.state['TSLA']['stop_loss']
-        assert sl == pytest.approx(self.ENTRY - self.CHAND_DIST, abs=0.01)
+        assert sl == pytest.approx(self.ENTRY - self.TRAIL_DIST, abs=0.01)
 
     def test_state_has_no_take_profit(self):
         """New structure has no take-profit — state must not contain that key."""
@@ -556,7 +558,7 @@ class TestBracketOrderMath:
     def test_unconfirmed_protective_stop_halts_additional_entries_this_cycle(self):
         """After a filled BUY, no second entry is allowed until protection is confirmed."""
         from src.config import (
-            CHANDELIER_MULT, MAX_POSITIONS_CAP, MIN_BUCKET_SIZE,
+            TRAIL_PCT, MAX_POSITIONS_CAP, MIN_BUCKET_SIZE,
             RISK_PER_TRADE_PCT, SETTLED_CASH_DEPLOYMENT_PCT,
         )
         ib, engine, ctx = self._setup()
@@ -564,7 +566,7 @@ class TestBracketOrderMath:
         equity, settled = 1400.0, 5000.0
         max_pos = min(int(equity / MIN_BUCKET_SIZE), MAX_POSITIONS_CAP)
         bucket_size = (settled * SETTLED_CASH_DEPLOYMENT_PCT) / max_pos
-        risk_dist = round(self.ATR_CHAND * CHANDELIER_MULT, 2)
+        risk_dist = round(self.LIMIT * TRAIL_PCT, 2)
         expected_qty = min(int(bucket_size / self.LIMIT), int((equity * RISK_PER_TRADE_PCT) / risk_dist))
 
         buy_trade = MagicMock()
@@ -2904,12 +2906,23 @@ class TestDailyLossCircuitBreaker:
         passing_ctx = _ctx(price=101.0, orb=100.0, ma50=95.0, ma200=85.0,
                            rsi=65.0, rsi_prev=55.0, dollar_vol=500_000_000)
 
-        mock_trade = MagicMock()
-        mock_trade.order.orderId             = 1
-        mock_trade.orderStatus.status        = 'Filled'
-        mock_trade.orderStatus.avgFillPrice  = 101.0
-        mock_trade.fills = [_mock_fill(1.0)]
-        ib.placeOrder.return_value = mock_trade
+        stop_trade = MagicMock()
+        stop_trade.order.orderId = 2
+
+        # side_effect lets the first call (BUY) return a proper filled mock, and the
+        # second call (TRAIL stop) return a separate mock — preventing the partial-fill
+        # path from firing because a MagicMock's __float__ returns 1.0 ≠ qty.
+        def _place_order_side_effect(contract, order):
+            if order.action == 'BUY':
+                t = MagicMock()
+                t.order.orderId = 1
+                t.orderStatus.status = 'Filled'
+                t.orderStatus.filled = float(order.totalQuantity)
+                t.orderStatus.avgFillPrice = 101.0
+                t.fills = [_mock_fill(1.0)]
+                return t
+            return stop_trade
+        ib.placeOrder.side_effect = _place_order_side_effect
 
         tz_ny    = pytz.timezone('US/Eastern')
         fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))

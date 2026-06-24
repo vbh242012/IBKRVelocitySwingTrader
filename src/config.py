@@ -102,9 +102,9 @@ MIN_BUCKET_FLOOR     = float(os.getenv("VELOCITY_MIN_BUCKET_FLOOR", "150.0"))
 MAX_POSITIONS_CAP    = int(os.getenv("VELOCITY_MAX_POSITIONS_CAP", "20"))
 SETTLED_CASH_DEPLOYMENT_PCT = float(os.getenv("VELOCITY_SETTLED_CASH_DEPLOYMENT_PCT", "0.95"))
 
-# ── Chandelier Exit trailing stop ─────────────────────────────────────────────
-CHANDELIER_PERIOD = 22     # lookback for ATR and highest-high (standard setting)
-CHANDELIER_MULT   = 1.0    # ATR multiplier
+# ── Trailing stop ─────────────────────────────────────────────────────────────
+CHANDELIER_PERIOD = 22     # ATR lookback period for entry volatility filter (ATR_CHAND)
+TRAIL_PCT = float(os.getenv("VELOCITY_TRAIL_PCT", "0.04"))  # flat % trail from peak (e.g. 0.04 = 4%)
 
 # ── Risk rules ────────────────────────────────────────────────────────────────
 VIX_THRESHOLD        = 35

@@ -11,7 +11,8 @@ from src.config import (
     DAILY_LOOKBACK, DAILY_BAR_SIZE,
     ENTRY_START,
     STOP_ACTIVATION_TIME,
-    CHANDELIER_PERIOD, CHANDELIER_MULT,
+    CHANDELIER_PERIOD,
+    TRAIL_PCT,
     PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC, PROTECTIVE_STOP_CONFIRM_POLL_SEC,
     SPREAD_MAX_PCT,
     ENTRY_LIMIT_ASK_CUSHION_PCT, ENTRY_LIMIT_MIN_TICK, ENTRY_LIMIT_MAX_OVER_MARKET_PCT,
@@ -50,16 +51,20 @@ class OrdersMixin:
             stop_loss = trail_stop or (ref_price - aux_dist if ref_price is not None else 0.0)
             return True, f"dist=${aux_dist:.2f}", aux_dist, max(stop_loss, 0.0)
 
-        if trail_pct is not None and trail_stop is not None:
+        if trail_pct is not None:
             if trail_pct >= 99.0:
                 return False, f"trailing percent {trail_pct:.4g}% is unusable", 0.0, 0.0
-            if ref_price is not None:
-                if trail_stop >= ref_price:
+            if trail_stop is not None:
+                if ref_price is not None and trail_stop >= ref_price:
                     return False, f"trail stop ${trail_stop:.2f} >= reference price ${ref_price:.2f}", 0.0, 0.0
-                stop_dist = ref_price - trail_stop
+                stop_dist = (ref_price - trail_stop) if ref_price is not None else trail_stop * (trail_pct / max(100.0 - trail_pct, 1e-9))
+            elif ref_price is not None:
+                # trailStopPrice not yet populated by IBKR (order just submitted); estimate from ref_price
+                stop_dist = ref_price * trail_pct / 100
+                trail_stop = round(ref_price - stop_dist, 2)
             else:
-                stop_dist = trail_stop * (trail_pct / max(100.0 - trail_pct, 1e-9))
-            return True, f"stop=${trail_stop:.2f} trail={trail_pct:.4g}%", stop_dist, trail_stop
+                return False, "percent trail: no trail stop price or reference price available", 0.0, 0.0
+            return True, f"stop=${trail_stop:.2f} trail={trail_pct:.4g}%", stop_dist, max(trail_stop, 0.0)
 
         return False, "missing dollar trail or percent trail fields", 0.0, 0.0
 
@@ -436,13 +441,13 @@ class OrdersMixin:
 
     def _audit_stop_orders(self):
         """
-        For every open position ensure exactly one chandelier TRAIL SELL order exists.
+        For every open position ensure exactly one percent TRAIL SELL order exists.
 
         Steps per symbol:
         1. Find all open SELL orders for the symbol.
         2. Cancel any that are NOT order type TRAIL (stale LMT take-profits, STP, etc.).
-        3. If no TRAIL SELL remains after cancellations, fetch ATR(22) from daily bars
-           and place a new chandelier TRAIL SELL (GTC, transmit=True).
+        3. If no TRAIL SELL remains after cancellations, place a new percent TRAIL SELL
+           (GTC, transmit=True) using TRAIL_PCT from config and entry price from state.
 
         The configured entry trading window applies only to new BUY entries.
         Stop orders for existing positions are placed immediately regardless of time,
@@ -588,50 +593,34 @@ class OrdersMixin:
                 )
                 continue
 
-            logger.info(f"AUDIT: {sym} — no TRAIL SELL found; placing chandelier stop...")
+            logger.info(f"AUDIT: {sym} — no TRAIL SELL found; placing percent trail stop...")
             try:
                 contract = self._stock_contract(sym)
 
-                bars = self.ib.reqHistoricalData(
-                    contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
+                entry_px = float(pos_data.get('fill_price') or pos_data.get('price') or 0)
+                if entry_px <= 0:
+                    self._mark_position_protection(
+                        sym,
+                        'unconfirmed',
+                        'missing_entry_price_for_audit_stop',
+                    )
+                    self._alert(
+                        "CRITICAL",
+                        f"AUDIT: {sym} — entry price unavailable in state, "
+                        f"cannot place stop; position is unprotected."
+                    )
+                    continue
+
+                trail_pct_val = float(
+                    pos_data.get('trailing_percent') or (TRAIL_PCT * 100)
                 )
-                if not isinstance(bars, list) or len(bars) < CHANDELIER_PERIOD:
-                    self._mark_position_protection(
-                        sym,
-                        'unconfirmed',
-                        'insufficient_history_for_audit_stop',
-                    )
-                    self._alert(
-                        "CRITICAL",
-                        f"AUDIT: {sym} — insufficient history "
-                        f"({len(bars) if isinstance(bars, list) else 0} bars), "
-                        f"cannot place stop; position is unprotected."
-                    )
-                    continue
-
-                df = util.df(bars)
-                df = apply_all(df)
-                atr_chandelier = float(df['ATR_CHAND'].iloc[-1])
-                if np.isnan(atr_chandelier) or atr_chandelier <= 0:
-                    self._mark_position_protection(
-                        sym,
-                        'unconfirmed',
-                        'invalid_atr_for_audit_stop',
-                    )
-                    self._alert(
-                        "CRITICAL",
-                        f"AUDIT: {sym} — ATR_CHAND invalid ({atr_chandelier}), "
-                        f"cannot place stop; position is unprotected."
-                    )
-                    continue
-
-                chandelier_dist = round(atr_chandelier * CHANDELIER_MULT, 2)
+                trail_dist = round(entry_px * trail_pct_val / 100, 2)
 
                 stop_order               = Order()
                 stop_order.action        = 'SELL'
                 stop_order.orderType     = 'TRAIL'
                 stop_order.totalQuantity = qty
-                stop_order.auxPrice      = chandelier_dist
+                stop_order.trailingPercent = round(trail_pct_val, 2)
                 stop_order.tif           = 'GTC'
                 stop_order.goodAfterTime = self._stop_good_after_time()
                 # outsideRth = False (default): stop only triggers during regular
@@ -677,9 +666,11 @@ class OrdersMixin:
                     )
                     continue  # do not update state; leave for next audit cycle
 
-                self.state[sym]['stop_dist'] = chandelier_dist
+                self.state[sym]['stop_dist']        = trail_dist
+                self.state[sym]['stop_mode']        = 'percent'
+                self.state[sym]['trailing_percent'] = round(trail_pct_val, 4)
                 self.state[sym]['stop_loss'] = round(
-                    float(pos_data.get('price', 0)) - chandelier_dist, 2
+                    entry_px * (1 - trail_pct_val / 100), 2
                 )
                 self._mark_position_protection(
                     sym,
@@ -688,7 +679,7 @@ class OrdersMixin:
                 )
                 logger.info(
                     f"AUDIT: {sym} — TRAIL SELL live "
-                    f"(qty={qty:.4f} dist=${chandelier_dist:.2f} "
+                    f"(qty={qty:.4f} trail={trail_pct_val:.2g}% dist=${trail_dist:.2f} "
                     f"status={status} id={stop_trade.order.orderId})"
                 )
             except Exception as e:

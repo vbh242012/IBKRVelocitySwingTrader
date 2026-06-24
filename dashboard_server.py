@@ -42,8 +42,7 @@ from src.config import (
     EOD_HOLD_DAY_RANGE_LOCATION_MIN,
     EOD_HOLD_RELATIVE_STRENGTH_MIN,
     EOD_HOLD_REQUIRE_STOP_CONFIRMED,
-    CHANDELIER_MULT,
-    CHANDELIER_PERIOD,
+    TRAIL_PCT,
     SWING_RS_MIN_63D,
     SWING_RS_MIN_126D,
     SWING_MIN_13W_RETURN,
@@ -743,7 +742,7 @@ const ENTRY_CONDITIONS = [
   ["12", "Ranked Execution",  "en", "Passing candidates ranked highest-score-first; each rechecked at live price immediately before order placement"],
 ];
 const EXIT_CONDITIONS = [
-  ["1", "Chandelier Trail", "ex", "TRAIL SELL at ATR(__CHANDELIER_PERIOD__) × __CHANDELIER_MULT__ from peak price; broker ratchets the stop up as price climbs — never down"],
+  ["1", "Percent Trail", "ex", "TRAIL SELL at __TRAIL_PCT__% below peak price (IBKR broker-side); stop ratchets up as price climbs — never down"],
   ["2", "Hard Stop",        "ex", "Software exit: 7% drawdown from fill price triggers immediate Market SELL regardless of ATR distance"],
   ["3", "Strategy Exit",    "ex", "Positions exit on the matching sleeve rule that opened them: MA bearish cross for the default profile, or the standalone research profile's own reversal rule"],
   ["4", "Swing Time Stop",  "ex", "__SWING_TIME_STOP_RULE__"],
@@ -1110,8 +1109,7 @@ _HTML = (
     .replace("__EOD_PROFIT_CLEANUP_RULE__", _eod_rule)
     .replace("__SWING_TIME_STOP_RULE__", _time_stop_rule)
     .replace("__ANALYST_EXIT_RULE__", _analyst_exit_rule)
-    .replace("__CHANDELIER_PERIOD__", str(CHANDELIER_PERIOD))
-    .replace("__CHANDELIER_MULT__", f"{CHANDELIER_MULT:g}")
+    .replace("__TRAIL_PCT__", f"{TRAIL_PCT * 100:.4g}")
     .replace("__SWING_RS_63D__", _pct_text(SWING_RS_MIN_63D, signed=True))
     .replace("__SWING_RS_126D__", _pct_text(SWING_RS_MIN_126D, signed=True))
     .replace("__SWING_RET_13W__", _pct_text(SWING_MIN_13W_RETURN))

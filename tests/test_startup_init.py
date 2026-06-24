@@ -592,11 +592,13 @@ class TestUnrealizedPnl:
         engine.state['TSLA']['stop_mode'] = 'percent'
         engine.state['TSLA']['stop_loss'] = 94.0
         engine.state['TSLA']['stop_dist'] = 5.0
+        engine.state['TSLA']['trailing_percent'] = 5.0  # 5% trail; floor ratchets to peak*(1-0.05)
 
         engine._update_position_prices()
 
         assert engine.state['TSLA']['peak_price'] == pytest.approx(110.0)
-        assert engine.state['TSLA']['effective_stop'] == pytest.approx(94.0)
+        # effective_stop = max(initial_sl=94, trail_floor=110*(1-0.05)=104.5) = 104.5
+        assert engine.state['TSLA']['effective_stop'] == pytest.approx(104.5)
 
     def test_pnl_rounded_to_two_decimals(self):
         engine = self._engine_with_pos(entry=33.33, qty=3, cur_price=34.00)

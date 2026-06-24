@@ -11,7 +11,7 @@ from backtest.strategy import BacktestResult, VelocityBacktest
 from src.config import (
     BACKTEST_INITIAL_CAPITAL,
     BACKTEST_COMMISSION_PER_ORDER,
-    CHANDELIER_MULT,
+    TRAIL_PCT,
     BACKTEST_SCAN_COUNT,
     BACKTEST_MAX_SYMBOLS,
 )
@@ -19,7 +19,7 @@ from src.config import (
 
 @dataclass(frozen=True)
 class OptimizationParams:
-    chandelier_mult: float = CHANDELIER_MULT
+    trail_pct: float = TRAIL_PCT
 
 
 @dataclass(frozen=True)
@@ -35,16 +35,16 @@ class OptimizationRun:
 def default_grid() -> List[OptimizationParams]:
     """Small robustness grid over active indicator_swing exit parameters."""
     return [
-        OptimizationParams(chandelier_mult=chandelier_mult)
-        for chandelier_mult in [0.8, 1.0, 1.2]
+        OptimizationParams(trail_pct=trail_pct)
+        for trail_pct in [0.03, 0.04, 0.05]
     ]
 
 
 def quick_grid() -> List[OptimizationParams]:
     """Very small grid for a fast smoke-test optimization pass."""
     return [
-        OptimizationParams(chandelier_mult=chandelier_mult)
-        for chandelier_mult in [0.8, 1.0]
+        OptimizationParams(trail_pct=trail_pct)
+        for trail_pct in [0.03, 0.04]
     ]
 
 
@@ -156,7 +156,7 @@ def _run_with_params(
         min_dollar_vol=base._min_dollar_vol,
         use_spy_filter=base._use_spy_filter,
         use_vix_filter=base._use_vix_filter,
-        chandelier_mult=params.chandelier_mult,
+        trail_pct=params.trail_pct,
         bear_phase_trading=base._bear_phase_trading,
         commission_per_order=base._round_trip_cost / 2.0,
         use_cache=False,
@@ -233,7 +233,7 @@ def run_optimization(
             print(
                 f"  [{idx:>2}/{len(candidates)}] robust={robust_score:.2f} "
                 f"forward={forward_score:.2f} trades_f={forward.metrics.get('total_trades', 0)} "
-                f"chand={params.chandelier_mult}",
+                f"trail_pct={params.trail_pct:.0%}",
                 flush=True,
             )
     runs.sort(key=lambda r: (r.robust_score, r.forward_score, r.train_score), reverse=True)
@@ -255,7 +255,7 @@ def format_optimization_table(runs: Iterable[OptimizationRun]) -> str:
             f"{fm.get('total_return_pct', 0.0):>6.1f}% "
             f"{fm.get('sharpe_ratio', 0.0):>7.2f} "
             f"{fm.get('max_drawdown_pct', 0.0):>6.1f}% "
-            f"chand={p.chandelier_mult}, "
+            f"trail_pct={p.trail_pct:.0%}, "
             f"train_trades={tm.get('total_trades', 0)}"
         )
     return "\n".join(lines)

@@ -27,6 +27,7 @@ from src.config import (
     BEAR_PHASE_TRADING_ENABLED, BEAR_PHASE_RISK_MULT, BEAR_PHASE_DOLLAR_VOL_MULT,
     FRIDAY_ENTRY_CUTOFF_TIME,
     EOD_EXIT_TIME,
+    TRAIL_PCT,
 )
 from src.scoring import score_candidate
 from src.strategy_profiles import (
@@ -526,18 +527,19 @@ class EntriesMixin:
                         self.state[sym]['unrealized_pnl_pct'] = round((cur - ep) / ep * 100, 2)
                     # Track trailing stop high-watermark so dashboard shows live stop level
                     sd = float(self.state[sym].get('stop_dist', 0))
-                    if sd > 0:
+                    if sd > 0 or str(self.state[sym].get('stop_mode', '')).lower() == 'percent':
                         peak = max(float(self.state[sym].get('peak_price', cur)), cur)
-                        self.state[sym]['peak_price']     = round(peak, 2)
+                        self.state[sym]['peak_price'] = round(peak, 2)
                         initial_sl = float(self.state[sym].get('stop_loss', 0))
-                        if str(self.state[sym].get('stop_mode', '')).lower() == 'percent':
-                            # IBKR owns the moving stop for percent TRAIL orders.
-                            # Do not invent a fixed-dollar trail from a snapshot;
-                            # that can overstate protection on the dashboard.
-                            if initial_sl > 0:
-                                self.state[sym]['effective_stop'] = round(initial_sl, 2)
-                        else:
+                        trail_pct_state = self.state[sym].get('trailing_percent')
+                        if trail_pct_state is not None:
+                            # Percent trail: IBKR ratchets stop to peak × (1 - pct/100)
+                            trail_floor = round(peak * (1 - float(trail_pct_state) / 100), 2)
+                        elif sd > 0:
                             trail_floor = peak - sd
+                        else:
+                            trail_floor = 0
+                        if trail_floor > 0:
                             self.state[sym]['effective_stop'] = round(max(initial_sl, trail_floor), 2)
                     changed = True
 
