@@ -557,6 +557,39 @@ class OrdersMixin:
                     except Exception as e:
                         logger.warning(f"AUDIT: {sym} — duplicate cancel failed: {e}")
 
+            # Convert any dollar TRAIL to percent trail; if cancelled successfully,
+            # the "no trail found" block below places a fresh percent TRAIL at TRAIL_PCT.
+            # Respect clientId: only attempt cancellation of orders this engine owns.
+            if trail_orders and trail_meta.get(id(trail_orders[0]), {}).get('trail_pct') is None:
+                primary = trail_orders[0]
+                try:
+                    order_client_id = int(
+                        getattr(primary.order, 'clientId', IB_CLIENT_ID) or IB_CLIENT_ID
+                    )
+                except (TypeError, ValueError):
+                    order_client_id = IB_CLIENT_ID
+                if order_client_id != IB_CLIENT_ID:
+                    logger.warning(
+                        f"AUDIT: {sym} — dollar TRAIL (id={primary.order.orderId}) "
+                        f"belongs to clientId={order_client_id}, not this engine "
+                        f"(clientId={IB_CLIENT_ID}); skipping percent-trail conversion"
+                    )
+                else:
+                    logger.warning(
+                        f"AUDIT: {sym} — converting dollar TRAIL "
+                        f"(id={primary.order.orderId}) to {TRAIL_PCT:.0%} percent trail"
+                    )
+                    try:
+                        self.ib.cancelOrder(primary.order)
+                        self.ib.sleep(2)
+                        trail_orders = []
+                    except Exception as e:
+                        self._alert(
+                            "CRITICAL",
+                            f"AUDIT: {sym} — failed to cancel dollar TRAIL for "
+                            f"percent conversion ({e}); retaining dollar trail as protection"
+                        )
+
             if trail_orders:
                 primary_trail = trail_orders[0]
                 meta = trail_meta.get(id(primary_trail), {})

@@ -715,9 +715,16 @@ class TestAuditStopOrders:
     }
 
     def test_no_action_when_trail_exists(self):
-        """TRAIL SELL already present — nothing cancelled, nothing placed."""
+        """Percent TRAIL SELL already present — nothing cancelled, nothing placed."""
         ib = MagicMock()
-        ib.openTrades.return_value = [_make_trade('AAPL', 'SELL', 'TRAIL')]
+        ib.openTrades.return_value = [
+            _make_trade(
+                'AAPL', 'SELL', 'TRAIL',
+                aux_price=eng_mod.util.UNSET_DOUBLE,
+                trail_stop_price=95.0,
+                trailing_percent=2.0,
+            )
+        ]
         engine = _make_engine(ib, state={'AAPL': dict(self._POS)})
         with patch.object(engine, '_stop_good_after_time', return_value=''):
             engine._audit_stop_orders()
@@ -725,10 +732,14 @@ class TestAuditStopOrders:
         ib.placeOrder.assert_not_called()
 
     def test_existing_trail_before_stop_gate_is_delayed_to_932_et(self):
-        """Existing GTC TRAIL orders must not activate before the stop gate."""
+        """Existing percent TRAIL orders must not activate before the stop gate."""
         gate = '20260605 09:32:00 US/Eastern'
         ib = MagicMock()
-        trail = _make_trade('AAPL', 'SELL', 'TRAIL', good_after_time='')
+        trail = _make_trade(
+            'AAPL', 'SELL', 'TRAIL', good_after_time='',
+            aux_price=eng_mod.util.UNSET_DOUBLE,
+            trail_stop_price=95.0, trailing_percent=2.0,
+        )
         modified = MagicMock()
         modified.orderStatus.status = 'Submitted'
         ib.reqAllOpenOrders.return_value = [trail]
@@ -749,9 +760,11 @@ class TestAuditStopOrders:
         assert placed_order.totalQuantity == pytest.approx(10)
 
     def test_existing_trail_from_different_client_is_not_modified(self):
-        """Do not try to control protective orders owned by another IB client id."""
+        """Do not try to control protective orders (dollar or percent) owned by another IB client id."""
         gate = '20260605 09:32:00 US/Eastern'
         ib = MagicMock()
+        # Use a dollar trail owned by a different client to verify both
+        # the conversion and the gate-replacement paths respect the client_id guard.
         trail = _make_trade('AAPL', 'SELL', 'TRAIL', good_after_time='', client_id=99)
         ib.reqAllOpenOrders.return_value = [trail]
         ib.openTrades.return_value = []
@@ -769,6 +782,8 @@ class TestAuditStopOrders:
         trail = _make_trade(
             'AAPL', 'SELL', 'TRAIL',
             good_after_time='20260605 10:00:00 US/Eastern',
+            aux_price=eng_mod.util.UNSET_DOUBLE,
+            trail_stop_price=95.0, trailing_percent=2.0,
         )
         replacement_trade = MagicMock()
         replacement_trade.orderStatus.status = 'Submitted'
@@ -979,17 +994,56 @@ class TestAuditStopOrders:
         ib.openTrades.assert_not_called()
 
     def test_keeps_trail_cancels_lmt_for_same_symbol(self):
-        """One TRAIL and one LMT SELL on same symbol — cancel LMT, keep TRAIL."""
+        """One percent TRAIL and one LMT SELL on same symbol — cancel LMT, keep TRAIL."""
         ib = MagicMock()
-        trail_trade = _make_trade('TSLA', 'SELL', 'TRAIL', order_id=10)
+        trail_trade = _make_trade(
+            'TSLA', 'SELL', 'TRAIL', order_id=10,
+            aux_price=eng_mod.util.UNSET_DOUBLE,
+            trail_stop_price=95.0, trailing_percent=2.0,
+        )
         lmt_trade   = _make_trade('TSLA', 'SELL', 'LMT',   order_id=11)
         ib.openTrades.return_value = [trail_trade, lmt_trade]
         engine = _make_engine(ib, state={'TSLA': dict(self._POS)})
         with patch.object(engine, '_stop_good_after_time', return_value=''):
             engine._audit_stop_orders()
-        # LMT cancelled; TRAIL kept; no new order placed
+        # LMT cancelled; percent TRAIL kept; no new order placed
         ib.cancelOrder.assert_called_once_with(lmt_trade.order)
         ib.placeOrder.assert_not_called()
+
+    def test_converts_dollar_trail_to_percent_trail(self):
+        """Existing dollar TRAIL (ATR-based auxPrice) is cancelled and replaced with percent trail."""
+        from src.config import TRAIL_PCT
+        ib = MagicMock()
+        dollar_trail = _make_trade(
+            'AAPL', 'SELL', 'TRAIL', order_id=500,
+            aux_price=6.0,  # old ATR-based dollar distance
+        )
+        ib.reqAllOpenOrders.return_value = [dollar_trail]
+        ib.openTrades.return_value = []
+
+        stop_trade = MagicMock()
+        stop_trade.orderStatus.status = 'PreSubmitted'
+        preflight_state = MagicMock()
+        preflight_state.warningText = ''
+        ib.whatIfOrder.return_value = preflight_state
+        ib.placeOrder.return_value = stop_trade
+
+        state = {'AAPL': {'price': 100.0, 'fill_price': 100.0, 'qty': 10,
+                          'stop_loss': 94.0, 'volume': 1_000_000, 'score': 75.0,
+                          'time': '2026-01-01T10:00:00'}}
+        engine = _make_engine(ib, state=state)
+        with patch.object(engine, '_stop_good_after_time', return_value=''):
+            engine._audit_stop_orders()
+
+        # Dollar trail must be cancelled, then a fresh percent TRAIL placed
+        ib.cancelOrder.assert_called_once_with(dollar_trail.order)
+        assert ib.placeOrder.call_count == 1
+        placed_order = ib.placeOrder.call_args[0][1]
+        assert placed_order.orderType == 'TRAIL'
+        assert placed_order.trailingPercent == pytest.approx(TRAIL_PCT * 100, abs=0.01)
+        assert not hasattr(placed_order, 'auxPrice') or placed_order.auxPrice in (0, None, eng_mod.util.UNSET_DOUBLE)
+        assert engine.state['AAPL']['stop_mode'] == 'percent'
+        assert engine.state['AAPL']['trailing_percent'] == pytest.approx(TRAIL_PCT * 100, abs=0.01)
 
     def test_cancels_and_rebuilds_trail_when_qty_mismatches_state(self):
         """A protective stop with stale quantity must be replaced, not trusted."""
