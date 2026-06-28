@@ -104,7 +104,7 @@ SETTLED_CASH_DEPLOYMENT_PCT = float(os.getenv("VELOCITY_SETTLED_CASH_DEPLOYMENT_
 
 # ── Trailing stop ─────────────────────────────────────────────────────────────
 CHANDELIER_PERIOD = 22     # ATR lookback period for entry volatility filter (ATR_CHAND)
-TRAIL_PCT = float(os.getenv("VELOCITY_TRAIL_PCT", "0.04"))  # flat % trail from peak (e.g. 0.04 = 4%)
+TRAIL_PCT = float(os.getenv("VELOCITY_TRAIL_PCT", "0.02"))  # flat % trail from peak (e.g. 0.02 = 2%)
 
 # ── Risk rules ────────────────────────────────────────────────────────────────
 VIX_THRESHOLD        = 35

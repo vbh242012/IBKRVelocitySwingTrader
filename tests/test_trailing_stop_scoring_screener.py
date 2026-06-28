@@ -2,7 +2,7 @@
 Comprehensive validation of three critical VelocityEngine subsystems:
 
   1. Percent trailing stop order construction (standalone BUY + post-fill TRAIL)
-     - trail_dist = limit_price × TRAIL_PCT (0.04 = 4%)
+     - trail_dist = limit_price × TRAIL_PCT (0.02 = 2%)
      - trailingPercent on TRAIL order = TRAIL_PCT × 100
      - goodAfterTime is omitted after the configured entry start so IBKR cannot reject a past activation time
      - BUY order: transmit=True; TRAIL stop: standalone GTC transmit=True after fill
@@ -292,19 +292,19 @@ class TestBracketOrderMath:
     Verify percent trail stop distance, GTC 2-order structure, and state persistence.
 
     Config values used (from src/config.py):
-        TRAIL_PCT = 0.04  →  trail_dist = limit_price × 0.04
+        TRAIL_PCT = 0.02  →  trail_dist = limit_price × 0.02
 
-    With entry=100.00, limit=100.15, TRAIL_PCT=0.04:
-        trail_dist  = round(100.15 × 0.04, 2) = 4.01
-        stop_loss (state) = fill - trail_dist = 100.00 - 4.01 = 95.99
-        trailingPercent on TRAIL order = 4.0
+    With entry=100.00, limit=100.15, TRAIL_PCT=0.02:
+        trail_dist  = round(100.15 × 0.02, 2) = 2.0
+        stop_loss (state) = fill - trail_dist = 100.00 - 2.0 = 98.0
+        trailingPercent on TRAIL order = 2.0
         No take-profit order or state key.
     """
 
     ENTRY       = 100.00
     LIMIT       = 100.15                         # ask 100.10 + 5 bps cushion, capped by 0.2%
-    TRAIL_DIST  = round(100.15 * 0.04, 2)        # 4.01 (4% of limit price)
-    INIT_STOP   = round(100.00 - round(100.15 * 0.04, 2), 2)  # 95.99
+    TRAIL_DIST  = round(100.15 * 0.02, 2)        # 2.0 (2% of limit price)
+    INIT_STOP   = round(100.00 - round(100.15 * 0.02, 2), 2)  # 98.0
 
     def _setup(self):
         ib      = _mock_ib()
@@ -318,9 +318,9 @@ class TestBracketOrderMath:
 
     # ── trail_dist computation ───────────────────────────────────────────────
 
-    def test_trail_pct_is_four_percent(self):
+    def test_trail_pct_is_two_percent(self):
         from src.config import TRAIL_PCT
-        assert TRAIL_PCT == pytest.approx(0.04, abs=1e-6), "TRAIL_PCT must be 0.04 (4%)"
+        assert TRAIL_PCT == pytest.approx(0.02, abs=1e-6), "TRAIL_PCT must be 0.02 (2%)"
 
     def test_trail_dist_equals_limit_price_times_trail_pct(self):
         from src.config import TRAIL_PCT
@@ -329,7 +329,7 @@ class TestBracketOrderMath:
 
     def test_trail_dist_is_rounded_to_2_decimals(self):
         from src.config import TRAIL_PCT
-        assert round(100.333 * TRAIL_PCT, 2) == round(100.333 * 0.04, 2)
+        assert round(100.333 * TRAIL_PCT, 2) == round(100.333 * 0.02, 2)
 
     # ── Order count and structure ─────────────────────────────────────────────
 

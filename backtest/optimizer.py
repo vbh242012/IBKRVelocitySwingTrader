@@ -36,7 +36,7 @@ def default_grid() -> List[OptimizationParams]:
     """Small robustness grid over active indicator_swing exit parameters."""
     return [
         OptimizationParams(trail_pct=trail_pct)
-        for trail_pct in [0.03, 0.04, 0.05]
+        for trail_pct in [0.02, 0.03, 0.04]
     ]
 
 
@@ -44,7 +44,7 @@ def quick_grid() -> List[OptimizationParams]:
     """Very small grid for a fast smoke-test optimization pass."""
     return [
         OptimizationParams(trail_pct=trail_pct)
-        for trail_pct in [0.03, 0.04]
+        for trail_pct in [0.02, 0.03]
     ]
 
 
