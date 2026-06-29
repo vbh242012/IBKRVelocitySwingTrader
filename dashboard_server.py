@@ -686,9 +686,7 @@ footer a{color:var(--dim);text-decoration:none;}
           <th>QTY</th>
           <th>TOTAL COST</th>
           <th>UNREALIZED P&amp;L</th>
-          <th>R</th>
           <th>STOP (TRAIL)</th>
-          <th>RS 63D</th>
           <th>ANALYST SCORE</th>
           <th>ANALYST VOTES</th>
           <th>PROTECTION</th>
@@ -696,7 +694,7 @@ footer a{color:var(--dim);text-decoration:none;}
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr class="empty"><td colspan="16">Waiting for data…</td></tr>
+        <tr class="empty"><td colspan="14">Waiting for data…</td></tr>
       </tbody>
     </table>
   </div>
@@ -919,16 +917,11 @@ function render(d) {
     const usign = unr >= 0 ? '+' : '';
     const sc    = p.score != null ? p.score.toFixed(1) : '—';
     const scCls = p.score != null ? (p.score >= 70 ? 'g' : p.score >= 45 ? 'y' : 'r') : 'd';
-    const rs63  = p.relative_strength_63d;
-    const rsCls = rs63 == null ? 'd' : rs63 >= 0.05 ? 'g' : rs63 >= 0 ? 'y' : 'r';
     const ar    = p.analyst_rating_score;
     const arCls = ar == null ? 'd' : ar > 0.15 ? 'g' : ar < -0.15 ? 'r' : 'y';
     const arTxt = ar == null
       ? '—'
       : `${ar > 0 ? '+' : ''}${(+ar).toFixed(2)}${p.analyst_rating_total != null ? '/' + p.analyst_rating_total : ''}`;
-    const rVal = p.r_multiple;
-    const rCls = rVal == null ? 'd' : rVal >= 1 ? 'g' : rVal >= 0 ? 'y' : 'r';
-    const rTxt = rVal == null ? '—' : `${rVal >= 0 ? '+' : ''}${(+rVal).toFixed(2)}R`;
     const buyVotes = (p.analyst_rating_strong_buy ?? null) == null && (p.analyst_rating_buy ?? null) == null
       ? null
       : (+p.analyst_rating_strong_buy || 0) + (+p.analyst_rating_buy || 0);
@@ -951,9 +944,7 @@ function render(d) {
       <td>${Math.round(+p.qty)}</td>
       <td>${$f(p.total_amount)}</td>
       <td class="${ucls}">${usign}${$f(unr)}<br><span style="font-size:10px;opacity:.8">${usign}${unrP.toFixed(2)}%</span></td>
-      <td class="${rCls}" style="font-weight:700">${rTxt}</td>
       <td class="sl">${$f(p.effective_stop ?? p.stop_loss)}${p.effective_stop > p.stop_loss ? ' ↑' : ''}</td>
-      <td class="${rsCls}">${pct(rs63, 1, true)}</td>
       <td class="${arCls}">${arTxt}</td>
       <td class="${arCls}" style="font-size:10px">${votesTxt}</td>
       <td class="${protCls}" style="font-size:10px">${prot}</td>

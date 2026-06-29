@@ -530,17 +530,23 @@ class EntriesMixin:
                     if sd > 0 or str(self.state[sym].get('stop_mode', '')).lower() == 'percent':
                         peak = max(float(self.state[sym].get('peak_price', cur)), cur)
                         self.state[sym]['peak_price'] = round(peak, 2)
-                        initial_sl = float(self.state[sym].get('stop_loss', 0))
+                        ibkr_stop = float(self.state[sym].get('stop_loss', 0))
                         trail_pct_state = self.state[sym].get('trailing_percent')
                         if trail_pct_state is not None:
-                            # Percent trail: IBKR ratchets stop to peak × (1 - pct/100)
-                            trail_floor = round(peak * (1 - float(trail_pct_state) / 100), 2)
+                            # Percent trail: estimate IBKR's live trailStopPrice as
+                            # max(last IBKR-confirmed stop_loss, cur × (1 - pct/100)).
+                            # Do NOT use peak_price here — the percent trail order may
+                            # have been placed after the historical peak (e.g. after a
+                            # dollar→percent conversion), so peak × (1-pct) overstates
+                            # the actual broker-side stop.
+                            cur_estimate = round(cur * (1 - float(trail_pct_state) / 100), 2)
+                            trail_floor = max(ibkr_stop, cur_estimate)
                         elif sd > 0:
-                            trail_floor = peak - sd
+                            trail_floor = max(ibkr_stop, peak - sd)
                         else:
                             trail_floor = 0
                         if trail_floor > 0:
-                            self.state[sym]['effective_stop'] = round(max(initial_sl, trail_floor), 2)
+                            self.state[sym]['effective_stop'] = round(trail_floor, 2)
                     changed = True
 
                 # Backfill volume once if it is missing/zero — only fetches
