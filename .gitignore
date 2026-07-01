@@ -86,6 +86,7 @@ engine_state.json
 engine_state.json.*
 dashboard_data.json
 equity_history.json
+daily_health_report.json
 HALT_TRADING
 FORCE_EXIT_ALL
 velocity_engine.lock
@@ -98,6 +99,7 @@ analyst_ratings_cache.json
 # Local assistant/tool scratch directories
 .agents/
 .codex/
+.claude/
 
 # Secrets/configs from common app frameworks
 instance/
