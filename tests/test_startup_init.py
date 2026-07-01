@@ -826,6 +826,42 @@ class TestAuditStopOrders:
         assert engine.state['AAPL']['stop_mode'] == 'percent'
         assert engine.state['AAPL']['trailing_percent'] == pytest.approx(5.0)
 
+    def test_keeps_in_the_money_percent_trail_above_reference_price(self):
+        """Regression (live AMD 2026-07-01): a percent TRAIL whose trailStopPrice
+        sits ABOVE the current price is an in-the-money trailed stop that price has
+        pulled back through. It must be honored as-is, NOT cancelled and rebuilt
+        lower (which resets the locked-in stop down to the fallen price and gives
+        back the protected gain)."""
+        ib = MagicMock()
+        ib.openTrades.return_value = [
+            _make_trade(
+                'AMD', 'SELL', 'TRAIL', order_id=107937,
+                aux_price=eng_mod.util.UNSET_DOUBLE,
+                trail_stop_price=573.0,      # trailed up while AMD ran
+                trailing_percent=2.0,
+                total_quantity=1,
+            )
+        ]
+        # Current price pulled back BELOW the trailed stop (573 >= 564.88).
+        state = {'AMD': {
+            'price': 565.24, 'fill_price': 565.24, 'current_price': 564.88,
+            'qty': 1, 'stop_loss': 553.94, 'volume': 1_000_000, 'score': 95.0,
+            'time': '2026-06-30T11:15:53',
+        }}
+        engine = _make_engine(ib, state=state)
+
+        with patch.object(engine, '_stop_good_after_time', return_value=''):
+            engine._audit_stop_orders()
+
+        # The protective stop must be preserved — never cancelled or rebuilt.
+        ib.cancelOrder.assert_not_called()
+        ib.placeOrder.assert_not_called()
+        # State reflects the broker's trailed (in-the-money) stop, not a reset lower.
+        assert engine.state['AMD']['stop_loss'] == pytest.approx(573.0)
+        assert engine.state['AMD']['effective_stop'] == pytest.approx(573.0)
+        assert engine.state['AMD']['stop_mode'] == 'percent'
+        assert engine.state['AMD']['trailing_percent'] == pytest.approx(2.0)
+
     def test_audit_uses_all_open_orders_feed_before_rebuilding_stop(self):
         """Existing GTC stops may be visible through reqAllOpenOrders before openTrades."""
         ib = MagicMock()

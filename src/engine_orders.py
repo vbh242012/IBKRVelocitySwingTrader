@@ -55,9 +55,19 @@ class OrdersMixin:
             if trail_pct >= 99.0:
                 return False, f"trailing percent {trail_pct:.4g}% is unusable", 0.0, 0.0
             if trail_stop is not None:
-                if ref_price is not None and trail_stop >= ref_price:
-                    return False, f"trail stop ${trail_stop:.2f} >= reference price ${ref_price:.2f}", 0.0, 0.0
-                stop_dist = (ref_price - trail_stop) if ref_price is not None else trail_stop * (trail_pct / max(100.0 - trail_pct, 1e-9))
+                # A finite trailStopPrice with a sane trailingPercent is a valid
+                # protective order. When the stop sits at/above the current
+                # reference price it is an in-the-money trailed stop that price has
+                # pulled back through — a breached stop that should TRIGGER, not a
+                # malformed order. It must never be cancelled/rebuilt here: doing so
+                # ratchets a locked-in stop back down to the fallen price and gives
+                # up the protected gain (this reset turned the live AMD trade on
+                # 2026-07-01 from a locked winner into a loss). Derive the distance
+                # from the trail percent when the ref-price gap is non-positive.
+                if ref_price is not None and ref_price > trail_stop:
+                    stop_dist = ref_price - trail_stop
+                else:
+                    stop_dist = trail_stop * (trail_pct / max(100.0 - trail_pct, 1e-9))
             elif ref_price is not None:
                 # trailStopPrice not yet populated by IBKR (order just submitted); estimate from ref_price
                 stop_dist = ref_price * trail_pct / 100

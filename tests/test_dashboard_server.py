@@ -148,7 +148,11 @@ def test_dashboard_equity_chart_uses_intraday_time_labels():
     assert "Analyst Downgrade" in html
     assert "ANALYST SCORE" in html
     assert "ANALYST VOTES" in html
-    assert "<th>R</th>" in html
+    assert "<th>STOP (TRAIL)</th>" in html
+    # R (r_multiple) and RS 63D columns were removed from the dashboard in
+    # commit 8588cbf; enforce that they stay gone.
+    assert "<th>R</th>" not in html
+    assert "<th>RS 63D</th>" not in html
     assert "B:${buyVotes" in html
     assert "__SWING_" not in html
     assert "Velocity Exit" not in html

@@ -1363,3 +1363,63 @@
    - `run_backtest.py`: `--chandelier-mult` → `--trail-pct`.
    - `dashboard_server.py`: "Percent Trail" row with `__TRAIL_PCT__%` token.
    - All tests updated; 164 passed.
+
+1. In-the-money trailing-stop reset bug fixed, 2026-07-01
+
+   Live-log analysis of the AMD trade (bought 2026-06-30 at $565.24, 1 share,
+   2% percent TRAIL) found a real defect that turned a locked winner into a
+   loss. AMD ran up and the broker-side percent TRAIL trailed its
+   `trailStopPrice` up to $573.00. On 2026-07-01 pre-market the stock pulled
+   back to ~$564.88 — below the trailed stop. The 08:45 ET stop audit saw
+   `trail stop $573.00 >= reference price $564.88`, wrongly classified the
+   order as invalid, cancelled it, and rebuilt a fresh 2% trail from the
+   fallen price ($547.43). AMD then fell through the reset stop and exited
+   near ~$547 instead of the locked ~$573.
+
+   Root cause: `OrdersMixin._trail_order_protection()` in `src/engine_orders.py`
+   rejected any percent trail whose `trailStopPrice >= ref_price`. Because
+   `_coerce_order_number()` already maps IBKR `UNSET_DOUBLE` to `None`, a
+   non-`None` `trail_stop` in that branch is always a real, finite stop price,
+   so the check only ever fired on legitimate in-the-money trailed stops. A
+   SELL stop at/above the current price is a *breached* stop that should
+   trigger — not a malformed order.
+
+   Fix:
+
+   - Removed the `trail_stop >= ref_price` rejection in the percent-trail
+     branch. A finite `trailStopPrice` with a sane `trailingPercent` (< 99) is
+     now always treated as valid protection.
+   - Stop distance is computed safely: `ref_price - trail_stop` when the ref
+     price is above the stop, otherwise the trail-percent-implied distance
+     `trail_stop * (trail_pct / (100 - trail_pct))`, so a non-positive gap
+     never leaks downstream.
+   - Left untouched (correct guards): the dollar-trail `aux_dist >= ref_price`
+     check, the "missing dollar/percent fields" rejection, GTC persistence, and
+     the 09:32 ET RTH-only stop activation gate.
+
+   Regression test added:
+   `tests/test_startup_init.py::TestAuditStopOrders::test_keeps_in_the_money_percent_trail_above_reference_price`
+   — an existing percent TRAIL with `trailStopPrice=$573` above the current
+   price ($564.88) must be kept (no cancel, no rebuild) with
+   `stop_loss`/`effective_stop` = $573.
+
+   Also fixed a stale, unrelated test left behind by commit `8588cbf` (which
+   removed the dashboard `R` and `RS 63D` columns):
+   `tests/test_dashboard_server.py::test_dashboard_equity_chart_uses_intraday_time_labels`
+   asserted `<th>R</th>` still existed. It now enforces that both removed
+   columns stay gone.
+
+   Validation:
+
+   ```bash
+   PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/engine_orders.py src/config.py src/ib_gateway.py
+   PYTHONPYCACHEPREFIX=/tmp/velocity-pycache VELOCITY_BASE_DIR=/tmp/velocity-test .venv/bin/python -m pytest -o cache_dir=/tmp/velocity-pytest-cache -q
+   ```
+
+   Results:
+
+   - `py_compile`: passed.
+   - Full suite: 345 passed (344 prior passing + the new regression test; the
+     previously stale dashboard test now passes).
+   - Strategy rules unchanged — this is a broker-state/audit correctness fix,
+     not an alpha or exit-policy change.
