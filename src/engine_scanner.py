@@ -77,7 +77,7 @@ class ScannerMixin:
     def _application_universe_symbols(self) -> list:
         from src.engine_base import logger, _TZ_NY
         import pytz
-        tz_ny = pytz.timezone('US/Eastern')
+        tz_ny = _TZ_NY
         today = datetime.now(tz_ny).strftime('%Y-%m-%d')
         cached_day = getattr(self, '_scanner_universe_date', None)
         cached_symbols = getattr(self, '_scanner_universe_symbols', None)
@@ -555,7 +555,8 @@ class ScannerMixin:
         contract = self._contract_cache[symbol]
 
         # Bar cache — daily bars are valid for one trading day; re-fetch on date change.
-        tz_ny      = pytz.timezone('US/Eastern')
+        from src.engine_base import _TZ_NY
+        tz_ny      = _TZ_NY
         now_ny     = datetime.now(tz_ny)
         today_str  = now_ny.strftime('%Y-%m-%d')
 

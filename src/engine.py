@@ -245,7 +245,7 @@ class VelocityEngine(
             return
 
         # 5. Entry Window
-        tz_ny  = pytz.timezone('US/Eastern')
+        tz_ny  = _TZ_NY
         now_ny = datetime.now(tz_ny)
         profile = getattr(self, "_strategy_profile", None)
         if profile is None:
@@ -370,6 +370,7 @@ class VelocityEngine(
                     'correlation': 0,
                     'sector_limit': 0,
                 }
+                entry_filter_reasons: dict = {}
                 for sym in watchlist:
                     if sym in self.state:
                         reject_counts['already_held'] += 1
@@ -448,6 +449,8 @@ class VelocityEngine(
                     if not evaluation.passed:
                         reject_counts['entry_filter'] += 1
                         failed = list(evaluation.failed)
+                        for _gate in failed:
+                            entry_filter_reasons[_gate] = entry_filter_reasons.get(_gate, 0) + 1
                         logger.debug(f"{scan_detail}")
                         logger.debug(f"SCAN {sym}: NO SIGNAL — failed: {failed}")
                         if any(name.startswith("dollar_vol>=") for name in failed):
@@ -529,11 +532,18 @@ class VelocityEngine(
                     for name, count in reject_counts.items()
                     if count
                 ) or "none"
+                gate_summary = ", ".join(
+                    f"{name}={count}"
+                    for name, count in sorted(
+                        entry_filter_reasons.items(), key=lambda kv: kv[1], reverse=True
+                    )[:8]
+                )
                 logger.info(
                     f"SCAN SUMMARY: scanner_hits={len(watchlist)} "
                     f"eligible_signals={len(signals)} "
                     f"filtered={filtered} "
                     f"rejects[{reject_summary}]"
+                    + (f" entry_filter_gates[{gate_summary}]" if gate_summary else "")
                 )
 
                 # Fix 1: Market data blackout detection.

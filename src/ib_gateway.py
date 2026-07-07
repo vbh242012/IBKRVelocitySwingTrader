@@ -29,10 +29,11 @@ from src.config import (
     IB_HOST,
     IB_PORT,
     LOG_DIR,
+    TZ_ET,
 )
 
 
-_TZ_NY = pytz.timezone("US/Eastern")
+_TZ_NY = TZ_ET
 
 
 class IBGatewayStartupError(RuntimeError):

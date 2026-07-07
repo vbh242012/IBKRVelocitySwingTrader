@@ -59,6 +59,7 @@ from src.config import (
     ANALYST_RATING_EXIT_ENABLED,
     DASHBOARD_ALLOWED_ORIGINS,
     DASHBOARD_TOKEN,
+    TZ_ET,
 )
 from src.strategy_profiles import get_strategy_profile
 
@@ -128,7 +129,7 @@ def _int_or_none(value) -> Optional[int]:
 def _pnl(equity_now: float) -> dict:
     """Compute calendar daily / weekly / monthly / overall P&L in ET."""
     history = _read_history()
-    tz_ny   = pytz.timezone('US/Eastern')
+    tz_ny   = TZ_ET
     now     = datetime.now(tz_ny)
 
     def _parse_ts(ts: str) -> Optional[datetime]:
@@ -189,7 +190,7 @@ def _pnl(equity_now: float) -> dict:
 
 
 def _market_open() -> bool:
-    tz_ny  = pytz.timezone("US/Eastern")
+    tz_ny  = TZ_ET
     now_ny = datetime.now(tz_ny)
     if now_ny.weekday() >= 5:
         return False
@@ -215,7 +216,7 @@ def get_state():
     )
     settled_cash = float(raw_settled) if raw_settled is not None else 0.0
 
-    tz_ny = pytz.timezone('US/Eastern')
+    tz_ny = TZ_ET
     now   = datetime.now(tz_ny)
     positions        = []
     total_unrealized = 0.0

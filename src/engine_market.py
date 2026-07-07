@@ -387,8 +387,8 @@ class MarketDataMixin:
 
     def _fetch_spy_daily_frame(self) -> Optional[pd.DataFrame]:
         """Return cached SPY daily bars with MA context for regime/RS checks."""
-        from src.engine_base import logger
-        tz_ny = pytz.timezone('US/Eastern')
+        from src.engine_base import logger, _TZ_NY
+        tz_ny = _TZ_NY
         today = datetime.now(tz_ny).strftime('%Y-%m-%d')
         cached = self._spy_cache.get('df') if self._spy_cache.get('date') == today else None
         if cached is not None:
@@ -422,7 +422,8 @@ class MarketDataMixin:
 
     def _fetch_spy_trend(self) -> bool:
         """True when SPY price > SMA50 > SMA200 and SMA200 is rising."""
-        tz_ny  = pytz.timezone('US/Eastern')
+        from src.engine_base import _TZ_NY
+        tz_ny  = _TZ_NY
         today  = datetime.now(tz_ny).strftime('%Y-%m-%d')
         if self._spy_cache.get('date') == today:
             return self._spy_cache['trend']

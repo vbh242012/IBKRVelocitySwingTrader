@@ -31,6 +31,7 @@ from src.config import (
     ERROR_WAIT,
     APP_SCANNER_BATCH_SIZE, APP_SCANNER_SOURCE,
     STRATEGY_PROFILE,
+    TZ_ET,
 )
 from src.analyst_ratings import AnalystRatingProvider
 from src.ib_gateway import ensure_ib_gateway_ready
@@ -42,7 +43,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # Single timezone object reused throughout the module.
 # The machine runs on IST (UTC+5:30); all times must be anchored to US/Eastern
 # so market-hours checks, timestamps, and log lines are unambiguous.
-_TZ_NY = pytz.timezone('US/Eastern')
+_TZ_NY = TZ_ET
 _REJECTED_ORDER_STATUSES = {'Inactive', 'ApiCancelled', 'Cancelled'}
 
 

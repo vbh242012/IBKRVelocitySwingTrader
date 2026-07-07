@@ -1,5 +1,11 @@
 import os
 
+import pytz
+
+# Single shared US/Eastern timezone. The host OS runs on IST; every market-hours
+# check, timestamp, and log line must anchor to ET, so this is the one source of truth.
+TZ_ET = pytz.timezone("US/Eastern")
+
 
 def _parse_hhmm(value: str, default: tuple[int, int]) -> tuple[int, int]:
     try:
