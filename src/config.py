@@ -328,6 +328,18 @@ INDICATOR_SWING_STRATEGIES = tuple(
     ).split(",")
     if s.strip()
 )
+# Bounded score bonus for ma_cross entries triggered by an MA reclaim
+# (pullback entry) rather than a prior-high breakout.  The 2026-07-11 trigger
+# attribution runs measured reclaim entries at PF 1.83 / MaxDD -6.3% versus
+# breakout entries at PF 1.25 / MaxDD -17.3%, so when both compete for the
+# same slot the reclaim deserves priority.  Affects ranking and the min-score
+# admission gate; 0 disables the bonus entirely.
+# Validated 2026-07-11 (bounded cached run, 5% trail): sweep over 0/5/10/15
+# saturated at 5 points — +48.58% vs +39.75% baseline, PF 1.35 vs 1.29,
+# Sharpe 0.60 vs 0.52, MaxDD unchanged.  5 is the smallest value with the
+# full effect, so it is the promoted default.
+RECLAIM_TRIGGER_BONUS = float(os.getenv("VELOCITY_RECLAIM_TRIGGER_BONUS", "5.0"))
+
 # Research-only attribution switch: restrict which ma_cross timing sub-triggers
 # may fire (fresh_cross | break_prev_high | reclaim).  The default enables all
 # three, which is the unchanged production behavior.  Used to measure whether

@@ -15,6 +15,7 @@ from src.config import (
     ANALYST_RATING_SCORE_WEIGHT,
     ATR_PCT_MAX,
     INDICATOR_SWING_STOCH_OVERSOLD,
+    RECLAIM_TRIGGER_BONUS,
     SCAN_MIN_DOLLAR_VOL,
     SPREAD_MAX_PCT,
 )
@@ -91,6 +92,15 @@ def indicator_swing_score(
         "bollinger_reversion": 18.0,
         "psar_flip": 12.0,
     }.get(sleeve, 12.0)
+    # Pullback-reclaim entries carry materially better per-trade economics than
+    # prior-high breakouts (2026-07-11 attribution: PF 1.83 vs 1.25), so a
+    # bounded bonus lets reclaims win the slot when both signal the same day.
+    if (
+        sleeve == "ma_cross"
+        and RECLAIM_TRIGGER_BONUS > 0
+        and (bool(ctx.get("reclaim_ma20")) or bool(ctx.get("reclaim_ma50")))
+    ):
+        trigger_score += float(RECLAIM_TRIGGER_BONUS)
 
     rsi = _finite_float(ctx.get("rsi"), float("nan"))
     rsi_prev = _finite_float(ctx.get("rsi_prev", ctx.get("prev_rsi")), float("nan"))

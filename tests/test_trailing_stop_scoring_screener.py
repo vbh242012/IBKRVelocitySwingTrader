@@ -1152,6 +1152,49 @@ class TestIndicatorSwingScoring:
         assert bullish > bearish
         assert 0.0 <= bearish <= bullish <= 100.0
 
+    def test_reclaim_bonus_default_is_promoted_five_points(self):
+        """RECLAIM_TRIGGER_BONUS defaults to the validated 5.0 — reclaim
+        entries outrank otherwise-identical breakouts by exactly 5 points.
+        Setting the bonus to 0 must fully disable the tilt."""
+        import src.scoring as scoring_mod
+        from src.config import RECLAIM_TRIGGER_BONUS
+
+        assert RECLAIM_TRIGGER_BONUS == pytest.approx(5.0)
+
+        breakout = _ctx(entry_strategy="ma_cross", break_prev_high=True,
+                        reclaim_ma20=False, reclaim_ma50=False)
+        reclaim = _ctx(entry_strategy="ma_cross", break_prev_high=False,
+                       reclaim_ma20=True, reclaim_ma50=False)
+
+        assert score_candidate(reclaim) == pytest.approx(
+            score_candidate(breakout) + 5.0
+        )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(scoring_mod, "RECLAIM_TRIGGER_BONUS", 0.0)
+            assert score_candidate(breakout) == score_candidate(reclaim)
+
+    def test_reclaim_bonus_ranks_pullback_entries_above_breakouts(self, monkeypatch):
+        """With the bonus enabled, an MA-reclaim ma_cross entry outranks an
+        otherwise identical breakout entry by the bonus amount; non-ma_cross
+        sleeves are unaffected."""
+        import src.scoring as scoring_mod
+        monkeypatch.setattr(scoring_mod, "RECLAIM_TRIGGER_BONUS", 6.0)
+
+        breakout = _ctx(entry_strategy="ma_cross", break_prev_high=True,
+                        reclaim_ma20=False, reclaim_ma50=False)
+        reclaim = _ctx(entry_strategy="ma_cross", break_prev_high=False,
+                       reclaim_ma20=True, reclaim_ma50=False)
+        psar_reclaim = _ctx(entry_strategy="psar_flip", break_prev_high=False,
+                            reclaim_ma20=True, reclaim_ma50=False)
+        psar_plain = _ctx(entry_strategy="psar_flip", break_prev_high=False,
+                          reclaim_ma20=False, reclaim_ma50=False)
+
+        assert score_candidate(reclaim) == pytest.approx(
+            score_candidate(breakout) + 6.0
+        )
+        assert score_candidate(psar_reclaim) == score_candidate(psar_plain)
+
     def test_unknown_scoring_model_is_rejected(self):
         with pytest.raises(ValueError, match="Valid model: indicator_swing"):
             score_candidate(_ctx(), model="legacy")
