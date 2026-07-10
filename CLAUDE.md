@@ -48,7 +48,7 @@
      - `ma_cross`: default live sleeve. EMA20 must be above SMA50; fresh crosses, MA20/MA50 reclaims, or prior-high breaks can time entries only after the RS/trend gate passes.
      - `bollinger_reversion`: standalone research profile only unless explicitly enabled. It means Bollinger lower-band reclaim after two prior closes below the lower band. Do not buy merely because price closed below the lower band.
      - `psar_flip`: standalone research profile only unless explicitly enabled. PSAR may be confirmation/trailing evidence, but it is not a default primary buy trigger.
-   - Default confirmation rule: RSI must show momentum/recovery and at least two of MACD, OBV, PSAR, stochastic, or volume pace must confirm.
+   - Default confirmation rule (updated 2026-07-10): RSI must show momentum/recovery and at least two of MACD, OBV, PSAR, or stochastic must confirm. Volume pace is a separate hard gate and no longer counts toward the confirmation total — counting it double-counted the gate and collapsed the rule to one-of-four in practice.
    - Analyst ratings are bounded scoring/exit inputs only. Analyst consensus may improve or reduce rank, but it must never create a buy by itself or force an exit without weak price action confirming the downgrade.
    - Live/paper analyst ratings resolve in this order: dated local CSV, Finnhub when `VELOCITY_FINNHUB_API_KEY` is set, then Yahoo/yfinance when `VELOCITY_ANALYST_RATINGS_FREE_SOURCE=yahoo` is enabled. Backtests use only dated local CSV snapshots to avoid look-ahead.
    - Default minimum entry score is 50.

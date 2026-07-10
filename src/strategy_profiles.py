@@ -340,9 +340,11 @@ def evaluate_entry_rules(
     macd_bull = _bool(ctx, "macd_bull_divergence") or (_present(macd_delta) and macd_delta > 0)
     obv_bull = _bool(ctx, "obv_uptrend") or _bool(ctx, "obv_bull_divergence")
     psar_confirm = _bool(ctx, "psar_bull_3")
-    volume_confirm = _present(pace) and pace >= float(profile.min_volume_pace)
-    confirmations = sum(bool(v) for v in (stoch_bull, macd_bull, obv_bull, psar_confirm, volume_confirm))
-    _check(checks, "two_momentum_volume_confirmations", confirmations >= 2)
+    # Volume pace is already a hard gate above; counting it again here let
+    # "two of five" collapse to "one of the other four" for every candidate
+    # that reached this check.  Confirmations must be independent evidence.
+    confirmations = sum(bool(v) for v in (stoch_bull, macd_bull, obv_bull, psar_confirm))
+    _check(checks, "two_indicator_confirmations", confirmations >= 2)
 
     failed = tuple(label for label, ok in checks.items() if not ok)
     return EntryEvaluation(passed=not failed, failed=failed, checks=checks)

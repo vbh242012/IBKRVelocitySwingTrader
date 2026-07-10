@@ -195,7 +195,17 @@ class VelocityEngine(
             self._day_start_date   = today_str
             self._day_start_equity = equity
             self._daily_scan_skip.clear()
-            self._bar_cache.clear()
+            # Drop only stale-dated bar caches.  This rollover executes on the
+            # first regular-session cycle (~09:32 ET), which is AFTER the 06:30
+            # premarket prefilter has populated _bar_cache with clean completed
+            # daily bars stamped with today's date.  A blanket clear() here
+            # wiped those bars and forced mid-session re-fetches whose last row
+            # was today's partial daily bar — corrupting volume/prev-high/RSI
+            # for every signal for the rest of the day.
+            self._bar_cache = {
+                sym: entry for sym, entry in self._bar_cache.items()
+                if isinstance(entry, dict) and entry.get('date') == today_str
+            }
             getattr(self, '_exit_price_miss_counts', {}).clear()
             getattr(self, '_correlation_book_failures', set()).clear()
             self._prefilter_date = None

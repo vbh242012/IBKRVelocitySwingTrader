@@ -355,10 +355,11 @@ class ScannerMixin:
             and rsi >= 40.0
             and rsi > rsi_prev
         )
+        # Volume pace no longer counts as a confirmation (it is a hard gate),
+        # so the requirement is two of the four static daily-bar indicators.
+        # These are computed from completed bars and cannot change intraday,
+        # which makes this check fully decidable premarket.
         static_confirmations = sum(bool(v) for v in (stoch_bull, macd_bull, obv_bull, psar_confirm))
-        volume_can_confirm = profile.min_volume_pace is not None
-        if profile.min_volume_pace is None:
-            static_confirmations += 1
 
         possible_sleeves: list[str] = []
         if "ma_cross" in sleeves and ma_trend_active and (macd_bull or obv_bull):
@@ -374,13 +375,14 @@ class ScannerMixin:
             failures.append("no_possible_indicator_sleeve")
         if not (rsi_momentum or rsi_recovery_possible):
             failures.append("daily_RSI_cannot_confirm")
-        if static_confirmations + (1 if volume_can_confirm else 0) < 2:
-            failures.append("not_enough_static_confirmations_for_intraday_volume")
+        if static_confirmations < 2:
+            failures.append("static_indicator_confirmations<2")
 
         return tuple(failures)
 
     def _prefilter_symbol(self, symbol: str, profile, today: str) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
         from ib_async import util
+        from src.engine_base import completed_daily_bars
         if symbol in TICKER_BLOCKLIST:
             return False, ("blocklisted",), ()
         try:
@@ -388,6 +390,9 @@ class ScannerMixin:
             bars_daily = self.ib.reqHistoricalData(
                 contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
             )
+            # Premarket runs get completed bars anyway; this protects manual
+            # intraday prefilter runs from today's partial daily bar.
+            bars_daily = completed_daily_bars(bars_daily, today)
             if not isinstance(bars_daily, list) or len(bars_daily) < MIN_CANDLES:
                 return False, (f"insufficient_daily_history<{MIN_CANDLES}",), ()
             df = util.df(bars_daily)
@@ -565,9 +570,14 @@ class ScannerMixin:
 
         if not bars_daily:
             # Daily context (trends, ATR, RSI) — prior completed daily bars.
+            # During the regular session IBKR appends today's partial bar;
+            # strip it so signals always see completed bars only, matching the
+            # premarket prefilter and the backtester.
+            from src.engine_base import completed_daily_bars
             bars_daily = self.ib.reqHistoricalData(
                 contract, '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
             )
+            bars_daily = completed_daily_bars(bars_daily, today_str)
 
         if bars_daily:
             self._bar_cache[symbol] = {
@@ -740,6 +750,10 @@ class ScannerMixin:
             'reclaim_ma20':     ma20 > 0 and prev_close <= ma20 and live_price > ma20,
             'reclaim_ma50':     ma50 > 0 and prev_close <= ma50 and live_price > ma50,
             'break_prev_high':  prev_daily_high > 0 and live_price > prev_daily_high,
+            # Last COMPLETED daily bar volume (yesterday during live sessions)
+            # — same measure the premarket prefilter validated, so the
+            # volume>=min gate stays consistent all day.  Intraday activity is
+            # judged by volume_pace, never by this field.
             'volume':           int(df['volume'].iloc[-1]),
             'dollar_vol_20d':   dollar_vol_20d,
             'price_fetched_at': datetime.now(tz_ny),

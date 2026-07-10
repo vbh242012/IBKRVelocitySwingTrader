@@ -107,6 +107,27 @@ def _log_namer(default_name: str) -> str:
     return default_name
 
 
+def completed_daily_bars(bars, today_str: str):
+    """Drop the in-progress daily bar IBKR appends during the regular session.
+
+    Historical daily requests with endDateTime='' include today's partial,
+    still-forming bar once RTH begins.  Every entry signal is defined on
+    completed daily bars (matching the backtester and the premarket prefilter),
+    so the forming bar must never reach indicator or gate computation:
+    its volume/high/close are a snapshot of whenever the fetch happened and
+    then sit frozen in the bar cache for the rest of the day.
+    """
+    if not bars:
+        return bars
+    try:
+        last_date = getattr(bars[-1], 'date', None)
+        if last_date is not None and last_date.strftime('%Y-%m-%d') == today_str:
+            return list(bars[:-1])
+    except Exception:
+        pass
+    return bars
+
+
 logger = logging.getLogger('VelocityEngine')
 logger.setLevel(logging.INFO)
 # Guard against duplicate handlers when the module is re-imported (tests, restarts).

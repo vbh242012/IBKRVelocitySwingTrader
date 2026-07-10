@@ -1733,6 +1733,32 @@ class TestDailyScanSkip:
 
         assert engine._bar_cache == cached
 
+    def test_day_rollover_preserves_same_day_prefilter_bars(self):
+        """The day rollover runs on the first regular-session cycle (~09:32 ET),
+        AFTER the 06:30 premarket prefilter cached today's completed daily bars.
+        It must drop only stale-dated entries — wiping today's bars forced
+        mid-session re-fetches whose last row was today's partial daily bar,
+        corrupting volume/prev-high/RSI for every signal for the rest of the day.
+        """
+        ib = _mock_ib()
+        engine = _make_engine(ib)
+        engine._day_start_date = '2024-06-04'
+        engine._day_start_equity = 1400.0
+        engine._bar_cache = {
+            'FRESH': {'date': '2024-06-05', 'bars_daily': ['premarket']},
+            'STALE': {'date': '2024-06-04', 'bars_daily': ['yesterday']},
+            'DATELESS': {'bars_daily': ['no-date']},
+        }
+
+        fake_now = self._TZ_NY.localize(datetime(2024, 6, 5, 10, 30))
+
+        with patch.object(engine, 'get_institutional_scan', return_value=[]):
+            self._run_cycle_at(engine, fake_now)
+
+        assert engine._bar_cache == {
+            'FRESH': {'date': '2024-06-05', 'bars_daily': ['premarket']},
+        }
+
     def test_scan_summary_reports_filter_reasons_not_non_orderable(self):
         ib = _mock_ib()
         engine = _make_engine(ib)
@@ -3655,3 +3681,47 @@ class TestCommissionReport:
         self._fire(engine, order_id=42, commission=1.123456789)
 
         assert engine.state['TSLA']['commission'] == round(1.123456789, 4)
+
+
+# ── Completed daily bars (partial-bar stripping) ─────────────────────────────
+class TestCompletedDailyBars:
+    """During RTH, IBKR daily history includes today's partial, still-forming
+    bar as the last row.  Signals are defined on completed daily bars, so
+    completed_daily_bars() must strip a today-dated last bar and leave
+    completed histories untouched."""
+
+    @staticmethod
+    def _bar(day):
+        from types import SimpleNamespace
+        return SimpleNamespace(date=day)
+
+    def test_strips_today_partial_last_bar(self):
+        from datetime import date
+        from src.engine_base import completed_daily_bars
+
+        bars = [self._bar(date(2024, 6, 3)), self._bar(date(2024, 6, 4)),
+                self._bar(date(2024, 6, 5))]
+        out = completed_daily_bars(bars, '2024-06-05')
+
+        assert [b.date for b in out] == [date(2024, 6, 3), date(2024, 6, 4)]
+
+    def test_keeps_history_that_already_ends_yesterday(self):
+        from datetime import date
+        from src.engine_base import completed_daily_bars
+
+        bars = [self._bar(date(2024, 6, 3)), self._bar(date(2024, 6, 4))]
+        out = completed_daily_bars(bars, '2024-06-05')
+
+        assert out is bars
+
+    def test_empty_and_none_inputs_pass_through(self):
+        from src.engine_base import completed_daily_bars
+
+        assert completed_daily_bars([], '2024-06-05') == []
+        assert completed_daily_bars(None, '2024-06-05') is None
+
+    def test_bars_without_date_attribute_pass_through(self):
+        from src.engine_base import completed_daily_bars
+
+        bars = [object(), object()]
+        assert completed_daily_bars(bars, '2024-06-05') is bars

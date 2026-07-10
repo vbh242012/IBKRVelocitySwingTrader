@@ -396,9 +396,13 @@ class MarketDataMixin:
         try:
             if 'SPY' not in self._contract_cache:
                 self._contract_cache['SPY'] = self._stock_contract('SPY')
+            from src.engine_base import completed_daily_bars
             bars = self.ib.reqHistoricalData(
                 self._contract_cache['SPY'], '', DAILY_LOOKBACK, DAILY_BAR_SIZE, 'TRADES', True
             )
+            # Strip today's partial bar so SPY trend/RS windows stay aligned
+            # with candidate frames, which are completed-bars only.
+            bars = completed_daily_bars(bars, today)
             if not isinstance(bars, list) or len(bars) < MA_SLOW + SMA200_SLOPE_LOOKBACK:
                 logger.warning("SPY context has insufficient history — blocking new entries")
                 self._spy_cache = {'date': today, 'trend': False, 'df': None}
@@ -545,8 +549,12 @@ class MarketDataMixin:
                 if cached and 'bars_daily' in cached:
                     book_df = util.df(cached['bars_daily'])
                 else:
+                    from src.engine_base import completed_daily_bars, _TZ_NY
                     bars = self.ib.reqHistoricalData(
                         self._stock_contract(book_sym), '', '90 D', DAILY_BAR_SIZE, 'TRADES', True
+                    )
+                    bars = completed_daily_bars(
+                        bars, datetime.now(_TZ_NY).strftime('%Y-%m-%d')
                     )
                     if not isinstance(bars, list) or not bars:
                         logger.warning(

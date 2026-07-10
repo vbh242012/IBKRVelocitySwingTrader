@@ -122,6 +122,39 @@ def test_indicator_swing_requires_enabled_sleeve_signal():
     assert "indicator_sleeve_signal" in result.failed
 
 
+def test_volume_pace_no_longer_counts_as_a_confirmation():
+    """Volume pace is a hard gate; letting it also count as a confirmation
+    collapsed 'two of five' to 'one of the other four' for every candidate that
+    reached the confirmation check.  With only MACD confirming, the entry must
+    fail even though volume pace passes its gate."""
+    profile = get_strategy_profile("indicator_swing")
+    ctx = _base_ctx(
+        stoch_bull_exit_oversold=False,
+        obv_uptrend=False,
+        psar_bull_3=False,
+        # volume pace comfortably above the 1.2x hard gate
+        volume_pace=2.0,
+    )
+
+    result = evaluate_entry_rules(ctx, profile)
+
+    assert not result.passed
+    assert "two_indicator_confirmations" in result.failed
+
+
+def test_two_independent_indicator_confirmations_pass():
+    profile = get_strategy_profile("indicator_swing")
+    ctx = _base_ctx(
+        stoch_bull_exit_oversold=False,
+        obv_uptrend=False,
+        psar_bull_3=True,  # MACD histogram delta + PSAR = two independent signals
+    )
+
+    result = evaluate_entry_rules(ctx, profile)
+
+    assert result.passed
+
+
 def test_optional_bollinger_and_psar_sleeves_are_current_profile_configuration():
     profile = get_strategy_profile("indicator_swing")
     bollinger_profile = replace(profile, indicator_sleeves=("bollinger_reversion",))
