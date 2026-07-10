@@ -107,6 +107,58 @@ def test_optimizer_params_only_cover_active_exit_knobs():
     assert all(set(p.__dataclass_fields__) == {"trail_pct"} for p in default_grid())
 
 
+def test_run_with_params_propagates_full_regime_state(monkeypatch):
+    """_run_with_params must hand every regime series to the per-parameter run.
+
+    _spy_close was omitted, so the RS entry gates computed NaN relative
+    strength, silently rejected every candidate, and the optimizer reported
+    zero trades for every parameter set in the grid."""
+    from backtest.optimizer import _run_with_params
+
+    base = VelocityBacktest(
+        start="2024-01-01", end="2024-06-01", use_cache=False, vix_delay_bars=1
+    )
+    idx = pd.date_range("2023-01-01", periods=10, freq="B")
+    base._data = {}
+    base._spy_close = pd.Series(100.0, index=idx)
+    base._spy_return = pd.Series(0.0, index=idx)
+    base._spy_bull = pd.Series(True, index=idx)
+    base._vix_series = pd.Series(15.0, index=idx)
+
+    captured = {}
+
+    def fake_run_loop(self):
+        captured["bt"] = self
+        return "sentinel"
+
+    monkeypatch.setattr(VelocityBacktest, "_run_loop", fake_run_loop)
+
+    result = _run_with_params(
+        base, "2024-01-01", "2024-06-01", OptimizationParams(trail_pct=0.04)
+    )
+
+    bt = captured["bt"]
+    assert result == "sentinel"
+    assert bt._spy_close is base._spy_close
+    assert bt._spy_bull is base._spy_bull
+    assert bt._spy_return is base._spy_return
+    assert bt._vix_series is base._vix_series
+    assert bt._vix_delay_bars == base._vix_delay_bars
+    assert bt._trail_pct == pytest.approx(0.04)
+
+
+def test_validate_regime_data_requires_spy_close():
+    bt = VelocityBacktest(start="2024-01-01", end="2024-06-01", use_cache=False)
+    idx = pd.date_range("2023-01-01", periods=10, freq="B")
+    bt._spy_return = pd.Series(0.0, index=idx)
+    bt._spy_bull = pd.Series(True, index=idx)
+    bt._vix_series = pd.Series(15.0, index=idx)
+    bt._spy_close = None
+
+    with pytest.raises(RuntimeError, match="SPY close"):
+        bt._validate_regime_data()
+
+
 def test_run_backtest_scoring_model_is_profile_owned():
     args = SimpleNamespace(strategy_profile="indicator_swing")
     assert run_backtest._effective_scoring_model(args) == "indicator_swing"

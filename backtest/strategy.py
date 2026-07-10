@@ -927,6 +927,11 @@ class VelocityBacktest:
             raise RuntimeError(
                 "SPY daily return data is unavailable; EOD relative-strength cleanup cannot be tested."
             )
+        if self._spy_close is None:
+            raise RuntimeError(
+                "SPY close series is unavailable; the relative-strength entry "
+                "gates would silently reject every candidate."
+            )
         if self._use_spy_filter and self._spy_bull is None:
             raise RuntimeError(
                 "SPY regime filter is enabled, but SPY regime data is unavailable."

@@ -33,10 +33,15 @@ class OptimizationRun:
 
 
 def default_grid() -> List[OptimizationParams]:
-    """Small robustness grid over active indicator_swing exit parameters."""
+    """Small robustness grid over active indicator_swing exit parameters.
+
+    Brackets the 2026-07-10 walk-forward optimum (5%): tighter trails were
+    strictly worse (2% ranked last in train AND forward), and 6% gave back
+    too much per stop, so the grid spans 3%-6% instead of topping out at the
+    old 4% ceiling that censored the optimum."""
     return [
         OptimizationParams(trail_pct=trail_pct)
-        for trail_pct in [0.02, 0.03, 0.04]
+        for trail_pct in [0.03, 0.04, 0.05, 0.06]
     ]
 
 
@@ -44,7 +49,7 @@ def quick_grid() -> List[OptimizationParams]:
     """Very small grid for a fast smoke-test optimization pass."""
     return [
         OptimizationParams(trail_pct=trail_pct)
-        for trail_pct in [0.02, 0.03]
+        for trail_pct in [0.04, 0.05]
     ]
 
 
@@ -156,6 +161,7 @@ def _run_with_params(
         min_dollar_vol=base._min_dollar_vol,
         use_spy_filter=base._use_spy_filter,
         use_vix_filter=base._use_vix_filter,
+        vix_delay_bars=base._vix_delay_bars,
         trail_pct=params.trail_pct,
         bear_phase_trading=base._bear_phase_trading,
         commission_per_order=base._round_trip_cost / 2.0,
@@ -166,6 +172,10 @@ def _run_with_params(
     bt._data = _slice_data(base, end)
     bt._spy_bull = base._spy_bull
     bt._spy_return = base._spy_return
+    # The RS-first entry gates derive relative strength from SPY closes; without
+    # this series every candidate silently fails the RS gate and the optimizer
+    # reports zero trades for every parameter set.
+    bt._spy_close = base._spy_close
     bt._vix_series = base._vix_series
     bt._validate_regime_data()
     return bt._run_loop()
