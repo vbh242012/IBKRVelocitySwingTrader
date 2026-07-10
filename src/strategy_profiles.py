@@ -19,6 +19,7 @@ from src.config import (
     INDICATOR_SWING_STRATEGIES,
     INDICATOR_SWING_TIME_STOP_BARS,
     INDICATOR_SWING_TIME_STOP_MIN_PROFIT_PCT,
+    MA_CROSS_TRIGGERS,
     SCAN_MIN_DOLLAR_VOL,
     SCAN_MIN_MKTCAP,
     SCAN_MIN_PRICE,
@@ -190,14 +191,19 @@ def indicator_sleeve_signals(ctx: Mapping, profile: StrategyProfile = PROFILE) -
     sleeves = profile.indicator_sleeves or ("ma_cross",)
     signals: list[str] = []
     ma_trend_active = _bool(ctx, "ema20_gt_sma50") or _bool(ctx, "ma_bull_cross")
+    # MA_CROSS_TRIGGERS is a research-only attribution switch; the production
+    # default enables all three sub-triggers, matching the original behavior.
+    triggers = MA_CROSS_TRIGGERS
     ma_timing = (
-        _bool(ctx, "ma_bull_cross")
+        ("fresh_cross" in triggers and _bool(ctx, "ma_bull_cross"))
         or (
             ma_trend_active
             and (
-                _bool(ctx, "break_prev_high")
-                or _bool(ctx, "reclaim_ma20")
-                or _bool(ctx, "reclaim_ma50")
+                ("break_prev_high" in triggers and _bool(ctx, "break_prev_high"))
+                or (
+                    "reclaim" in triggers
+                    and (_bool(ctx, "reclaim_ma20") or _bool(ctx, "reclaim_ma50"))
+                )
             )
         )
     )

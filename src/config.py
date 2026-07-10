@@ -328,6 +328,18 @@ INDICATOR_SWING_STRATEGIES = tuple(
     ).split(",")
     if s.strip()
 )
+# Research-only attribution switch: restrict which ma_cross timing sub-triggers
+# may fire (fresh_cross | break_prev_high | reclaim).  The default enables all
+# three, which is the unchanged production behavior.  Used to measure whether
+# the sleeve's edge comes from breakout entries or pullback-reclaim entries.
+MA_CROSS_TRIGGERS = tuple(
+    t.strip().lower()
+    for t in os.getenv(
+        "VELOCITY_MA_CROSS_TRIGGERS",
+        "fresh_cross,break_prev_high,reclaim",
+    ).split(",")
+    if t.strip()
+) or ("fresh_cross", "break_prev_high", "reclaim")
 
 # ── Analyst rating integration ───────────────────────────────────────────────
 # Live ratings use a local CSV first, then Finnhub when a key is configured, and

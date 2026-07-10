@@ -122,6 +122,37 @@ def test_indicator_swing_requires_enabled_sleeve_signal():
     assert "indicator_sleeve_signal" in result.failed
 
 
+def test_ma_cross_trigger_subset_is_research_switchable(monkeypatch):
+    """VELOCITY_MA_CROSS_TRIGGERS restricts which ma_cross sub-triggers fire so
+    the sleeve's edge can be attributed between breakout, reclaim, and fresh
+    cross entries.  Each subset must accept its own trigger and reject the
+    others."""
+    import src.strategy_profiles as sp
+
+    profile = get_strategy_profile("indicator_swing")
+    breakout_only_ctx = _base_ctx()
+    reclaim_only_ctx = _base_ctx(break_prev_high=False, reclaim_ma20=True)
+    fresh_cross_only_ctx = _base_ctx(break_prev_high=False, ma_bull_cross=True)
+
+    monkeypatch.setattr(sp, "MA_CROSS_TRIGGERS", ("reclaim",))
+    assert not evaluate_entry_rules(breakout_only_ctx, profile).passed
+    assert evaluate_entry_rules(reclaim_only_ctx, profile).passed
+
+    monkeypatch.setattr(sp, "MA_CROSS_TRIGGERS", ("break_prev_high",))
+    assert evaluate_entry_rules(breakout_only_ctx, profile).passed
+    assert not evaluate_entry_rules(reclaim_only_ctx, profile).passed
+
+    monkeypatch.setattr(sp, "MA_CROSS_TRIGGERS", ("fresh_cross",))
+    assert evaluate_entry_rules(fresh_cross_only_ctx, profile).passed
+    assert not evaluate_entry_rules(breakout_only_ctx, profile).passed
+
+
+def test_ma_cross_default_triggers_match_production_behavior():
+    from src.config import MA_CROSS_TRIGGERS
+
+    assert set(MA_CROSS_TRIGGERS) == {"fresh_cross", "break_prev_high", "reclaim"}
+
+
 def test_volume_pace_no_longer_counts_as_a_confirmation():
     """Volume pace is a hard gate; letting it also count as a confirmation
     collapsed 'two of five' to 'one of the other four' for every candidate that
