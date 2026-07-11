@@ -436,6 +436,15 @@ class EntriesMixin:
                 changed = True
             else:
                 missing_counts.pop(sym, None)
+                # Backfill a ledger record for positions that predate the
+                # ledger (present in local state at startup, so the
+                # recovered-from-broker hook never fires for them).
+                if self._ledger_call('has_open', sym) is False:
+                    self._ledger_call(
+                        'open_trade', sym,
+                        {**self.state[sym], 'source': 'backfilled_from_state'},
+                        replace=False,
+                    )
                 if self.state[sym].pop('pending_exit', None):
                     logger.warning(
                         f"SYNC: {sym} still present at IBKR after pending exit; "

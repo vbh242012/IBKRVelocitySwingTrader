@@ -288,6 +288,40 @@ class TestEngineLedgerHooks:
         assert rec['exit_reason'] == 'broker_exit'
         assert rec['exit_price'] == pytest.approx(99.5)
 
+    def test_sync_backfills_ledger_for_pre_ledger_positions(self, tmp_path):
+        """A position already in local state at startup (so the recovery hook
+        never fires) must still get an open ledger record, otherwise its exit
+        would be recorded without entry data."""
+        engine = _bare_engine()
+        engine._trade_ledger = _ledger(tmp_path)
+        engine.state = {'AAPL': {
+            'fill_price': 312.92, 'price': 312.92, 'qty': 1.0,
+            'entry_order_id': 42, 'score': 79.0,
+        }}
+        engine._missing_position_counts = {}
+
+        position = MagicMock()
+        position.contract.symbol = 'AAPL'
+        position.position = 1.0
+        position.avgCost = 312.92
+        engine.ib.positions.return_value = [position]
+
+        with patch.object(engine, '_force_exit_active', return_value=False), \
+             patch.object(engine, 'save_state'):
+            engine._sync_positions_from_ibkr()
+
+        assert engine._trade_ledger.has_open('AAPL')
+        rec = engine._trade_ledger._open['AAPL']
+        assert rec['source'] == 'backfilled_from_state'
+        assert rec['entry_price'] == pytest.approx(312.92)
+
+        # A second sync must not clobber the record.
+        rec['mfe_price'] = 320.0
+        with patch.object(engine, '_force_exit_active', return_value=False), \
+             patch.object(engine, 'save_state'):
+            engine._sync_positions_from_ibkr()
+        assert engine._trade_ledger._open['AAPL']['mfe_price'] == pytest.approx(320.0)
+
     def test_estimate_used_when_no_fills_available(self, tmp_path):
         engine = _bare_engine()
         engine._trade_ledger = _ledger(tmp_path)
