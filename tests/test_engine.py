@@ -610,7 +610,10 @@ class TestForceExit:
              patch.object(engine, '_alert') as mock_alert:
             engine.run_cycle()
 
-        assert mock_liq.call_args_list == [call('AAPL'), call('MSFT')]
+        assert mock_liq.call_args_list == [
+            call('AAPL', reason='force_exit_all'),
+            call('MSFT', reason='force_exit_all'),
+        ]
         mock_prices.assert_called_once()
         mock_dash.assert_called_once_with(connected=True)
         mock_alert.assert_called_once()

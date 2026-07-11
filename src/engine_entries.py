@@ -426,6 +426,13 @@ class EntriesMixin:
                     'score':           None,
                 }
                 logger.info(f"SYNC: Added {sym} from IBKR (qty={pos.position} avg=${avg_cost:.2f})")
+                # Positions recovered after a restart keep any surviving ledger
+                # record (replace=False); only truly unknown ones open fresh.
+                self._ledger_call(
+                    'open_trade', sym,
+                    {**self.state[sym], 'source': 'recovered_from_broker'},
+                    replace=False,
+                )
                 changed = True
             else:
                 missing_counts.pop(sym, None)
@@ -489,6 +496,10 @@ class EntriesMixin:
                     continue
                 logger.info(f"SYNC: Removed {sym} from state — no IBKR position found")
                 self._cancel_orphaned_exit_orders(sym)
+                # Finalize the trade ledger record now that IBKR has confirmed
+                # the position flat — this is the single exit point for both
+                # software exits and broker-side TRAIL/manual fills.
+                self._ledger_close_from_state(sym)
                 del self.state[sym]
                 missing_counts.pop(sym, None)
                 changed = True
@@ -520,6 +531,8 @@ class EntriesMixin:
                     cur = price
                     self.state[sym]['current_price'] = round(cur, 2)
                     self.state[sym]['price_checked_at'] = datetime.now(_TZ_NY).isoformat()
+                    # Cycle-sampled MFE/MAE for the trade ledger.
+                    self._ledger_call('update_price', sym, cur)
                     ep  = float(self.state[sym].get('price', 0))
                     qty = float(self.state[sym].get('qty', 0))
                     if ep > 0 and qty > 0:

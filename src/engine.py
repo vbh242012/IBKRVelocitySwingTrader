@@ -122,7 +122,7 @@ class VelocityEngine(
                 f"FORCE EXIT: {FORCE_EXIT_FILE} exists — liquidating all tracked positions."
             )
             for sym in list(self.state.keys()):
-                self.liquidate(sym)
+                self.liquidate(sym, reason='force_exit_all')
             self._update_position_prices()
             self._write_dashboard_data(connected=True)
             return
@@ -830,6 +830,12 @@ class VelocityEngine(
                             if cr and not np.isnan(cr.commission) and cr.commission > 0:
                                 self.state[sym]['commission'] = round(float(cr.commission), 4)
                         self.save_state()
+                        self._ledger_call('open_trade', sym, {
+                            **self.state[sym],
+                            'spread_pct': ctx.get('spread_pct'),
+                            'volume_pace': ctx.get('volume_pace'),
+                            'atr_pct': ctx.get('atr_pct'),
+                        })
 
                         # Place the protective TRAIL stop as a standalone order AFTER
                         # the position is confirmed in IBKR's books. Attaching it as a

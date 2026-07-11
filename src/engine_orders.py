@@ -989,8 +989,13 @@ class OrdersMixin:
         )
         return False
 
-    def liquidate(self, symbol):
+    def liquidate(self, symbol, reason=None):
         from src.engine_base import logger, _TZ_NY, _REJECTED_ORDER_STATUSES
+
+        # Record the exit intent so the trade ledger can attribute the round
+        # trip when IBKR later confirms the position flat.
+        if reason and symbol in self.state:
+            self.state[symbol]['exit_reason'] = str(reason)
 
         found_position = False
         for p in self.ib.positions():
@@ -1053,6 +1058,22 @@ class OrdersMixin:
                 if status == 'Filled' or filled_qty >= qty:
                     if symbol in self.state:
                         self.state[symbol]['pending_exit'] = True
+                        # Capture the real exit fill for the trade ledger; the
+                        # record is finalized when the sync confirms flat.
+                        exit_px = self._coerce_positive_price(
+                            getattr(trade.orderStatus, 'avgFillPrice', None)
+                        )
+                        if exit_px is not None:
+                            self.state[symbol]['exit_fill_price'] = round(exit_px, 4)
+                        self.state[symbol]['exit_fill_time'] = datetime.now(_TZ_NY).isoformat()
+                        try:
+                            exit_order_id = int(getattr(
+                                getattr(trade, 'order', None), 'orderId', None
+                            ))
+                        except (TypeError, ValueError):
+                            exit_order_id = None
+                        if exit_order_id is not None and exit_order_id > 0:
+                            self.state[symbol]['exit_order_id'] = exit_order_id
                     self.save_state()
                     logger.info(
                         f"LIQUIDATE {symbol}: market SELL filled "
@@ -1071,6 +1092,9 @@ class OrdersMixin:
                 "cancelling orphaned exits and removing stale state"
             )
             self._cancel_orphaned_exit_orders(symbol)
+            self._ledger_close_from_state(
+                symbol, fallback_reason=str(reason) if reason else 'stale_state_removed'
+            )
             del self.state[symbol]
             self.save_state()
 

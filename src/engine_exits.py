@@ -325,7 +325,7 @@ class ExitsMixin:
                                 f"(threshold -{stale_threshold*100:.0f}% with stale buffer, "
                                 f"cache age {cache_age_sec:.0f}s). Forcing exit."
                             )
-                            self.liquidate(sym)
+                            self.liquidate(sym, reason='hard_stop_stale_price')
                             continue
 
                 cached_desc = f"${cached_cur:.2f}" if cached_cur else "unavailable"
@@ -343,6 +343,8 @@ class ExitsMixin:
             cur = fresh_cur
             self.state[sym]['current_price'] = round(cur, 2)
             self.state[sym]['price_checked_at'] = now_et.isoformat()
+            # Cycle-sampled MFE/MAE for the trade ledger.
+            self._ledger_call('update_price', sym, cur)
             for state_key, snapshot_key in (
                 ('day_open', 'open'),
                 ('day_high', 'high'),
@@ -362,7 +364,7 @@ class ExitsMixin:
                     f"HARD STOP: {sym} down {drawdown*100:.1f}% from entry "
                     f"(${cur:.2f} vs entry ${entry_price:.2f}). Forcing exit."
                 )
-                self.liquidate(sym)
+                self.liquidate(sym, reason='hard_stop')
                 continue
 
             peak_price = max(float(data.get('peak_price', entry_price) or entry_price), cur)
@@ -381,7 +383,7 @@ class ExitsMixin:
                 logger.warning(
                     f"ANALYST DOWNGRADE EXIT: {sym} {analyst_reason}. Closing."
                 )
-                self.liquidate(sym)
+                self.liquidate(sym, reason='analyst_downgrade')
                 continue
 
             strategy_exit, strategy_reason = self._indicator_strategy_exit_required(sym, data)
@@ -390,7 +392,7 @@ class ExitsMixin:
                     f"STRATEGY EXIT: {sym} [{data.get('entry_strategy', 'unknown')}] "
                     f"{strategy_reason}. Closing."
                 )
-                self.liquidate(sym)
+                self.liquidate(sym, reason='strategy_exit')
                 continue
 
             entry_time_raw = data.get('time')
@@ -413,7 +415,7 @@ class ExitsMixin:
                         f"SWING TIME STOP: {sym} held {trading_bars_held} trading bars "
                         f"with profit={profit*100:.1f}% <= {min_profit*100:.1f}%. Closing."
                     )
-                    self.liquidate(sym)
+                    self.liquidate(sym, reason='time_stop')
                     continue
 
             # ── 2. Friday afternoon close — explicit weekend-risk policy
@@ -424,7 +426,7 @@ class ExitsMixin:
                         f"FRIDAY CLOSE: {sym} profit={friday_profit*100:.1f}% < "
                         f"{FRIDAY_MIN_PROFIT_PCT*100:.0f}% — closing to avoid weekend risk."
                     )
-                    self.liquidate(sym)
+                    self.liquidate(sym, reason='friday_close')
                     continue
 
             # ── 3. EOD quality cleanup — same-day capital recycling.
@@ -449,7 +451,7 @@ class ExitsMixin:
                         f"(cur=${cur:.2f}, entry=${entry_price:.2f}) "
                         f"— closing position."
                     )
-                    self.liquidate(sym)
+                    self.liquidate(sym, reason='eod_quality_cleanup')
                     continue
                 logger.info(f"EOD QUALITY HOLD: {sym} held overnight ({hold_reason}).")
 
@@ -478,7 +480,7 @@ class ExitsMixin:
                     f"+{STALE_POSITION_MAX_PEAK_PCT*100:.0f}%). "
                     "Closing stale loser to recycle capital."
                 )
-                self.liquidate(sym)
+                self.liquidate(sym, reason='stale_losing_exit')
                 continue
 
         # Mark EOD exit as done only after at least one live-price evaluation.

@@ -24,6 +24,7 @@ BASE_DIR         = os.getenv(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)),
 )
 STATE_FILE       = os.path.join(BASE_DIR, "engine_state.json")
+TRADE_LEDGER_FILE = os.path.join(BASE_DIR, "trade_ledger.json")
 DASHBOARD_FILE   = os.path.join(BASE_DIR, "dashboard_data.json")
 EQUITY_HIST_FILE = os.path.join(BASE_DIR, "equity_history.json")
 READINESS_FILE   = os.path.join(BASE_DIR, "readiness_snapshot.json")

@@ -36,6 +36,7 @@ from src.config import (
 from src.analyst_ratings import AnalystRatingProvider
 from src.ib_gateway import ensure_ib_gateway_ready
 from src.strategy_profiles import get_strategy_profile
+from src.trade_ledger import TradeLedger
 
 os.makedirs(BASE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -149,6 +150,7 @@ class VelocityEngineBase:
         self.state        = self.load_state()
         self._strategy_profile = get_strategy_profile(STRATEGY_PROFILE)
         self._analyst_provider = AnalystRatingProvider(allow_remote=True)
+        self._trade_ledger = TradeLedger()
 
         # Metrics written to dashboard_data.json after every cycle
         self._last_equity:      float            = 0.0
@@ -330,7 +332,7 @@ class VelocityEngineBase:
 
     def _on_commission_report(self, trade, fill, report):
         """Async callback: IB commission reports arrive after the fill confirmation.
-        Match by the entry order ID stored at fill time and persist to state."""
+        Match by the entry/exit order IDs stored at fill time and persist to state."""
         try:
             commission = float(report.commission)
         except (TypeError, ValueError):
@@ -347,6 +349,144 @@ class VelocityEngineBase:
                     f"commission=${commission:.4f}"
                 )
                 break
+            if order_id is not None and order_id in (
+                data.get('exit_order_id'), data.get('stop_order_id')
+            ):
+                data['exit_commission'] = round(commission, 4)
+                self.save_state()
+                logger.info(
+                    f"COMMISSION (exit): {sym} order={order_id} "
+                    f"commission=${commission:.4f}"
+                )
+                break
+
+    # ── Trade ledger (measurement) ─────────────────────────────────────────────
+    def _ledger_call(self, method: str, *args, **kwargs):
+        """Invoke a TradeLedger method fail-soft.
+
+        Measurement must never interrupt trading: a broken ledger degrades
+        observability, not execution.  Engines constructed without a ledger
+        (unit tests build instances via __new__) silently no-op."""
+        ledger = getattr(self, '_trade_ledger', None)
+        if ledger is None:
+            return None
+        try:
+            return getattr(ledger, method)(*args, **kwargs)
+        except Exception as e:
+            logger.warning(f"LEDGER: {method} failed: {e}")
+            return None
+
+    def _broker_sell_fill_summary(self, symbol: str) -> Optional[dict]:
+        """Best-effort qty-weighted SELL fill summary for a symbol from IBKR.
+
+        Used when a position disappears without a software exit — a broker-side
+        TRAIL fill or a manual close — so the ledger records the real exit
+        price instead of nothing.  Tries the session fill cache first, then
+        falls back to reqExecutions (covers fills from earlier today after an
+        engine restart).  Returns None when nothing usable is found."""
+        def _symbol_fills(fills):
+            return [
+                f for f in (fills or [])
+                if getattr(getattr(f, 'contract', None), 'symbol', None) == symbol
+            ]
+
+        try:
+            fills = _symbol_fills(self.ib.fills())
+        except Exception:
+            fills = []
+        if not fills:
+            try:
+                from ib_async import ExecutionFilter
+                fills = _symbol_fills(self.ib.reqExecutions(ExecutionFilter()))
+            except Exception:
+                return None
+
+        sells = []
+        for f in fills:
+            try:
+                ex = getattr(f, 'execution', None)
+                side = str(getattr(ex, 'side', '')).upper()
+                if side not in ('SLD', 'SELL'):
+                    continue
+                shares = float(getattr(ex, 'shares', 0) or 0)
+                price = float(getattr(ex, 'price', 0) or 0)
+                if shares <= 0 or price <= 0:
+                    continue
+                cr = getattr(f, 'commissionReport', None)
+                commission = float(getattr(cr, 'commission', 0) or 0) if cr else 0.0
+                if not np.isfinite(commission) or commission < 0:
+                    commission = 0.0
+                order_id = getattr(ex, 'orderId', None)
+                fill_time = getattr(ex, 'time', None) or getattr(f, 'time', None)
+                sells.append((shares, price, commission, order_id, fill_time))
+            except Exception:
+                continue
+        if not sells:
+            return None
+
+        total_shares = sum(s for s, _, _, _, _ in sells)
+        avg_price = sum(s * p for s, p, _, _, _ in sells) / total_shares
+        total_commission = sum(c for _, _, c, _, _ in sells)
+        times = [t for _, _, _, _, t in sells if t is not None]
+        last_time = max(times) if times else None
+        return {
+            'avg_price': round(avg_price, 4),
+            'qty': total_shares,
+            'commission': round(total_commission, 4) if total_commission > 0 else None,
+            'time': last_time.isoformat() if hasattr(last_time, 'isoformat') else last_time,
+            'order_ids': sorted({oid for _, _, _, oid, _ in sells if oid}),
+        }
+
+    def _ledger_close_from_state(self, symbol: str, fallback_reason: str = 'broker_exit'):
+        """Close the ledger record for a position IBKR has confirmed flat.
+
+        Software exits recorded their fill in state via liquidate(); everything
+        else (broker TRAIL fill, manual close) is reconstructed from broker
+        executions.  A best-effort estimate is used only as the last resort and
+        is labelled as such."""
+        if getattr(self, '_trade_ledger', None) is None:
+            return
+        data = self.state.get(symbol) or {}
+        reason = data.get('exit_reason')
+        exit_price = self._coerce_positive_price(data.get('exit_fill_price'))
+        exit_time = data.get('exit_fill_time')
+        commission = data.get('exit_commission')
+        source = 'software_fill'
+
+        if exit_price is None:
+            summary = self._broker_sell_fill_summary(symbol)
+            if summary:
+                exit_price = summary['avg_price']
+                exit_time = exit_time or summary.get('time')
+                commission = commission if commission is not None else summary.get('commission')
+                source = 'broker_fills'
+                if reason is None:
+                    stop_id = data.get('stop_order_id')
+                    reason = (
+                        'trail_stop'
+                        if stop_id and stop_id in (summary.get('order_ids') or [])
+                        else fallback_reason
+                    )
+
+        if exit_price is None:
+            exit_price = (
+                self._coerce_positive_price(data.get('current_price'))
+                or self._coerce_positive_price(data.get('effective_stop'))
+                or self._coerce_positive_price(data.get('stop_loss'))
+            )
+            source = 'estimate'
+
+        self._ledger_call(
+            'close_trade',
+            symbol,
+            exit_price=exit_price,
+            exit_reason=reason or fallback_reason,
+            exit_time=exit_time,
+            exit_commission=commission,
+            entry_commission=data.get('commission'),
+            exit_price_source=source,
+            qty=data.get('qty'),
+        )
 
     def _reconnect(self) -> bool:
         self._validate_deployment_mode()
@@ -759,6 +899,8 @@ class VelocityEngineBase:
             "scanner_prefilter_status": getattr(self, '_prefilter_status', 'not_started'),
             "scanner_prefilter_candidates": len(getattr(self, '_prefilter_candidates', []) or []),
             "scanner_prefilter_stats": copy.deepcopy(getattr(self, '_prefilter_stats', {}) or {}),
+            "trade_history": self._ledger_call('recent_closed', 20) or [],
+            "trade_stats": self._ledger_call('summary') or {},
             "last_updated": now.isoformat(),
         }
         try:
