@@ -34,6 +34,7 @@ import pytz
 
 from contextlib import contextmanager
 from src.scoring import score_candidate, volume_pace_from_intraday
+from src.config import TRAIL_PCT as _TRAIL_PCT
 
 
 @contextmanager
@@ -292,19 +293,19 @@ class TestBracketOrderMath:
     Verify percent trail stop distance, GTC 2-order structure, and state persistence.
 
     Config values used (from src/config.py):
-        TRAIL_PCT = 0.02  →  trail_dist = limit_price × 0.02
+        TRAIL_PCT  →  trail_dist = limit_price × TRAIL_PCT
 
-    With entry=100.00, limit=100.15, TRAIL_PCT=0.02:
-        trail_dist  = round(100.15 × 0.02, 2) = 2.0
-        stop_loss (state) = fill - trail_dist = 100.00 - 2.0 = 98.0
-        trailingPercent on TRAIL order = 2.0
+    With entry=100.00, limit=100.15:
+        trail_dist  = round(100.15 × TRAIL_PCT, 2)
+        stop_loss (state) = fill - trail_dist
+        trailingPercent on TRAIL order = trail_dist expressed as %
         No take-profit order or state key.
     """
 
     ENTRY       = 100.00
     LIMIT       = 100.15                         # ask 100.10 + 5 bps cushion, capped by 0.2%
-    TRAIL_DIST  = round(100.15 * 0.02, 2)        # 2.0 (2% of limit price)
-    INIT_STOP   = round(100.00 - round(100.15 * 0.02, 2), 2)  # 98.0
+    TRAIL_DIST  = round(100.15 * _TRAIL_PCT, 2)
+    INIT_STOP   = round(100.00 - round(100.15 * _TRAIL_PCT, 2), 2)
 
     def _setup(self):
         ib      = _mock_ib()
@@ -318,9 +319,13 @@ class TestBracketOrderMath:
 
     # ── trail_dist computation ───────────────────────────────────────────────
 
-    def test_trail_pct_is_two_percent(self):
+    def test_trail_pct_promoted_default_is_five_percent(self):
+        """2026-07-22: promoted from the unvalidated 2% cut to the 2026-07-10
+        walk-forward-optimizer-validated 5% optimum (independently confirmed by
+        live-ledger median MFE at trail_stop exits landing almost exactly at
+        the old 2% trail width)."""
         from src.config import TRAIL_PCT
-        assert TRAIL_PCT == pytest.approx(0.02, abs=1e-6), "TRAIL_PCT must be 0.02 (2%)"
+        assert TRAIL_PCT == pytest.approx(0.05, abs=1e-6), "TRAIL_PCT must be 0.05 (5%)"
 
     def test_trail_dist_equals_limit_price_times_trail_pct(self):
         from src.config import TRAIL_PCT
@@ -329,7 +334,7 @@ class TestBracketOrderMath:
 
     def test_trail_dist_is_rounded_to_2_decimals(self):
         from src.config import TRAIL_PCT
-        assert round(100.333 * TRAIL_PCT, 2) == round(100.333 * 0.02, 2)
+        assert round(100.333 * TRAIL_PCT, 2) == round(100.333 * _TRAIL_PCT, 2)
 
     # ── Order count and structure ─────────────────────────────────────────────
 
@@ -3306,6 +3311,188 @@ class TestHardStop:
 
         assert engine.state['DOWN']['pending_exit'] is True
         assert ib.placeOrder.called
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13B. MOMENTUM STALL — periodic hold/sell re-check every N days
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMomentumStallExit:
+    """
+    manage_position_exits() must, every MOMENTUM_HOLD_CHECK_INTERVAL_DAYS,
+    require at least MOMENTUM_HOLD_MIN_MOVE_PCT close-to-close appreciation
+    over the trailing MOMENTUM_HOLD_LOOKBACK_DAYS completed sessions, or close
+    the position — independent of profit/loss versus entry.
+    """
+
+    def _make_position(self, symbol, qty):
+        pos = MagicMock()
+        pos.contract.symbol = symbol
+        pos.position        = qty
+        return pos
+
+    def _state_entry(self, price, cur, entry_time, momentum_check_date=None):
+        state = {'price': price, 'qty': 5.0, 'current_price': cur,
+                 'stop_loss': price * 0.90,
+                 'volume': 0, 'score': 60,
+                 'protection_status': 'confirmed',
+                 'time': entry_time.isoformat()}
+        if momentum_check_date is not None:
+            state['momentum_check_date'] = momentum_check_date
+        return state
+
+    @staticmethod
+    def _bar(day, close):
+        from types import SimpleNamespace
+        return SimpleNamespace(date=day, close=close)
+
+    def _run_exit_check(self, engine, now):
+        with patch('src.engine_exits.datetime') as mock_dt:
+            mock_dt.now.return_value = now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            engine.manage_position_exits()
+
+    def test_momentum_stall_exit_closes_position_below_threshold(self):
+        """A position that hasn't moved +1% over the trailing 2 sessions is closed."""
+        from datetime import date as _date
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry_time = tz_ny.localize(datetime(2024, 6, 7, 10, 0))   # Friday
+        now        = tz_ny.localize(datetime(2024, 6, 12, 10, 30))  # Wednesday, +3 trading days
+        engine.state = {'MOM': self._state_entry(100.0, 101.0, entry_time)}
+        ib.reqTickers.return_value = [_mock_price_ticker(101.0)]
+        ib.reqHistoricalData.return_value = [
+            self._bar(_date(2024, 6, 7), 100.00),
+            self._bar(_date(2024, 6, 10), 100.10),
+            self._bar(_date(2024, 6, 11), 100.29),   # +0.29% over trailing 2 sessions — stalled
+        ]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('MOM', 5.0)]
+
+        self._run_exit_check(engine, now)
+
+        assert engine.state.get('MOM', {}).get('pending_exit') is True
+        assert ib.placeOrder.called
+
+    def test_momentum_hold_passes_when_move_meets_threshold(self):
+        """A position that has moved >= +1% over the trailing 2 sessions is kept."""
+        from datetime import date as _date
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry_time = tz_ny.localize(datetime(2024, 6, 7, 10, 0))
+        now        = tz_ny.localize(datetime(2024, 6, 12, 10, 30))
+        engine.state = {'MOM': self._state_entry(100.0, 103.0, entry_time)}
+        ib.reqTickers.return_value = [_mock_price_ticker(103.0)]
+        ib.reqHistoricalData.return_value = [
+            self._bar(_date(2024, 6, 7), 100.00),
+            self._bar(_date(2024, 6, 10), 101.00),
+            self._bar(_date(2024, 6, 11), 102.00),   # +2.0% over trailing 2 sessions — fine
+        ]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('MOM', 5.0)]
+
+        self._run_exit_check(engine, now)
+
+        assert 'MOM' in engine.state
+        assert 'pending_exit' not in engine.state['MOM']
+        assert not ib.placeOrder.called
+        assert engine.state['MOM']['momentum_check_date'] == now.strftime('%Y-%m-%d')
+
+    def test_momentum_check_skipped_before_lookback_days_held(self):
+        """A position held less than MOMENTUM_HOLD_LOOKBACK_DAYS is not checked yet."""
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry_time = tz_ny.localize(datetime(2024, 6, 11, 10, 0))   # Tuesday
+        now        = tz_ny.localize(datetime(2024, 6, 12, 10, 30))  # Wednesday, 1 trading day
+        engine.state = {'MOM': self._state_entry(100.0, 100.05, entry_time)}
+        ib.reqTickers.return_value = [_mock_price_ticker(100.05)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('MOM', 5.0)]
+
+        self._run_exit_check(engine, now)
+
+        assert 'MOM' in engine.state
+        assert 'pending_exit' not in engine.state['MOM']
+        assert not ib.placeOrder.called
+        assert 'momentum_check_date' not in engine.state['MOM']
+        ib.reqHistoricalData.assert_not_called()
+
+    def test_momentum_check_not_repeated_within_interval(self):
+        """A position already checked recently is not re-checked before the interval elapses."""
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry_time = tz_ny.localize(datetime(2024, 6, 7, 10, 0))
+        now        = tz_ny.localize(datetime(2024, 6, 12, 10, 30))
+        # Checked yesterday — well within the default 3-day interval.
+        engine.state = {
+            'MOM': self._state_entry(100.0, 100.05, entry_time, momentum_check_date='2024-06-11'),
+        }
+        ib.reqTickers.return_value = [_mock_price_ticker(100.05)]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('MOM', 5.0)]
+
+        self._run_exit_check(engine, now)
+
+        assert 'MOM' in engine.state
+        assert 'pending_exit' not in engine.state['MOM']
+        assert not ib.placeOrder.called
+        assert engine.state['MOM']['momentum_check_date'] == '2024-06-11'
+        ib.reqHistoricalData.assert_not_called()
+
+    def test_momentum_check_fails_open_when_daily_history_unavailable(self):
+        """A daily-history fetch failure must not liquidate; it retries next cycle."""
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry_time = tz_ny.localize(datetime(2024, 6, 7, 10, 0))
+        now        = tz_ny.localize(datetime(2024, 6, 12, 10, 30))
+        engine.state = {'MOM': self._state_entry(100.0, 100.05, entry_time)}
+        ib.reqTickers.return_value = [_mock_price_ticker(100.05)]
+        ib.reqHistoricalData.return_value = []
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('MOM', 5.0)]
+
+        self._run_exit_check(engine, now)
+
+        assert 'MOM' in engine.state
+        assert 'pending_exit' not in engine.state['MOM']
+        assert not ib.placeOrder.called
+        assert 'momentum_check_date' not in engine.state['MOM']
+
+    def test_momentum_stall_disabled_by_config_flag(self):
+        """VELOCITY_MOMENTUM_HOLD_ENABLED=0 must fully disable the check."""
+        from datetime import date as _date
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        tz_ny  = pytz.timezone('US/Eastern')
+
+        entry_time = tz_ny.localize(datetime(2024, 6, 7, 10, 0))
+        now        = tz_ny.localize(datetime(2024, 6, 12, 10, 30))
+        engine.state = {'MOM': self._state_entry(100.0, 101.0, entry_time)}
+        ib.reqTickers.return_value = [_mock_price_ticker(101.0)]
+        ib.reqHistoricalData.return_value = [
+            self._bar(_date(2024, 6, 7), 100.00),
+            self._bar(_date(2024, 6, 10), 100.10),
+            self._bar(_date(2024, 6, 11), 100.29),
+        ]
+        ib.openTrades.return_value = []
+        ib.positions.return_value  = [self._make_position('MOM', 5.0)]
+
+        with patch('src.engine_exits.MOMENTUM_HOLD_ENABLED', False):
+            self._run_exit_check(engine, now)
+
+        assert 'MOM' in engine.state
+        assert 'pending_exit' not in engine.state['MOM']
+        assert not ib.placeOrder.called
 
 
 # ─────────────────────────────────────────────────────────────────────────────

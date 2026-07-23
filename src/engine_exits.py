@@ -6,6 +6,7 @@ import numpy as np
 from src.config import (
     ANALYST_RATING_EXIT_ENABLED,
     ANALYST_RATING_SELL_THRESHOLD,
+    DAILY_BAR_SIZE,
     EOD_EXIT_TIME,
     EOD_HOLD_MIN_PROFIT_PCT,
     EOD_HOLD_DAY_RANGE_LOCATION_MIN,
@@ -13,6 +14,10 @@ from src.config import (
     EOD_HOLD_REQUIRE_STOP_CONFIRMED,
     HARD_STOP_PCT,
     HARD_STOP_STALE_BUFFER_PCT,
+    MOMENTUM_HOLD_CHECK_INTERVAL_DAYS,
+    MOMENTUM_HOLD_ENABLED,
+    MOMENTUM_HOLD_LOOKBACK_DAYS,
+    MOMENTUM_HOLD_MIN_MOVE_PCT,
     PRICE_STALE_MAX_AGE_SEC,
     POSITION_PRICE_BLACKOUT_STREAK_ALERT,
     FRIDAY_CLOSE_HOUR,
@@ -243,6 +248,44 @@ class ExitsMixin:
         if strategy == "psar_flip" and bool(last.get('PSAR_BEAR_3', False)):
             return True, "three PSAR dots above price"
         return False, "strategy exit not triggered"
+
+    def _momentum_hold_passes(self, sym: str) -> Tuple[Optional[bool], str]:
+        """Require at least MOMENTUM_HOLD_MIN_MOVE_PCT close-to-close appreciation
+        over the trailing MOMENTUM_HOLD_LOOKBACK_DAYS completed sessions.
+
+        Returns (None, reason) when daily history is unavailable so the caller
+        can fail open (retry next cycle) rather than liquidating on a data
+        outage. Uses completed daily closes rather than the live intraday
+        price so a momentum-continuation judgement isn't made on an
+        in-progress bar.
+        """
+        from src.engine_base import completed_daily_bars, logger, _TZ_NY
+        try:
+            contract = self._stock_contract(sym)
+            bars = self.ib.reqHistoricalData(
+                contract, '', '10 D', DAILY_BAR_SIZE, 'TRADES', True
+            )
+            today_str = datetime.now(_TZ_NY).strftime('%Y-%m-%d')
+            bars = completed_daily_bars(bars, today_str)
+        except Exception as exc:
+            logger.warning(f"MOMENTUM HOLD: {sym} daily history fetch failed: {exc}")
+            return None, "daily history unavailable"
+
+        if not isinstance(bars, list) or len(bars) <= MOMENTUM_HOLD_LOOKBACK_DAYS:
+            return None, "insufficient daily history"
+
+        window = bars[-(MOMENTUM_HOLD_LOOKBACK_DAYS + 1):]
+        closes = [self._coerce_positive_price(getattr(b, 'close', None)) for b in window]
+        if any(c is None for c in closes):
+            return None, "incomplete daily closes"
+
+        ref_close, latest_close = closes[0], closes[-1]
+        move = (latest_close - ref_close) / ref_close
+        passed = move >= MOMENTUM_HOLD_MIN_MOVE_PCT
+        return passed, (
+            f"{move*100:+.2f}% over trailing {MOMENTUM_HOLD_LOOKBACK_DAYS} sessions "
+            f"(${ref_close:.2f} -> ${latest_close:.2f})"
+        )
 
     def manage_position_exits(self):
         """Manage live software exits for existing positions.
@@ -482,6 +525,40 @@ class ExitsMixin:
                 )
                 self.liquidate(sym, reason='stale_losing_exit')
                 continue
+
+            # ── 5. Periodic momentum-stall exit ─────────────────────────────
+            # Every MOMENTUM_HOLD_CHECK_INTERVAL_DAYS, require at least
+            # MOMENTUM_HOLD_MIN_MOVE_PCT close-to-close appreciation over the
+            # trailing MOMENTUM_HOLD_LOOKBACK_DAYS completed sessions. This is
+            # a momentum-continuation check, independent of profit/loss versus
+            # entry, and can close a position that is still up overall if it
+            # has stopped making fresh progress.
+            if MOMENTUM_HOLD_ENABLED and trading_bars_held >= MOMENTUM_HOLD_LOOKBACK_DAYS:
+                last_check_str = data.get('momentum_check_date')
+                check_due = last_check_str is None
+                if not check_due:
+                    try:
+                        last_check_date = datetime.fromisoformat(last_check_str).date()
+                        check_due = (
+                            (now_et.date() - last_check_date).days
+                            >= MOMENTUM_HOLD_CHECK_INTERVAL_DAYS
+                        )
+                    except (TypeError, ValueError):
+                        check_due = True
+                if check_due:
+                    hold_ok, momentum_reason = self._momentum_hold_passes(sym)
+                    if hold_ok is not None:
+                        self.state[sym]['momentum_check_date'] = today_str
+                        changed = True
+                        if not hold_ok:
+                            logger.warning(
+                                f"MOMENTUM STALL EXIT: {sym} {momentum_reason} "
+                                f"(< required +{MOMENTUM_HOLD_MIN_MOVE_PCT*100:.1f}%). "
+                                "Closing to recycle capital."
+                            )
+                            self.liquidate(sym, reason='momentum_stall')
+                            continue
+                        logger.info(f"MOMENTUM HOLD: {sym} {momentum_reason}.")
 
         # Mark EOD exit as done only after at least one live-price evaluation.
         if eod_exit_due and eod_exit_checked:

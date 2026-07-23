@@ -1424,3 +1424,80 @@
      previously stale dashboard test now passes).
    - Strategy rules unchanged — this is a broker-state/audit correctness fix,
      not an alpha or exit-policy change.
+
+1. Brutal live-performance review and three live-risk fixes, 2026-07-22
+
+   The trade ledger (built 2026-07-11-ish, see the ledger sections above) gave
+   the first real measurement of live performance: 11 closed trades since
+   deployment, 27.3% win rate, 0.16 profit factor, net -$78.44, account equity
+   -12.1% from its first recorded peak ($2082.27 on 2026-05-28 to $1830.36 on
+   2026-07-22). Median MFE on the 10 `trail_stop` exits was 2.048% — almost
+   exactly the live 2% trail width, i.e. real trades were running up to the
+   stop distance and reversing before any real move developed. This is the
+   live-money confirmation of the 2026-07-10 walk-forward optimizer result
+   that was written down but never deployed. Three fixes were authorized and
+   applied from that review:
+
+   - **`TRAIL_PCT` promoted from 0.02 to 0.05** (`src/config.py`). This is the
+     already-validated 2026-07-10 walk-forward optimum, applied 12 days after
+     it was first recommended. Promoted as the code *default* (not a
+     live-only env override) since it is a validated strategy parameter, same
+     pattern as the `RECLAIM_TRIGGER_BONUS` promotion — it now also applies to
+     paper trading and the backtester baseline.
+   - **Live cash buffer widened**: `VELOCITY_SETTLED_CASH_DEPLOYMENT_PCT=0.85`
+     added to `.env.live.local` (live-only override; code default stays 0.95
+     for paper/backtest). The code default only ever reserved ~5% of settled
+     cash, which on this account's 3-slot sizing left $16-55 free for days at
+     a time with 0 entry slots. 0.85 reserves ~15% instead. This did not
+     require a code change — `SETTLED_CASH_DEPLOYMENT_PCT` already existed
+     and was already wired into both `EntriesMixin._deployable_settled_cash()`
+     and the backtester's equivalent; only the live value needed widening.
+   - **New periodic momentum-stall exit** (`src/engine_exits.py`,
+     `src/config.py`): added at explicit user request, **not yet
+     backtest-validated**. Every `MOMENTUM_HOLD_CHECK_INTERVAL_DAYS` (default
+     3 calendar days), a held position must show at least
+     `MOMENTUM_HOLD_MIN_MOVE_PCT` (default +1%) close-to-close appreciation
+     over the trailing `MOMENTUM_HOLD_LOOKBACK_DAYS` (default 2) completed
+     daily sessions, checked via `ExitsMixin._momentum_hold_passes()`, or the
+     position is closed via `liquidate(sym, reason='momentum_stall')` to
+     recycle capital. This is a momentum-*continuation* check, independent of
+     profit/loss versus entry — it can close a position that is still up
+     overall if it has stopped making fresh progress. Uses completed daily
+     closes (via `completed_daily_bars()`), not the live intraday price, so
+     the judgement isn't made on an in-progress bar. Cadence is tracked per
+     symbol via a new `momentum_check_date` state field; the check only runs
+     once `trading_bars_held >= MOMENTUM_HOLD_LOOKBACK_DAYS`. On a daily-
+     history fetch failure it fails open (retries next cycle, does not stamp
+     `momentum_check_date`) rather than liquidating on a data outage.
+     Controlled by `VELOCITY_MOMENTUM_HOLD_ENABLED` (default on). Because this
+     rule has no backtest coverage yet, it should be watched closely in live
+     logs (`MOMENTUM STALL EXIT` / `MOMENTUM HOLD` lines) and is a candidate
+     for a proper backtest implementation + forward validation before being
+     trusted the way `TRAIL_PCT` or the reclaim bonus are.
+
+   Also updated: `tests/test_trailing_stop_scoring_screener.py` —
+   `TestBracketOrderMath`'s `TRAIL_DIST`/`INIT_STOP` constants and the
+   "TRAIL_PCT is two percent" test were hardcoded to the old 0.02 default;
+   made dynamic against `src.config.TRAIL_PCT` (module-level `_TRAIL_PCT`
+   import) so the next promotion doesn't require another test edit, and the
+   percent-value assertion now pins 0.05 with the promotion rationale in the
+   docstring. Added `TestMomentumStallExit` (6 tests): stall exit fires below
+   threshold, hold passes at/above threshold, check skipped before
+   `MOMENTUM_HOLD_LOOKBACK_DAYS` held, check not repeated inside the cadence
+   interval, fails open on daily-history fetch failure, and the config kill
+   switch fully disables the rule.
+
+   Validation:
+
+   ```bash
+   .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/engine_exits.py src/engine_entries.py src/engine_orders.py src/engine_market.py src/engine_scanner.py src/engine_base.py src/config.py src/strategy_profiles.py backtest/strategy.py backtest/optimizer.py run_backtest.py tests/test_trailing_stop_scoring_screener.py
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m pytest -q -p no:cacheprovider
+   ```
+
+   Results:
+
+   - `py_compile`: passed.
+   - Full suite: 379 passed.
+   - Live trader and dashboard restarted under the new config; live logs
+     confirmed `trail_pct=5.0%` on the next order and `SETTLED_CASH_DEPLOYMENT_PCT`
+     effective at 0.85 (see the restart record immediately below, if present).

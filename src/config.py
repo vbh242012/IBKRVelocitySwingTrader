@@ -111,7 +111,15 @@ SETTLED_CASH_DEPLOYMENT_PCT = float(os.getenv("VELOCITY_SETTLED_CASH_DEPLOYMENT_
 
 # ── Trailing stop ─────────────────────────────────────────────────────────────
 CHANDELIER_PERIOD = 22     # ATR lookback period for entry volatility filter (ATR_CHAND)
-TRAIL_PCT = float(os.getenv("VELOCITY_TRAIL_PCT", "0.02"))  # flat % trail from peak (e.g. 0.02 = 2%)
+# Promoted 2026-07-22 from 0.02 to 0.05. The 2026-07-10 walk-forward optimizer
+# (train 2020-2025, forward 2025-2026-05, bounded cached universe, clean entry
+# logic) ranked 5% best — the only setting positive in both windows (forward
+# +19.1%, Sharpe 1.07, MaxDD -5.8%) — with 4% roughly break-even and 2% worst
+# on every column. The live trade ledger then independently confirmed the same
+# conclusion: median MFE on the first 10 trail_stop exits at the old 2% setting
+# was 2.048%, i.e. trades were running up to almost exactly the trail width and
+# reversing before any real move developed (classic premature-whipsaw exit).
+TRAIL_PCT = float(os.getenv("VELOCITY_TRAIL_PCT", "0.05"))  # flat % trail from peak (e.g. 0.05 = 5%)
 
 # ── Risk rules ────────────────────────────────────────────────────────────────
 VIX_THRESHOLD        = 35
@@ -404,6 +412,21 @@ HMDS_WARMUP_RETRY_WAIT_SEC = float(os.getenv("VELOCITY_HMDS_WARMUP_RETRY_WAIT_SE
 STALE_POSITION_MIN_BARS = int(os.getenv("VELOCITY_STALE_POSITION_MIN_BARS", "3"))
 STALE_POSITION_MAX_LOSS_PCT = float(os.getenv("VELOCITY_STALE_POSITION_MAX_LOSS_PCT", "-0.02"))
 STALE_POSITION_MAX_PEAK_PCT = float(os.getenv("VELOCITY_STALE_POSITION_MAX_PEAK_PCT", "0.01"))
+
+# ── Periodic momentum-stall exit ──────────────────────────────────────────────
+# Added 2026-07-22 at explicit user request; this is a live risk-management
+# control, not yet validated by backtest. Every MOMENTUM_HOLD_CHECK_INTERVAL_DAYS,
+# a held position must show at least MOMENTUM_HOLD_MIN_MOVE_PCT close-to-close
+# appreciation over the trailing MOMENTUM_HOLD_LOOKBACK_DAYS completed sessions,
+# or it is closed to recycle capital. This is a momentum-continuation check, not
+# a stop-loss — it can close a position that is still profitable versus entry if
+# it has stopped making fresh progress.
+MOMENTUM_HOLD_ENABLED = os.getenv(
+    "VELOCITY_MOMENTUM_HOLD_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+MOMENTUM_HOLD_CHECK_INTERVAL_DAYS = int(os.getenv("VELOCITY_MOMENTUM_HOLD_CHECK_INTERVAL_DAYS", "3"))
+MOMENTUM_HOLD_LOOKBACK_DAYS = int(os.getenv("VELOCITY_MOMENTUM_HOLD_LOOKBACK_DAYS", "2"))
+MOMENTUM_HOLD_MIN_MOVE_PCT = float(os.getenv("VELOCITY_MOMENTUM_HOLD_MIN_MOVE_PCT", "0.01"))
 
 # ── Late entry gate ────────────────────────────────────────────────────────────
 LATE_ENTRY_CUTOFF_TIME = _parse_hhmm(
