@@ -799,6 +799,70 @@ class TestAuditStopOrders:
         placed_order = ib.placeOrder.call_args[0][1]
         assert placed_order.goodAfterTime == ''
 
+    def test_already_confirmed_trail_is_not_reset_for_stale_stop_gate(self):
+        """Regression (live ARWR 2026-07-27): an order already confirmed active in
+        a prior audit cycle must never be cancelled/replaced merely because its
+        goodAfterTime date has gone stale. ARWR ran up to a genuine peak of
+        $92.68 on 2026-07-23/24; a routine gate-refresh replacement on
+        2026-07-27 reset its confirmed stop to $84.69 (implying a ~$89.15
+        reference, not the true peak) because the order's goodAfterTime date
+        no longer matched today's. Cancel-and-replace forces a brand-new IBKR
+        order with no memory of the true multi-day high, silently giving back
+        the locked-in gain. An order we have already confirmed must be left
+        alone regardless of its goodAfterTime string."""
+        ib = MagicMock()
+        trail = _make_trade(
+            'ARWR', 'SELL', 'TRAIL', order_id=182350, total_quantity=3,
+            aux_price=eng_mod.util.UNSET_DOUBLE,
+            trail_stop_price=88.04,      # true peak-based stop, already ratcheted up
+            trailing_percent=5.0,
+            good_after_time='20260724 09:32:00 US/Eastern',   # stale — set days ago
+        )
+        ib.openTrades.return_value = [trail]
+        state = {'ARWR': {
+            'price': 86.93, 'qty': 3, 'stop_loss': 88.04, 'current_price': 90.0,
+            'volume': 1_000_000, 'score': 85.0, 'time': '2026-07-23T09:53:51',
+            'protection_status': 'confirmed', 'stop_order_id': 182350,
+        }}
+        engine = _make_engine(ib, state=state)
+
+        # A normal pre-market audit cycle, before today's stop gate.
+        with patch.object(engine, '_stop_good_after_time', return_value='20260727 09:32:00 US/Eastern'):
+            engine._audit_stop_orders()
+
+        ib.cancelOrder.assert_not_called()
+        ib.placeOrder.assert_not_called()
+        # The true ratcheted stop must be preserved, not reset to a fresh value.
+        assert engine.state['ARWR']['stop_loss'] == pytest.approx(88.04)
+        assert engine.state['ARWR']['effective_stop'] == pytest.approx(88.04)
+
+    def test_confirmed_status_for_different_order_id_still_gets_gate_replacement(self):
+        """protection_status='confirmed' from a PRIOR order must not suppress
+        the gate replacement for a genuinely different (new) TRAIL order."""
+        gate = '20260605 09:32:00 US/Eastern'
+        ib = MagicMock()
+        trail = _make_trade(
+            'AAPL', 'SELL', 'TRAIL', order_id=555, total_quantity=10,
+            aux_price=eng_mod.util.UNSET_DOUBLE,
+            trail_stop_price=95.0, trailing_percent=2.0,
+            good_after_time='',
+        )
+        modified = MagicMock()
+        modified.orderStatus.status = 'Submitted'
+        ib.reqAllOpenOrders.return_value = [trail]
+        ib.openTrades.return_value = []
+        ib.placeOrder.return_value = modified
+        state = dict(self._POS)
+        state['protection_status'] = 'confirmed'
+        state['stop_order_id'] = 999   # a DIFFERENT, stale order id
+        engine = _make_engine(ib, state={'AAPL': state})
+
+        with patch.object(engine, '_stop_good_after_time', return_value=gate):
+            engine._audit_stop_orders()
+
+        ib.cancelOrder.assert_called_once_with(trail.order)
+        assert ib.placeOrder.call_count == 1
+
     def test_accepts_ib_percent_trail_when_aux_is_unset(self):
         """IBKR can return percent TRAIL orders with auxPrice left as UNSET_DOUBLE."""
         ib = MagicMock()

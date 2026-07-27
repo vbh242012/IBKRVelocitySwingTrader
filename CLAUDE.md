@@ -1501,3 +1501,97 @@
    - Live trader and dashboard restarted under the new config; live logs
      confirmed `trail_pct=5.0%` on the next order and `SETTLED_CASH_DEPLOYMENT_PCT`
      effective at 0.85 (see the restart record immediately below, if present).
+
+1. Daily stop-gate refresh was silently resetting ratcheted trailing stops, 2026-07-27
+
+   A full application review (requested after stopping the live stack) found
+   that the two trades closed since the `TRAIL_PCT=5%` promotion (ADM, ARWR)
+   both exited via `momentum_stall`, never `trail_stop` — even though ARWR had
+   genuinely run up to a **$92.675 peak (+6.6% MFE)** on 2026-07-23/24. A 5%
+   trail from that peak should have protected a stop near $88.04. Live logs
+   showed the actual sequence:
+
+   ```
+   07-27 00:15 EDT | AUDIT: ARWR — existing TRAIL SELL has stale/missing stop
+                     activation gate; cancelling and replacing with
+                     goodAfterTime=20260727 09:32:00 US/Eastern
+   07-27 00:15 EDT | AUDIT: ARWR — TRAIL SELL confirmed (id=182350 stop=$84.69
+                     trail=5%)
+   ```
+
+   $84.69 / 0.95 = an implied reference of **$89.15 — a $3.53 (3.8%) gap from
+   the true $92.675 peak**, not explainable by rounding (the companion ADM
+   trade, which never ran further than its own entry, showed only a 4-cent
+   gap — confirming the math and showing the effect only bites once a
+   position has genuinely run up). ARWR then drifted down and was closed by
+   the (separately unvalidated) momentum-stall rule at $85.395 — a loss on a
+   trade that had been a real +6.6% winner four days earlier.
+
+   Root cause: `_audit_stop_orders()` runs `_replace_trail_with_stop_activation_gate()`
+   on every valid `trail_orders[0]` whenever the order's `goodAfterTime`
+   string doesn't match today's freshly computed stop gate. Because the gate
+   string is date-stamped (`"YYYYMMDD 09:32:00 US/Eastern"`), it goes stale
+   **every single day** an order is held overnight — so this fired on
+   essentially the first audit of every new day for every multi-day position,
+   not as a rare edge case. Each firing does a genuine IBKR cancel + place of
+   a brand-new order (new orderId). The replacement code tried to carry
+   forward the old order's `trailStopPrice`/`trailingPercent`, but a fresh
+   IBKR order has no memory of price history before its own creation —
+   whatever mechanism is responsible (IBKR re-anchoring the trail's
+   high-water mark to the price prevailing at creation time, or our own read
+   of the old order's `trailStopPrice` not reflecting the true current
+   ratcheted level), the net effect is the same: **the "stop ratchets up and
+   never gives it back" guarantee was being silently violated once a day for
+   every position held more than one session.** This is a different code path
+   than the 2026-07-01 AMD fix (which stopped the audit from *misclassifying*
+   a healthy in-the-money trail as invalid via `_trail_order_protection()`);
+   this bug lives in the separate gate-refresh path that still touches orders
+   already correctly classified as valid.
+
+   Fix: `_replace_trail_with_stop_activation_gate()` now skips entirely
+   (returns the order untouched) whenever the order's `orderId` matches
+   `state[sym]['stop_order_id']` **and** `state[sym]['protection_status'] ==
+   'confirmed'` — i.e. whenever we have already confirmed this exact order
+   live in a prior audit cycle. A stale/mismatched `goodAfterTime` on an
+   order we already know is active protects nothing further; the gate only
+   has a real job to do for orders we have never confirmed (fresh entries,
+   freshly rebuilt stops after a genuine repair, or an externally placed
+   order the audit is seeing for the first time). This is a narrower, more
+   precise fix than trying to parse/compare `goodAfterTime` timestamps
+   directly, and it does not change behavior for any order that hasn't
+   already been through a successful confirmation — the existing
+   "gate a newly-discovered ungated order before the stop-activation time"
+   safety net (`test_existing_trail_before_stop_gate_is_delayed_to_932_et`)
+   is untouched because a brand-new/never-confirmed position's state has no
+   matching `stop_order_id` yet.
+
+   Regression tests added to `tests/test_startup_init.py::TestAuditStopOrders`:
+   - `test_already_confirmed_trail_is_not_reset_for_stale_stop_gate` —
+     reproduces the ARWR scenario exactly (confirmed order, stale dated gate,
+     audit running before today's stop gate); asserts no cancel/replace and
+     that `stop_loss`/`effective_stop` stay at the true ratcheted value.
+   - `test_confirmed_status_for_different_order_id_still_gets_gate_replacement` —
+     guards against an overly broad fix: a `protection_status='confirmed'`
+     left over from a *different*, now-stale `stop_order_id` must not
+     suppress gating for a genuinely new/different TRAIL order.
+
+   Not yet done, deliberately: the live stack is currently stopped (no open
+   positions) per an explicit prior instruction, so this fix has only been
+   verified via unit tests reproducing the exact logged scenario, not by
+   observing a real multi-day IBKR order survive a gate-refresh audit live.
+   It should be watched closely (`AUDIT: ... TRAIL SELL confirmed` lines with
+   no accompanying cancel/replace for known-good multi-day positions) the
+   next time the stack runs live across a multi-day hold.
+
+   Validation:
+
+   ```bash
+   .venv/bin/python -m py_compile auto_trader.py dashboard_server.py src/engine.py src/engine_orders.py src/config.py src/ib_gateway.py tests/test_startup_init.py
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m pytest -q -p no:cacheprovider
+   ```
+
+   Results:
+
+   - `py_compile`: passed.
+   - Focused audit tests: 23 passed (21 prior + 2 new regression tests).
+   - Full suite: 381 passed.

@@ -180,9 +180,43 @@ class OrdersMixin:
         GTC orders recovered from IBKR may not have it. Orders obtained through
         reqAllOpenOrders() are not always modifiable in place by a fresh API
         session, so use cancel-and-replace before the regular session opens.
+
+        This must never fire for an order we have already confirmed live in a
+        prior audit cycle. A cancel-and-replace forces a brand-new IBKR order
+        that starts tracking its trail from whatever price prevails at
+        replacement time — it has no memory of the true multi-day high the
+        old order had already ratcheted to. Because the stop gate's date
+        stamp goes stale every single day an order is held overnight, this
+        used to fire on the first audit of every new day for every
+        multi-day position, silently resetting the "locked-in" stop toward
+        the current price (live regression: ARWR ran up to $92.68 on
+        2026-07-23-24, but a routine gate-refresh replacement on 2026-07-27
+        reset its confirmed stop to $84.69 — implying a ~$89.15 reference,
+        not the true peak). A stale/mismatched goodAfterTime on an order we
+        already know is active protects nothing further; only orders we have
+        never confirmed (new entries, freshly rebuilt stops, externally
+        placed orders) still need the gate applied here.
         """
         from src.engine_base import logger, _REJECTED_ORDER_STATUSES
         order = trade.order
+
+        pos_data = self.state.get(sym, {})
+        try:
+            confirmed_order_id = int(pos_data.get('stop_order_id'))
+        except (TypeError, ValueError):
+            confirmed_order_id = None
+        try:
+            this_order_id = int(getattr(order, 'orderId', None))
+        except (TypeError, ValueError):
+            this_order_id = None
+        if (
+            pos_data.get('protection_status') == 'confirmed'
+            and confirmed_order_id is not None
+            and this_order_id is not None
+            and confirmed_order_id == this_order_id
+        ):
+            return trade, True
+
         current_gat = str(getattr(order, 'goodAfterTime', '') or '').strip()
         if not gate_str and not current_gat:
             return trade, True
