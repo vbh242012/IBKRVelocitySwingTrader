@@ -26,6 +26,7 @@ from src.config import (
     SETTLED_CASH_DEPLOYMENT_PCT,
     ENTRY_START, ENTRY_END,
     FRIDAY_ENTRY_CUTOFF_TIME,
+    INDICATOR_SWING_ENTRIES_ENABLED,
     MAX_DAILY_LOSS_PCT,
     TRAIL_PCT, HARD_STOP_PCT,
     RISK_PER_TRADE_PCT, BEAR_PHASE_RISK_MULT, BEAR_PHASE_DOLLAR_VOL_MULT,
@@ -106,6 +107,14 @@ class VelocityEngine(
         self._metric_inc('cycles')
         if not hasattr(self, '_daily_scan_skip') or self._daily_scan_skip is None:
             self._daily_scan_skip = {}
+
+        # Cash indicator_swing has committed to fills THIS cycle but that
+        # IBKR's settled-cash figure may not have propagated yet.
+        # _scan_and_enter_bollinger_standalone() makes its own independent
+        # fresh account-values call later in the same cycle and subtracts
+        # this reserve, so the two entry paths cannot both size a position
+        # off the same not-yet-debited settled cash.
+        self._cycle_committed_cash = 0.0
 
         # 0. Ensure connection is live before doing anything
         if not self._ensure_connected():
@@ -211,6 +220,7 @@ class VelocityEngine(
             self._prefilter_date = None
             self._prefilter_status = "not_started"
             self._prefilter_candidates = []
+            self._prefilter_bollinger_candidates = []
             self._prefilter_stats = {}
             # Fix 2: After resetting prefilter state (e.g. engine restart
             # mid-day), immediately try to restore today's candidates from the
@@ -262,7 +272,8 @@ class VelocityEngine(
             profile = get_strategy_profile(STRATEGY_PROFILE)
             self._strategy_profile = profile
 
-        if now_ny.weekday() < 5 and ENTRY_START <= (now_ny.hour, now_ny.minute) <= ENTRY_END:
+        if (INDICATOR_SWING_ENTRIES_ENABLED and now_ny.weekday() < 5
+                and ENTRY_START <= (now_ny.hour, now_ny.minute) <= ENTRY_END):
             # On Fridays raise the liquidity bar to 2× to avoid holding over weekends.
             is_friday = (now_ny.weekday() == 4)
             if is_friday and (now_ny.hour, now_ny.minute) >= FRIDAY_ENTRY_CUTOFF_TIME:
@@ -278,6 +289,11 @@ class VelocityEngine(
                         "Managing existing positions only."
                     )
                 self._update_position_prices()
+                # This return is indicator_swing-specific (Friday cutoff).
+                # Bollinger re-derives its own independent Friday/VIX/regime
+                # checks, so it must still get a chance to scan this cycle
+                # rather than being silently skipped by this branch too.
+                self._scan_and_enter_bollinger_standalone()
                 return
             dol_vol_threshold = profile.min_dollar_vol * (VOL_MULT_FRIDAY if is_friday else 1.0)
 
@@ -314,17 +330,22 @@ class VelocityEngine(
                 if not self._ensure_vix_contract():
                     logger.warning("VIX contract unavailable. Skipping entries as precaution.")
                     self._update_position_prices()
+                    # indicator_swing-specific VIX gate -- see the Friday-cutoff
+                    # comment above for why Bollinger must still run this cycle.
+                    self._scan_and_enter_bollinger_standalone()
                     return
                 vix_price = self._fetch_vix_price()
                 if vix_price is None:
                     logger.warning("VIX price unavailable. Skipping entries as precaution.")
                     self._last_vix = None
                     self._update_position_prices()
+                    self._scan_and_enter_bollinger_standalone()
                     return
                 self._last_vix = vix_price
                 if vix_price > VIX_THRESHOLD:
                     logger.warning(f"VIX HIGH ({vix_price:.2f}). Risk Off — no new entries.")
                     self._update_position_prices()
+                    self._scan_and_enter_bollinger_standalone()
                     return
 
                 # Check SPY regime once per cycle — same answer for all candidates
@@ -338,6 +359,12 @@ class VelocityEngine(
                         f"REGIME: SPY trend weak/falling — no new {profile.name} entries this cycle"
                     )
                     self._update_position_prices()
+                    # indicator_swing-specific regime gate -- Bollinger makes
+                    # its own independent bear-phase determination (and
+                    # currently also declines to participate in a bear tape),
+                    # but that decision belongs to its own code, not to a
+                    # return buried inside indicator_swing's block.
+                    self._scan_and_enter_bollinger_standalone()
                     return
 
                 if bear_phase:
@@ -936,6 +963,7 @@ class VelocityEngine(
 
                         actual_order_cost = round(float(filled_qty) * float(fill_price), 2)
                         settled -= actual_order_cost
+                        self._cycle_committed_cash += actual_order_cost
                         placed  += 1
                         # Recalculate bucket for any further entries in this cycle.
                         # The first order may have used less than one full bucket
@@ -960,6 +988,12 @@ class VelocityEngine(
                         )
                         if not protection_confirmed:
                             break
+
+        # Independent, additive entry path for the standalone Bollinger
+        # mean-reversion strategy. Self-contained (re-derives its own
+        # window/VIX/regime checks), so it is safe to call here regardless
+        # of whether the indicator_swing branch above ran this cycle.
+        self._scan_and_enter_bollinger_standalone()
 
         # Refresh live prices for dashboard unrealized P&L
         self._update_position_prices()

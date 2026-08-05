@@ -238,7 +238,13 @@ def evaluate_entry_rules(
     checks: dict[str, bool] = {}
 
     price = _number(ctx, "live_price", "price", "close")
-    spread_pct = _number(ctx, "spread_pct", default=0.0)
+    # No default=0.0 override here: the live scanner sets spread_pct to
+    # float('inf') as an explicit "unavailable -> fail closed" sentinel
+    # (engine_scanner.py). Overriding to 0.0 silently turned an unknown
+    # spread into a perfect 0% spread, defeating the spread gate below.
+    # Backtest/prefilter contexts always set an explicit finite spread_pct
+    # (0.0), so they are unaffected by the NaN default.
+    spread_pct = _number(ctx, "spread_pct")
     volume = _number(ctx, "volume")
     dollar_vol = _number(ctx, "dollar_vol_20d", "avg_dollar_vol_20")
     atr_pct = _number(ctx, "atr_pct")
@@ -349,7 +355,16 @@ def evaluate_entry_rules(
     # Volume pace is already a hard gate above; counting it again here let
     # "two of five" collapse to "one of the other four" for every candidate
     # that reached this check.  Confirmations must be independent evidence.
-    confirmations = sum(bool(v) for v in (stoch_bull, macd_bull, obv_bull, psar_confirm))
+    confirmation_votes = [stoch_bull, macd_bull, obv_bull]
+    if "psar_flip" not in (profile.indicator_sleeves or ()):
+        # psar_bull_3 doubles as the psar_flip sleeve's own entry trigger
+        # (indicator_sleeve_signals()). When that sleeve is enabled, counting
+        # the same signal again here is the identical structural double-count
+        # already fixed for volume pace: "two of five" collapsing to "one of
+        # the other three." Only include it when it cannot also be the
+        # trigger, i.e. genuinely independent confirming evidence.
+        confirmation_votes.append(psar_confirm)
+    confirmations = sum(bool(v) for v in confirmation_votes)
     _check(checks, "two_indicator_confirmations", confirmations >= 2)
 
     failed = tuple(label for label, ok in checks.items() if not ok)

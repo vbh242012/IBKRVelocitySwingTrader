@@ -26,6 +26,7 @@ from src.scanner import (
     load_application_symbol_universe,
 )
 from src.strategy_profiles import evaluate_entry_rules, get_strategy_profile
+from src.bollinger_standalone import evaluate_bollinger_standalone_entry
 
 
 class ScannerMixin:
@@ -176,6 +177,9 @@ class ScannerMixin:
         self._prefilter_date = today
         self._prefilter_status = str(payload.get("status") or "complete")
         self._prefilter_candidates = self._dedupe_symbols(candidates)
+        self._prefilter_bollinger_candidates = self._dedupe_symbols(
+            payload.get("bollinger_candidates", []) or []
+        )
         self._prefilter_stats = dict(payload.get("stats") or {})
         if self._prefilter_status == "complete":
             self._last_premarket_prefilter_date = today
@@ -286,6 +290,7 @@ class ScannerMixin:
             'bb_below_lower_2': bool(last.get('BB_BELOW_LOWER_2', False)),
             'bb_above_upper_2': bool(last.get('BB_ABOVE_UPPER_2', False)),
             'bb_reclaim_lower': bool(last.get('BB_RECLAIM_LOWER', False)),
+            'bb_mid': float(last['BB_MID']) if not pd.isna(last['BB_MID']) else float('nan'),
             'psar_bull_3': bool(last.get('PSAR_BULL_3', False)),
             'psar_bear_3': bool(last.get('PSAR_BEAR_3', False)),
             'stoch_k': float(last['STOCH_K']) if not pd.isna(last['STOCH_K']) else float('nan'),
@@ -402,6 +407,20 @@ class ScannerMixin:
             if np.isnan(float(df['MA200'].iloc[-1])):
                 return False, ("invalid_MA200",), ()
             ctx = self._build_prefilter_context(df)
+
+            # Independent standalone-Bollinger check. Uses the same
+            # already-fetched daily bars/ctx (no extra IBKR calls) and is
+            # deliberately NOT gated by indicator_swing's static_failures —
+            # a beaten-down candidate that fails the trend/RS stack below is
+            # exactly what BB_RECLAIM_LOWER is meant to catch.
+            if evaluate_bollinger_standalone_entry(ctx).passed:
+                if symbol not in self._prefilter_bollinger_candidates:
+                    self._prefilter_bollinger_candidates.append(symbol)
+                self._bar_cache[symbol] = {
+                    'date': today,
+                    'bars_daily': bars_daily,
+                }
+
             static_failures = self._prefilter_static_failures(ctx, profile)
             evaluation = evaluate_entry_rules(ctx, profile)
             deferred = tuple(
@@ -430,7 +449,8 @@ class ScannerMixin:
         if cached and cached.get("status") == "complete":
             logger.info(
                 f"PREFILTER: using cached {today} universe sieve "
-                f"({len(self._prefilter_candidates)} candidates)"
+                f"({len(self._prefilter_candidates)} candidates, "
+                f"{len(self._prefilter_bollinger_candidates)} bollinger candidates)"
             )
             return cached
 
@@ -453,6 +473,11 @@ class ScannerMixin:
             reject_reasons = dict(cached.get("reject_reasons", {}) or {})
             rejections_by_symbol = dict(cached.get("rejections_by_symbol", {}) or {})
             processed_count = len(processed)
+            self._prefilter_bollinger_candidates = self._dedupe_symbols(
+                cached.get("bollinger_candidates", []) or []
+            )
+        else:
+            self._prefilter_bollinger_candidates = []
 
         self._metric_inc('prefilter_runs')
         self._prefilter_date = today
@@ -466,11 +491,15 @@ class ScannerMixin:
 
         def write_checkpoint(status: str, stopped_reason: Optional[str] = None) -> dict:
             self._prefilter_candidates = self._dedupe_symbols(candidates)
+            self._prefilter_bollinger_candidates = self._dedupe_symbols(
+                self._prefilter_bollinger_candidates
+            )
             self._prefilter_status = status
             self._prefilter_stats = {
                 'processed': processed_count,
                 'universe': len(universe),
                 'candidates': len(self._prefilter_candidates),
+                'bollinger_candidates': len(self._prefilter_bollinger_candidates),
                 'rejected': max(0, processed_count - len(self._prefilter_candidates)),
                 'reject_reasons': reject_reasons,
             }
@@ -483,6 +512,7 @@ class ScannerMixin:
                 'universe': len(universe),
                 'processed_symbols': sorted(processed),
                 'candidates': self._prefilter_candidates,
+                'bollinger_candidates': self._prefilter_bollinger_candidates,
                 'deferred_rules': deferred_by_symbol,
                 'reject_reasons': reject_reasons,
                 'rejections_by_symbol': rejections_by_symbol,
@@ -544,6 +574,7 @@ class ScannerMixin:
         logger.info(
             f"PREFILTER COMPLETE: processed={processed_count}/{len(universe)} "
             f"candidates={len(self._prefilter_candidates)} "
+            f"bollinger_candidates={len(self._prefilter_bollinger_candidates)} "
             f"rejected={self._prefilter_stats['rejected']}"
         )
         return payload
@@ -739,6 +770,7 @@ class ScannerMixin:
             'bb_below_lower_2': bool(df.get('BB_BELOW_LOWER_2', pd.Series(False, index=df.index)).iloc[-1]),
             'bb_above_upper_2': bool(df.get('BB_ABOVE_UPPER_2', pd.Series(False, index=df.index)).iloc[-1]),
             'bb_reclaim_lower': bool(df.get('BB_RECLAIM_LOWER', pd.Series(False, index=df.index)).iloc[-1]),
+            'bb_mid':           float(df['BB_MID'].iloc[-1]) if not pd.isna(df['BB_MID'].iloc[-1]) else float('nan'),
             'psar_bull_3':      bool(df.get('PSAR_BULL_3', pd.Series(False, index=df.index)).iloc[-1]),
             'psar_bear_3':      bool(df.get('PSAR_BEAR_3', pd.Series(False, index=df.index)).iloc[-1]),
             'stoch_k':          float(df.get('STOCH_K', pd.Series(float('nan'), index=df.index)).iloc[-1]),

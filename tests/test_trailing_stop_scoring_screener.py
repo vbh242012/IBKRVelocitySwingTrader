@@ -2222,6 +2222,42 @@ class TestExitOrders:
         assert ib.cancelOrder.called, "cancelOrder must be called for open bracket order"
         assert cancel_count_at_place[0] >= 1, "cancelOrder must be called BEFORE placeOrder"
 
+    def test_liquidate_does_not_cancel_foreign_clientid_order(self):
+        """
+        The cash-account pre-exit cancel loop (_cancel_open_orders_before_market_exit)
+        must skip orders it does not own (a different IB clientId) rather than
+        blindly cancelling any open order for the symbol. 2026-08-05 finding: this
+        loop previously had no ownership check at all, unlike the stop-audit path.
+        """
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+
+        owned_trade = MagicMock()
+        owned_trade.contract.symbol    = 'SYM'
+        owned_trade.order.orderType    = 'LMT'
+        owned_trade.order.clientId     = 1   # matches default IB_CLIENT_ID
+        owned_trade.order.orderId      = 111
+        owned_trade.orderStatus.status = 'Submitted'
+
+        foreign_trade = MagicMock()
+        foreign_trade.contract.symbol    = 'SYM'
+        foreign_trade.order.orderType    = 'LMT'
+        foreign_trade.order.clientId     = 99  # a different API client / manual TWS order
+        foreign_trade.order.orderId      = 222
+        foreign_trade.orderStatus.status = 'Submitted'
+
+        ib.openTrades.return_value = [owned_trade, foreign_trade]
+        ib.positions.return_value  = [self._make_position('SYM', 1.0)]
+        engine.state = {'SYM': self._make_state_entry()}
+
+        engine.liquidate('SYM')
+
+        cancelled_orders = [call.args[0] for call in ib.cancelOrder.call_args_list]
+        assert owned_trade.order in cancelled_orders, "owned order must still be cancelled"
+        assert foreign_trade.order not in cancelled_orders, \
+            "order belonging to a different clientId must not be cancelled"
+        assert ib.placeOrder.called, "market sell should still proceed"
+
     def test_liquidate_cancels_trail_stop_before_cash_account_market_sell(self):
         """Cash accounts require protective SELL cancellation before market exit."""
         ib     = _mock_ib()

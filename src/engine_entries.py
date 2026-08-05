@@ -3,7 +3,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from ib_async import IB, util
+from ib_async import IB, util, Order
 
 from src.config import (
     ACCOUNT_CURRENCY,
@@ -28,6 +28,9 @@ from src.config import (
     FRIDAY_ENTRY_CUTOFF_TIME,
     EOD_EXIT_TIME,
     TRAIL_PCT,
+    BOLLINGER_STANDALONE_ENABLED, BOLLINGER_STANDALONE_MAX_OPEN,
+    MARKET_DATA_TYPE, TICKER_BLOCKLIST,
+    ENTRY_PARENT_TIF, ENTRY_ALL_OR_NONE, PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC,
 )
 from src.scoring import score_candidate
 from src.strategy_profiles import (
@@ -35,6 +38,12 @@ from src.strategy_profiles import (
     get_strategy_profile,
     select_entry_strategy,
     indicator_sleeve_label,
+    VALID_INDICATOR_SLEEVES,
+)
+from src.bollinger_standalone import (
+    ENTRY_STRATEGY_NAME as BOLLINGER_STANDALONE_STRATEGY,
+    evaluate_bollinger_standalone_entry,
+    bollinger_standalone_rank,
 )
 
 
@@ -424,6 +433,13 @@ class EntriesMixin:
                     'peak_price':      round(avg_cost, 2),
                     'volume':          0,
                     'score':           None,
+                    # True origin is unknown for a position recovered directly
+                    # from a broker snapshot (no fill-time state). Left
+                    # unset/blank rather than assumed 'ma_cross' so downstream
+                    # per-strategy caps (e.g. BOLLINGER_STANDALONE_MAX_OPEN)
+                    # fail closed and count it as a possible Bollinger slot
+                    # instead of silently ignoring it.
+                    'entry_strategy':  'unknown_recovered',
                 }
                 logger.info(f"SYNC: Added {sym} from IBKR (qty={pos.position} avg=${avg_cost:.2f})")
                 # Positions recovered after a restart keep any surviving ledger
@@ -764,3 +780,393 @@ class EntriesMixin:
                 )
 
         return ran
+
+    # ── Standalone Bollinger reversion (additive, independent of indicator_swing) ──
+
+    def _scan_and_enter_bollinger_standalone(self):
+        """Independent entry path for the standalone Bollinger mean-reversion
+        strategy (src/bollinger_standalone.py). Deliberately self-contained:
+        re-derives its own window/account/VIX/regime checks rather than
+        depending on indicator_swing's run_cycle branch having executed this
+        cycle, so it behaves correctly whether or not that branch ran or
+        returned early this cycle.
+
+        Draws from the SAME total slot pool as indicator_swing via the
+        existing _calc_entry_allocation() -- this does not add extra
+        concurrent-position capacity to the account -- and is separately
+        capped at BOLLINGER_STANDALONE_MAX_OPEN concurrent positions.
+        """
+        from src.engine_base import logger, _TZ_NY, AccountDataUnavailable
+
+        if not BOLLINGER_STANDALONE_ENABLED:
+            return
+        if MARKET_DATA_TYPE != 1:
+            return
+
+        now_ny = datetime.now(_TZ_NY)
+        if now_ny.weekday() >= 5 or not (ENTRY_START <= (now_ny.hour, now_ny.minute) <= ENTRY_END):
+            return
+        if now_ny.weekday() == 4 and (now_ny.hour, now_ny.minute) >= FRIDAY_ENTRY_CUTOFF_TIME:
+            return
+
+        # Fail closed on the concurrency cap: count a position toward the
+        # Bollinger slot unless it is positively tagged as a *different*,
+        # known indicator_swing sleeve. A position recovered from a broker
+        # snapshot with no fill-time state (tagged 'unknown_recovered') could
+        # genuinely be an untracked Bollinger position, so it must count too
+        # -- otherwise a second, uncapped Bollinger position could open
+        # alongside it.
+        known_non_bollinger_strategies = set(VALID_INDICATOR_SLEEVES) | {STRATEGY_PROFILE}
+        open_count = sum(
+            1 for pos in self.state.values()
+            if str(pos.get('entry_strategy') or '').strip().lower() not in known_non_bollinger_strategies
+        )
+        if open_count >= BOLLINGER_STANDALONE_MAX_OPEN:
+            return
+
+        candidates = [
+            s for s in (getattr(self, '_prefilter_bollinger_candidates', None) or [])
+            if s not in self.state and s not in TICKER_BLOCKLIST
+        ]
+        if not candidates:
+            return
+
+        try:
+            equity, settled = self._get_account_values()
+        except AccountDataUnavailable:
+            return
+
+        # A same-cycle indicator_swing fill may not have propagated into
+        # IBKR's settled-cash figure yet; subtract what indicator_swing has
+        # already committed this cycle so both entry paths cannot size a
+        # position off the same not-yet-debited cash.
+        settled = max(0.0, settled - float(getattr(self, '_cycle_committed_cash', 0.0) or 0.0))
+
+        allocation = self._calc_entry_allocation(equity, settled, len(self.state))
+        slots = int(allocation['entry_slots'])
+        bucket_size = float(allocation['bucket_size'])
+        if slots <= 0 or bucket_size <= 0:
+            return
+
+        if not self._ensure_vix_contract():
+            return
+        vix_price = self._fetch_vix_price()
+        if vix_price is None or vix_price > VIX_THRESHOLD:
+            return
+
+        if not self._fetch_spy_trend():
+            # Bear-phase tape: standalone Bollinger does not participate,
+            # matching indicator_swing's default (allow_bear_phase_entries=False).
+            return
+
+        # Same book-concentration guards indicator_swing applies before
+        # ranking candidates -- a mean-reversion sleeve is not exempt from
+        # correlation/sector concentration risk just because its entry
+        # signal is different, and it draws from the same slot pool.
+        book_sectors: dict = {}
+        for book_sym in self.state:
+            if book_sym in self._contract_cache:
+                s = self._get_sector(book_sym, self._contract_cache[book_sym])
+                book_sectors[s] = book_sectors.get(s, 0) + 1
+
+        best_sym = None
+        best_ctx = None
+        best_rank = float('-inf')
+        for sym in candidates:
+            ctx = self.get_technical_context(sym)
+            if not ctx:
+                continue
+            evaluation = evaluate_bollinger_standalone_entry(ctx)
+            if not evaluation.passed:
+                continue
+
+            df_daily = ctx.get('df_daily')
+            if df_daily is not None and self.state:
+                max_corr = self._compute_book_correlation(sym, df_daily)
+                if max_corr > CORR_MAX:
+                    logger.debug(
+                        f"BOLLINGER SCAN {sym}: SKIP — correlation {max_corr:.2f} > {CORR_MAX} with book"
+                    )
+                    continue
+            sector = self._get_sector(sym, ctx['contract'])
+            if book_sectors.get(sector, 0) >= MAX_SECTOR_COUNT:
+                logger.debug(
+                    f"BOLLINGER SCAN {sym}: SKIP — sector '{sector}' already has "
+                    f"{book_sectors[sector]}/{MAX_SECTOR_COUNT} positions"
+                )
+                continue
+
+            rank = bollinger_standalone_rank(ctx)
+            if rank > best_rank:
+                best_rank = rank
+                best_ctx = ctx
+                best_sym = sym
+
+        if best_sym is None:
+            return
+
+        logger.info(
+            f"BOLLINGER SCAN: {len(candidates)} prefilter candidates, "
+            f"best={best_sym} rank={best_rank:.4f}"
+        )
+        self._place_bollinger_standalone_order(best_sym, best_ctx, bucket_size, settled)
+
+    def _place_bollinger_standalone_order(
+        self, sym: str, ctx: dict, bucket_size: float, settled: float,
+    ):
+        """BUY -> confirm fill -> standalone TRAIL for a Bollinger candidate.
+
+        Mirrors run_cycle()'s indicator_swing order sequence (same helper
+        calls: _preflight_order, _confirm_protective_stop,
+        _mark_position_protection, _audit_stop_orders) but is kept as an
+        isolated, purpose-built routine for this one strategy rather than a
+        shared refactor of the existing multi-candidate ranked loop --
+        avoids any risk of regressing the already-live, already-hardened
+        indicator_swing order-placement code.
+        """
+        from src.engine_base import logger, _TZ_NY, _REJECTED_ORDER_STATUSES
+
+        price = ctx.get('live_price')
+        quote_bid = ctx.get('bid')
+        quote_ask = ctx.get('ask')
+        if price is None or not np.isfinite(price) or price <= 0:
+            logger.warning(f"BOLLINGER SKIP {sym}: invalid price")
+            return
+
+        # Re-fetch price/bid/ask if the scan snapshot is stale -- scanning the
+        # full prefilter candidate list can take time, and CLAUDE.md requires
+        # stale scan prices to be re-fetched before order placement (mirrors
+        # the same reprice/drift guard indicator_swing applies in engine.py).
+        fetched_at = ctx.get('price_fetched_at', datetime.now(_TZ_NY))
+        age_s = (datetime.now(_TZ_NY) - fetched_at).total_seconds()
+        if age_s > ENTRY_REPRICE_MAX_AGE_SEC:
+            try:
+                t2 = self.ib.reqTickers(ctx['contract'])[0]
+                new_price = t2.marketPrice()
+                if pd.isna(new_price):
+                    new_price = t2.last
+                if pd.isna(new_price):
+                    new_price = t2.close
+                new_price = self._coerce_positive_price(new_price)
+                new_bid = self._coerce_positive_price(getattr(t2, 'bid', None))
+                new_ask = self._coerce_positive_price(getattr(t2, 'ask', None))
+            except Exception:
+                logger.warning(f"BOLLINGER SKIP {sym}: stale scan price and live reprice failed")
+                return
+            if new_price is None or new_bid is None or new_ask is None:
+                logger.warning(f"BOLLINGER SKIP {sym}: stale scan price or bid/ask unavailable for reprice")
+                return
+            drift = abs(float(new_price) - float(price)) / float(price)
+            if drift > ENTRY_MAX_PRICE_DRIFT_PCT:
+                logger.warning(
+                    f"BOLLINGER SKIP {sym}: scan-to-order price drift "
+                    f"{drift*100:.2f}% exceeds {ENTRY_MAX_PRICE_DRIFT_PCT*100:.1f}% cap"
+                )
+                return
+            spread_pct = (
+                (new_ask - new_bid) / ((new_bid + new_ask) / 2)
+                if (new_bid + new_ask) > 0 else float('inf')
+            )
+            refreshed_ctx = dict(ctx)
+            refreshed_ctx['live_price'] = new_price
+            refreshed_ctx['close'] = new_price
+            refreshed_ctx['spread_pct'] = spread_pct
+            evaluation = evaluate_bollinger_standalone_entry(refreshed_ctx)
+            if not evaluation.passed:
+                logger.warning(
+                    f"BOLLINGER SKIP {sym}: refreshed price no longer passes "
+                    f"standalone setup ({list(evaluation.failed)})"
+                )
+                return
+            price = new_price
+            quote_bid = new_bid
+            quote_ask = new_ask
+            logger.debug(
+                f"BOLLINGER REPRICE {sym}: ${ctx['live_price']:.2f} -> ${price:.2f} "
+                f"bid=${quote_bid:.2f} ask=${quote_ask:.2f}"
+            )
+
+        limit_price = self._calc_entry_limit_price(price, quote_bid, quote_ask)
+        if limit_price is None:
+            logger.warning(
+                f"BOLLINGER SKIP {sym}: unusable bid/ask for entry limit "
+                f"(price={price}, bid={quote_bid}, ask={quote_ask})"
+            )
+            return
+
+        qty = int(bucket_size / limit_price)
+        if qty < 1:
+            logger.warning(
+                f"BOLLINGER SKIP {sym}: no whole-share size "
+                f"(bucket=${bucket_size:.2f}, limit=${limit_price:.2f})"
+            )
+            return
+
+        order_cost = round(qty * limit_price, 2)
+        if settled < order_cost:
+            logger.warning(
+                f"BOLLINGER SKIP {sym}: insufficient settled cash "
+                f"(need ${order_cost:.2f}, have ${settled:.2f})"
+            )
+            return
+
+        gat_str = self._entry_good_after_time()
+        buy_order               = Order()
+        buy_order.action        = 'BUY'
+        buy_order.orderType     = 'LMT'
+        buy_order.totalQuantity = qty
+        buy_order.lmtPrice      = limit_price
+        buy_order.tif           = ENTRY_PARENT_TIF
+        buy_order.allOrNone     = ENTRY_ALL_OR_NONE
+        buy_order.goodAfterTime = gat_str
+        buy_order.transmit      = True
+
+        if not self._preflight_order(ctx['contract'], buy_order, sym):
+            logger.warning(f"BOLLINGER SKIP {sym}: BUY LMT pre-flight rejected by IB")
+            return
+
+        parent_trade = self.ib.placeOrder(ctx['contract'], buy_order)
+        for _ in self.ib.loopUntil(parent_trade.isDone, timeout=30):
+            pass
+        status = parent_trade.orderStatus.status
+        filled = parent_trade.orderStatus.filled
+        logger.info(f"BOLLINGER ORDER STATUS: {sym} -> {status} (filled={filled})")
+
+        try:
+            filled_qty = float(filled or 0)
+        except (TypeError, ValueError):
+            filled_qty = float(qty) if status == 'Filled' else 0.0
+
+        if status != 'Filled' or filled_qty <= 0:
+            logger.warning(
+                f"BOLLINGER ORDER NOT FILLED: {sym} status={status} filled={filled_qty} "
+                f"qty={qty} limit=${limit_price:.2f}. Cancelling BUY."
+            )
+            try:
+                self.ib.cancelOrder(parent_trade.order)
+            except Exception:
+                pass
+            self.ib.sleep(1)
+            self._sync_positions_from_ibkr()
+            if sym in self.state:
+                self._audit_stop_orders()
+            return
+
+        fill_price = self._coerce_positive_price(parent_trade.orderStatus.avgFillPrice) or limit_price
+        trail_dist = round(limit_price * TRAIL_PCT, 2)
+
+        self.state[sym] = {
+            'fill_price':       fill_price,
+            'price':            fill_price,
+            'entry_order_id':   parent_trade.order.orderId,
+            'time':             datetime.now(_TZ_NY).isoformat(),
+            'qty':              filled_qty,
+            'entry_qty':        filled_qty,
+            'entry_risk_per_share': trail_dist,
+            'initial_stop_loss': round(fill_price - trail_dist, 4),
+            'stop_loss':        round(fill_price - trail_dist, 2),
+            'stop_dist':        trail_dist,
+            'stop_mode':        'percent',
+            'trailing_percent': round(TRAIL_PCT * 100, 4),
+            'peak_price':       fill_price,
+            'volume':           ctx.get('volume', 0),
+            'score':            None,
+            'regime':           'bull',
+            'strategy_profile': BOLLINGER_STANDALONE_STRATEGY,
+            'entry_strategy':   BOLLINGER_STANDALONE_STRATEGY,
+            'entry_strategy_label': 'Bollinger Reversion (standalone)',
+            'day_open':         ctx.get('day_open'),
+            'day_high':         ctx.get('day_high'),
+            'day_low':          ctx.get('day_low'),
+            'protection_status': 'pending',
+            'protection_reason': 'awaiting_trail_stop_confirmation',
+        }
+        if parent_trade.fills:
+            cr = parent_trade.fills[0].commissionReport
+            if cr and not np.isnan(cr.commission) and cr.commission > 0:
+                self.state[sym]['commission'] = round(float(cr.commission), 4)
+        self.save_state()
+        self._ledger_call('open_trade', sym, {
+            **self.state[sym],
+            'spread_pct': ctx.get('spread_pct'),
+        })
+
+        # Standalone protective TRAIL, placed AFTER the position is confirmed
+        # in IBKR's books -- same reasoning/sequence as indicator_swing
+        # (attaching as a bracket child is rejected in cash accounts because
+        # IBKR evaluates the child SELL before the parent BUY settles long).
+        stop_order                 = Order()
+        stop_order.action          = 'SELL'
+        stop_order.orderType       = 'TRAIL'
+        stop_order.totalQuantity   = filled_qty
+        stop_order.trailingPercent = round(TRAIL_PCT * 100, 2)
+        stop_order.tif             = 'GTC'
+        stop_order.goodAfterTime   = self._stop_good_after_time()
+        stop_order.transmit        = True
+
+        stop_placed = False
+        stop_trade = None
+        audit_ran = False
+        if self._preflight_order(
+            ctx['contract'], stop_order, sym, allow_protective_sell_fail_open=True,
+        ):
+            stop_trade = self.ib.placeOrder(ctx['contract'], stop_order)
+            self.ib.sleep(2)
+            stop_status = getattr(stop_trade.orderStatus, 'status', '')
+            if stop_status in _REJECTED_ORDER_STATUSES:
+                self._metric_inc('protective_stop_rejected')
+                logger.error(
+                    f"BOLLINGER STOP REJECTED: {sym} TRAIL status={stop_status}. "
+                    "Running immediate stop audit."
+                )
+                self._audit_stop_orders()
+                audit_ran = True
+            else:
+                stop_placed = True
+        else:
+            logger.warning(
+                f"BOLLINGER STOP PREFLIGHT FAILED: {sym} — running audit to place protection."
+            )
+            self._audit_stop_orders()
+            audit_ran = True
+
+        protection_confirmed = False
+        if stop_placed and not audit_ran:
+            protection_confirmed = self._confirm_protective_stop(
+                sym, filled_qty, known_trade=stop_trade, expected_order=stop_order,
+            )
+        if not protection_confirmed:
+            if not audit_ran:
+                logger.warning(
+                    f"BOLLINGER STOP CONFIRM: {sym} protective TRAIL not visible yet; "
+                    "running immediate stop audit."
+                )
+                self._audit_stop_orders()
+                audit_ran = True
+            protection_confirmed = self._confirm_protective_stop(
+                sym, filled_qty, timeout=PROTECTIVE_STOP_CONFIRM_TIMEOUT_SEC,
+            )
+
+        if protection_confirmed:
+            self._mark_position_protection(
+                sym, 'confirmed',
+                order_id=getattr(getattr(stop_trade, 'order', None), 'orderId', None)
+                if stop_trade is not None else None,
+            )
+        else:
+            self._mark_position_protection(
+                sym, 'unconfirmed', 'protective_stop_confirmation_timeout',
+            )
+            self._alert(
+                "CRITICAL",
+                f"BOLLINGER STOP UNCONFIRMED: {sym} BUY filled qty={filled_qty:g}, "
+                "but no valid TRAIL SELL was confirmed after audit.",
+            )
+
+        logger.info(
+            f"BOLLINGER ORDER CONFIRMED: {sym} Qty={filled_qty:g} Limit=${limit_price:.2f} "
+            f"FillPrice=${fill_price:.2f} "
+            f"TrailStop=${round(fill_price * (1 - TRAIL_PCT), 2):.2f} "
+            f"(trail_pct={TRAIL_PCT*100:.1f}%) "
+            f"Protection={'confirmed' if protection_confirmed else 'UNCONFIRMED'}"
+        )

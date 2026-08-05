@@ -417,6 +417,34 @@ class TestPositionLimit:
         mock_vix_price.assert_not_called()
         mock_scan.assert_not_called()
 
+    def test_indicator_swing_entries_disabled_skips_ma_cross_but_keeps_bollinger(self):
+        """INDICATOR_SWING_ENTRIES_ENABLED=False stops new ma_cross scanning/
+        entries while existing-position management and the independent
+        Bollinger standalone entry path both keep running normally."""
+        ib = _mock_ib()
+        engine = _make_engine_patched(ib)
+
+        tz_ny = pytz.timezone('US/Eastern')
+        fake_now = tz_ny.localize(datetime(2024, 6, 5, 10, 30))
+
+        with patch('src.engine.INDICATOR_SWING_ENTRIES_ENABLED', False), \
+             patch.object(engine, '_maybe_run_off_hours_jobs', return_value=False), \
+             patch.object(engine, 'manage_position_exits') as mock_exits, \
+             patch.object(engine, '_ensure_vix_contract') as mock_vix_contract, \
+             patch.object(engine, 'get_institutional_scan') as mock_scan, \
+             patch.object(engine, '_scan_and_enter_bollinger_standalone') as mock_bollinger, \
+             patch.object(engine, '_update_position_prices'), \
+             patch('src.engine.datetime') as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+
+            engine.run_cycle()
+
+        mock_exits.assert_called_once()
+        mock_vix_contract.assert_not_called()
+        mock_scan.assert_not_called()
+        mock_bollinger.assert_called_once()
+
 
 # ── State persistence ─────────────────────────────────────────────────────────
 class TestStatePersistence:

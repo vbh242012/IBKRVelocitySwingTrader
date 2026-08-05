@@ -261,8 +261,8 @@ class TradeLedger:
         mfe = _finite(rec.get('mfe_price'))
         mae = _finite(rec.get('mae_price'))
         if entry_px > 0:
-            rec['mfe_pct'] = round((mfe - entry_px) / entry_px * 100, 3) if mfe else None
-            rec['mae_pct'] = round((mae - entry_px) / entry_px * 100, 3) if mae else None
+            rec['mfe_pct'] = round((mfe - entry_px) / entry_px * 100, 3) if mfe is not None else None
+            rec['mae_pct'] = round((mae - entry_px) / entry_px * 100, 3) if mae is not None else None
         rec['trading_days_held'] = _trading_days_between(
             rec.get('entry_time'), rec['exit_time']
         )

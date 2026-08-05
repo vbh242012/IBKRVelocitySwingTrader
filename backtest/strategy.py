@@ -73,6 +73,18 @@ _NASDAQ_LISTED_URL = 'https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.t
 _OTHER_LISTED_URL  = 'https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt'
 _CACHE_DIR         = os.path.join(os.path.dirname(__file__), ".cache")
 _DEFAULT_ROUND_TRIP_COST = BACKTEST_COMMISSION_PER_ORDER * 2
+# Applied both to entry fills (raw_entry * (1 + SLIPPAGE)) and to non-gap
+# stop-market exit fills (effective_stop * (1 - SLIPPAGE)). Only entries
+# carried this previously; a clean stop touch (no gap through) filled at
+# exactly effective_stop with zero slippage, asymmetric with the explicit
+# entry-side cost and optimistic for the dominant trail/hard-stop exit
+# reasons.
+_ENTRY_EXIT_SLIPPAGE = 0.001
+# Force-close a position whose symbol data goes missing (delisting, feed
+# gap) mid-backtest once the gap persists this many consecutive sessions,
+# rather than leaving it frozen until the run's final stale-price close.
+# Matches the default swing time-stop's bar count as a reasonable analog.
+_DATA_GAP_FORCE_CLOSE_DAYS = 10
 _CACHE_VERSION = "v7_indicator_swing"
 _CACHE_COMPATIBLE_VERSIONS = {
     _CACHE_VERSION,
@@ -356,6 +368,10 @@ class VelocityBacktest:
             'min_volume': self._min_volume,
             'min_dollar_vol': self._min_dollar_vol,
             'max_symbols': self._max_symbols,
+            # The bounded-run ticker sample is shuffled with a seed derived
+            # from `start` (see _download()); record it so a superset-cache
+            # reuse can be refused when the seed would differ.
+            'start': self.start,
         }
 
     def _cache_data_covers_request(self, data: Dict[str, pd.DataFrame]) -> bool:
@@ -429,15 +445,17 @@ class VelocityBacktest:
                 fixed["OBV"] = pd.Series(signed_volume, index=fixed.index).cumsum()
                 fixed["OBV_SLOPE_5"] = fixed["OBV"] - fixed["OBV"].shift(5)
             if "reclaim_ma20" not in fixed.columns:
-                fixed["reclaim_ma20"] = (fixed["prev_close"] <= fixed["MA20"].shift(1)) & (fixed["close"] > fixed["MA20"])
+                # Same MA20 value on both sides, matching live and the primary
+                # _download() computation -- see the comment there.
+                fixed["reclaim_ma20"] = (fixed["prev_close"] <= fixed["MA20"]) & (fixed["close"] > fixed["MA20"])
             if "reclaim_ma50" not in fixed.columns:
-                fixed["reclaim_ma50"] = (fixed["prev_close"] <= fixed["MA50"].shift(1)) & (fixed["close"] > fixed["MA50"])
+                fixed["reclaim_ma50"] = (fixed["prev_close"] <= fixed["MA50"]) & (fixed["close"] > fixed["MA50"])
             if "break_prev_high" not in fixed.columns:
                 fixed["break_prev_high"] = fixed["close"] > fixed["prev_high"]
             if "avg_vol_20" not in fixed.columns:
-                fixed["avg_vol_20"] = fixed["volume"].rolling(20).mean()
+                fixed["avg_vol_20"] = fixed["volume"].rolling(20).mean().shift(1)
             if "avg_dollar_vol_20" not in fixed.columns:
-                fixed["avg_dollar_vol_20"] = (fixed["close"] * fixed["volume"]).rolling(20).mean()
+                fixed["avg_dollar_vol_20"] = (fixed["close"] * fixed["volume"]).rolling(20).mean().shift(1)
             if "return_13w" not in fixed.columns:
                 fixed["return_13w"] = fixed["close"] / fixed["close"].shift(63) - 1
             if "return_26w" not in fixed.columns:
@@ -482,6 +500,16 @@ class VelocityBacktest:
                 max_symbols == int(self._max_symbols)
                 or (self._max_symbols > 0 and len(data) <= self._max_symbols)
             )
+            if self._max_symbols > 0:
+                # A bounded run's N-symbol sample depends on a seed derived
+                # from `start` (_download()'s stable_seed), then truncated.
+                # Two runs with different `start` produce different samples
+                # even when data_start/end both satisfy the superset range
+                # check below, so a bounded run must match `start` exactly --
+                # otherwise this could silently reuse a completely different
+                # ticker sample with no indication in the output.
+                if str(meta.get('start') or '') != str(self.start):
+                    return False
             return (
                 str(meta.get('version')) in _CACHE_COMPATIBLE_VERSIONS
                 and symbol_cap_ok
@@ -807,14 +835,23 @@ class VelocityBacktest:
                 signed_volume = np.where(df['close'].diff() >= 0, df['volume'], -df['volume'])
                 df['OBV']               = pd.Series(signed_volume, index=df.index).cumsum()
                 df['OBV_SLOPE_5']       = df['OBV'] - df['OBV'].shift(5)
-                prev_ma20 = df['MA20'].shift(1)
-                prev_ma50 = df['MA50'].shift(1)
-                df['reclaim_ma20']      = (df['prev_close'] <= prev_ma20) & (df['close'] > df['MA20'])
-                df['reclaim_ma50']      = (df['prev_close'] <= prev_ma50) & (df['close'] > df['MA50'])
+                # Use the SAME MA20/MA50 value for both the prev-below and
+                # today-above clauses, matching live (engine_scanner.py),
+                # which only ever knows one point-in-time completed MA value
+                # per day and cannot distinguish "yesterday's MA" from
+                # "today's MA" the way a shifted backtest column could.
+                df['reclaim_ma20']      = (df['prev_close'] <= df['MA20']) & (df['close'] > df['MA20'])
+                df['reclaim_ma50']      = (df['prev_close'] <= df['MA50']) & (df['close'] > df['MA50'])
                 df['break_prev_high']   = df['close'] > df['prev_high']
-                df['avg_vol_20']        = df['volume'].rolling(20).mean()
+                # shift(1): must exclude today's own volume/dollar-volume from
+                # its own 20-day liquidity average, matching live, which always
+                # computes this average over completed_daily_bars() with
+                # today's bar already stripped. Without the shift, every
+                # backtested day's liquidity gate and volume-pace score were
+                # measured including that day's own volume.
+                df['avg_vol_20']        = df['volume'].rolling(20).mean().shift(1)
                 df['avg_dollar_vol_20'] = (
-                    (df['close'] * df['volume']).rolling(20).mean()
+                    (df['close'] * df['volume']).rolling(20).mean().shift(1)
                 )
                 df['return_13w']        = df['close'] / df['close'].shift(63) - 1
                 df['return_26w']        = df['close'] / df['close'].shift(126) - 1
@@ -967,7 +1004,18 @@ class VelocityBacktest:
         return self._vix_series.iloc[src_idx]
 
     @staticmethod
-    def _series_return(series: Optional[pd.Series], today, bars_back: int) -> float:
+    def _series_return(series: Optional[pd.Series], today, bars_back: int, lag: int = 0) -> float:
+        """Return series' pct change over `bars_back` bars ending `lag` bars before `today`.
+
+        lag=0 (default, used for everything except SPY relative-strength) is
+        self-inclusive: the return runs through today's own value. Live
+        anchors SPY relative-strength to the last COMPLETED close while the
+        stock side uses the live/intraday price -- backtest has no such
+        distinction (both sides are simply "today's close"), so SPY callers
+        pass lag=1 to reproduce that same one-bar asymmetry instead of
+        comparing the stock's return through today against SPY's return also
+        through today.
+        """
         if series is None or today not in series.index:
             return np.nan
         try:
@@ -977,10 +1025,11 @@ class VelocityBacktest:
             elif isinstance(loc, np.ndarray):
                 locs = np.flatnonzero(loc)
                 loc = int(locs[0]) if len(locs) else -1
-            src = int(loc) - int(bars_back)
-            if src < 0:
+            loc = int(loc) - int(lag)
+            src = loc - int(bars_back)
+            if src < 0 or loc < 0:
                 return np.nan
-            cur = float(series.iloc[int(loc)])
+            cur = float(series.iloc[loc])
             ref = float(series.iloc[src])
         except Exception:
             return np.nan
@@ -1033,8 +1082,8 @@ class VelocityBacktest:
             rvol = row['volume'] / avg_vol
 
             self._filter_stats['coarse_candidates'] += 1
-            spy_ret_63d = self._series_return(self._spy_close, today, 63)
-            spy_ret_126d = self._series_return(self._spy_close, today, 126)
+            spy_ret_63d = self._series_return(self._spy_close, today, 63, lag=1)
+            spy_ret_126d = self._series_return(self._spy_close, today, 126, lag=1)
             try:
                 return_13w = float(row.get('return_13w', np.nan))
             except (TypeError, ValueError):
@@ -1247,7 +1296,7 @@ class VelocityBacktest:
         bar_open = float(row['open'])
         if bar_open <= effective_stop:
             return round(bar_open, 4)
-        return round(effective_stop, 4)
+        return round(effective_stop * (1 - _ENTRY_EXIT_SLIPPAGE), 4)
 
     def _spy_return_for_date(self, today) -> float:
         if self._spy_return is None:
@@ -1485,8 +1534,32 @@ class VelocityBacktest:
                 t  = open_positions[sym]
                 df = self._data.get(sym)
                 if df is None or today not in df.index:
+                    # A genuine mid-backtest data gap (delisting, feed outage)
+                    # would otherwise leave this position frozen indefinitely
+                    # -- no peak update, no stop check, no time-stop progress
+                    # -- locking its slot and only getting force-closed at a
+                    # stale price at the very end of the whole run. Force-
+                    # close once the gap persists beyond a swing-time-stop's
+                    # worth of sessions, so capital is freed rather than
+                    # parked on data that never returns.
+                    stale_days = t.__dict__.get('_stale_data_days', 0) + 1
+                    t.__dict__['_stale_data_days'] = stale_days
+                    if stale_days >= _DATA_GAP_FORCE_CLOSE_DAYS:
+                        t.exit_date   = today.date() if hasattr(today, 'date') else today
+                        t.exit_price  = float(t.__dict__.get('_last_close', t.entry_price))
+                        t.exit_reason = "data_gap_force_close"
+                        self._set_final_exit_commission(t)
+                        sale_proceeds = t.exit_price * t.qty - t.round_trip_commission
+                        settle_date = next_trading_session(today)
+                        pending_settlements[settle_date] = (
+                            pending_settlements.get(settle_date, 0.0) + sale_proceeds
+                        )
+                        self._filter_stats['total_commissions'] += t.round_trip_commission
+                        trades.append(t)
+                        del open_positions[sym]
                     continue
 
+                t.__dict__['_stale_data_days'] = 0
                 row = df.loc[today]
                 t.__dict__['_last_close'] = float(row['close'])
 
@@ -1641,8 +1714,8 @@ class VelocityBacktest:
 
                     row      = df.loc[today].copy()
                     prev_rsi = float(df.iloc[idx - 1]['RSI'])
-                    spy_ret_63d = self._series_return(self._spy_close, today, 63)
-                    spy_ret_126d = self._series_return(self._spy_close, today, 126)
+                    spy_ret_63d = self._series_return(self._spy_close, today, 63, lag=1)
+                    spy_ret_126d = self._series_return(self._spy_close, today, 126, lag=1)
                     try:
                         return_13w = float(row.get('return_13w', np.nan))
                     except (TypeError, ValueError):
@@ -1681,7 +1754,7 @@ class VelocityBacktest:
                         raw_entry = max(float(row['open']), float(row['close']))
                         if raw_entry < self._min_price:
                             continue
-                        entry_price = round(raw_entry * 1.001, 4)
+                        entry_price = round(raw_entry * (1 + _ENTRY_EXIT_SLIPPAGE), 4)
 
                         # Percent-trail position sizing: stop = entry × TRAIL_PCT
                         chand_dist      = round(entry_price * self._trail_pct, 2)
@@ -1711,7 +1784,17 @@ class VelocityBacktest:
                             round_trip_commission = self._round_trip_cost,
                         )
                         t.__dict__['_trail_pct']  = self._trail_pct
-                        t.__dict__['_peak_high']  = entry_price
+                        # Seed with the entry day's own high, not just
+                        # entry_price. The exit-check loop already ran for
+                        # `today` before this entry block executes, so
+                        # without this a freshly-opened position's peak
+                        # wouldn't start accumulating until the following
+                        # day's exit-check loop -- permanently understating
+                        # the trailing-stop protection level for any trade
+                        # that ran hard on its own entry day, unlike live's
+                        # broker-side TRAIL, which begins tracking the peak
+                        # immediately from fill time.
+                        t.__dict__['_peak_high']  = max(entry_price, float(row['high']))
                         t.__dict__['_last_close'] = entry_price
                         t.__dict__['_bars_held']  = 0
                         t.__dict__['_regime']     = 'bear' if bear_phase else 'bull'
@@ -1720,10 +1803,6 @@ class VelocityBacktest:
                         t.__dict__['_initial_stop_loss'] = entry_price - float(risk_stop_dist)
                         t.__dict__['_entry_commission_total'] = self._round_trip_cost / 2.0
                         t.__dict__['_sell_commission_per_exit'] = self._round_trip_cost / 2.0
-                        # A daily close-fill is modeled after the live EOD audit
-                        # point.  Auditing it against the same close would make
-                        # carry impossible because entry includes slippage.
-                        t.__dict__['_skip_entry_day_eod'] = True
                         rating_ctx = self._analyst_context(sym, today)
                         t.__dict__['_analyst_rating_score'] = rating_ctx.get('analyst_rating_score', 0.0)
                         t.__dict__['_analyst_rating_total'] = rating_ctx.get('analyst_rating_total', 0)
@@ -1734,40 +1813,20 @@ class VelocityBacktest:
                         else:
                             self._filter_stats['bull_phase_entries'] += 1
 
-            # Daily-bar approximation of the live 15:50 ET EOD quality cleanup.
-            # Daily data only has the final close, so apply the same carry
-            # quality rule after all same-day entries have been selected. This
-            # does not free same-day buying power because sale proceeds settle
-            # on the next trading session.
-            if self._profile.eod_quality_cleanup:
-                today_date = today.date() if hasattr(today, 'date') else today
-                for sym in list(open_positions.keys()):
-                    t = open_positions[sym]
-                    if t.entry_date != today_date or t.__dict__.get('_bars_held', 0) != 0:
-                        continue
-                    if t.__dict__.get('_skip_entry_day_eod', False):
-                        continue
-                    df = self._data.get(sym)
-                    if df is None or today not in df.index:
-                        continue
-                    row = df.loc[today]
-                    close_px = float(row['close'])
-                    t.__dict__['_last_close'] = close_px
-                    if self._eod_quality_hold_passes(row, t, today):
-                        continue
-
-                    t.exit_date   = today_date
-                    t.exit_price  = close_px
-                    t.exit_reason = "eod_profit_cleanup"
-                    self._set_final_exit_commission(t)
-                    sale_proceeds = t.exit_price * t.qty - t.round_trip_commission
-                    settle_date = next_trading_session(today)
-                    pending_settlements[settle_date] = (
-                        pending_settlements.get(settle_date, 0.0) + sale_proceeds
-                    )
-                    self._filter_stats['total_commissions'] += t.round_trip_commission
-                    trades.append(t)
-                    del open_positions[sym]
+            # Same-day EOD quality cleanup is intentionally NOT applied to a
+            # position's own entry day (previously implemented as a
+            # `_skip_entry_day_eod` flag that was set unconditionally on
+            # every trade and never cleared -- i.e. dead code that always
+            # skipped, so it is removed here rather than kept as a loop that
+            # can never do anything else). entry_price includes 0.1%
+            # slippage on top of that same day's own max(open, close), so
+            # close_px <= entry_price -- and therefore profit_pct < 0 -- is
+            # mathematically guaranteed for a fresh entry regardless of how
+            # strong the actual price action was; comparing a same-day close
+            # against a slippage-inflated same-day reference price is not a
+            # genuine quality signal. Same-day entries first become eligible
+            # for EOD cleanup on the following session, via the main
+            # exit-check loop above.
 
             if past_start:
                 equity_curve[today] = mark_to_market(today)

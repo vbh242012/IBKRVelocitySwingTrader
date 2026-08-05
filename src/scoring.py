@@ -74,7 +74,11 @@ def analyst_rating_adjustment(ctx: Mapping) -> float:
         raw = max(-1.0, min(1.0, _finite_float(ctx.get("analyst_rating_score"), 0.0)))
     total = _finite_float(ctx.get("analyst_rating_total"), 0.0)
     min_analysts = max(float(ANALYST_RATING_MIN_ANALYSTS), 1.0)
-    confidence = max(0.0, min(total / min_analysts, 1.0)) if total > 0 else 1.0
+    # No special-case for total<=0: the formula already yields 0.0 confidence
+    # there. The prior `else 1.0` granted FULL confidence when the analyst
+    # count was missing/zero -- inverted from analyst_ratings.py's sibling
+    # `confidence` property, which correctly returns 0.0 in that case.
+    confidence = max(0.0, min(total / min_analysts, 1.0))
     return raw * confidence * float(ANALYST_RATING_SCORE_WEIGHT)
 
 

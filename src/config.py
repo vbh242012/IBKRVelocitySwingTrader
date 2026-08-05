@@ -441,6 +441,47 @@ DATA_BLACKOUT_RATIO_THRESHOLD = float(os.getenv("VELOCITY_DATA_BLACKOUT_RATIO_TH
 DATA_BLACKOUT_MIN_CANDIDATES = int(os.getenv("VELOCITY_DATA_BLACKOUT_MIN_CANDIDATES", "5"))
 DATA_BLACKOUT_STREAK_ALERT = int(os.getenv("VELOCITY_DATA_BLACKOUT_STREAK_ALERT", "2"))
 
+# ── Standalone Bollinger reversion strategy (research: 2026-07-30 session) ───
+# Distinct from the indicator_swing "bollinger_reversion" sleeve (which still
+# requires the full trend/RS gate stack and uses the standard percent trail
+# as its only real exit). This is an ungated mean-reversion strategy: entry on
+# BB_RECLAIM_LOWER alone (no trend/RS requirement), exit on midline reclaim /
+# a tighter hard stop / a short time-stop. Walk-forward validated across 4
+# out-of-sample 6-month folds (2024-07 to 2026-07) after a position-
+# concentration bug was found and fixed (a 10% cap on position size, applied
+# here as a 1-concurrent-position limit sized through the existing bucket
+# formula instead, since a literal 10%-of-equity dollar cap doesn't reconcile
+# with this account's ~$500 MIN_BUCKET_SIZE scale). The 5%/7-day parameter
+# choice carries a disclosed hindsight-bias risk: it was found by mining the
+# same out-of-sample folds it was tested on, not from an independent blind
+# test. Default OFF — requires explicit opt-in.
+# Kill switch for NEW indicator_swing (ma_cross) entries only. Default is on
+# (unchanged historical behavior). Existing indicator_swing positions keep
+# being managed/exited normally via manage_position_exits() and the stop-audit
+# machinery regardless of this flag -- it only gates the entry-window scan/
+# order-placement block in engine.py, not position management. Added
+# 2026-08-05 after a full-universe 2020-2026 backtest of the current
+# (post confirmation-rule-fix) entry logic showed a structurally negative
+# edge (-50.35% total return, Sharpe -0.56); see CLAUDE.md for the finding.
+INDICATOR_SWING_ENTRIES_ENABLED = os.getenv(
+    "VELOCITY_INDICATOR_SWING_ENTRIES_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+BOLLINGER_STANDALONE_ENABLED = os.getenv(
+    "VELOCITY_BOLLINGER_STANDALONE_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+BOLLINGER_STANDALONE_MIN_DOLLAR_VOL = float(os.getenv(
+    "VELOCITY_BOLLINGER_STANDALONE_MIN_DOLLAR_VOL", "1000000.0"
+))
+BOLLINGER_STANDALONE_HARD_STOP_PCT = float(os.getenv(
+    "VELOCITY_BOLLINGER_STANDALONE_HARD_STOP_PCT", "0.05"
+))
+BOLLINGER_STANDALONE_TIME_STOP_DAYS = int(os.getenv(
+    "VELOCITY_BOLLINGER_STANDALONE_TIME_STOP_DAYS", "7"
+))
+BOLLINGER_STANDALONE_MAX_OPEN = int(os.getenv(
+    "VELOCITY_BOLLINGER_STANDALONE_MAX_OPEN", "1"
+))
+
 # ── Position-level price blackout detection ───────────────────────────────────
 # When a held position's fresh-price fetch fails for this many consecutive
 # management cycles, emit a CRITICAL alert. Software exits remain disabled

@@ -1595,3 +1595,154 @@
    - `py_compile`: passed.
    - Focused audit tests: 23 passed (21 prior + 2 new regression tests).
    - Full suite: 381 passed.
+
+2. Standalone Bollinger reversion strategy added as a new, independent live strategy, 2026-07-30
+
+   A separate research effort this session (scratchpad-only, not touching this
+   repo) built a strategy-agnostic multi-strategy backtest engine and
+   walk-forward tested six classic strategy families against the full 3-year
+   NASDAQ+NYSE universe. Golden Cross and 52wk Momentum were the initial
+   headline candidates, but a corrected/widened-universe rerun (loosened
+   liquidity floor to $1M 20-day dollar volume, no price floor) flipped the
+   result: Bollinger Reversion (buy on `BB_RECLAIM_LOWER`, no trend/RS gate,
+   exit on midline reclaim / hard stop / time stop) became the standout.
+   Walk-forward validation across 4 out-of-sample 6-month folds (2024-07 to
+   2026-07) found a real position-concentration bug along the way (one trade
+   reached 54% of book equity with the naive equal-weight bucket formula; a
+   10% cap fixed it and *improved* results) and found that a single fixed
+   5%-hard-stop/7-day-time-stop combo — never once selected as "best" by the
+   walk-forward's own train-window grid search — beat the walk-forward's
+   period-by-period reoptimization by a wide margin (chained OOS: fixed
+   +102.9%/Sharpe 1.38 vs. reoptimized +35.0%/Sharpe 0.69). That 5%/7d
+   finding carries a disclosed hindsight-bias risk: it was found by mining
+   the same four out-of-sample folds it was tested on, not from an
+   independent blind test.
+
+   The user explicitly chose, after this caveat was laid out, to deploy
+   directly to the **live real-money account** (not paper first) using the
+   **loosened $1M dollar-volume floor** actually backtested rather than this
+   app's existing $75M production floor.
+
+   Key discovery during implementation: the live codebase already had a
+   `bollinger_reversion` *sleeve name* inside the `indicator_swing` profile
+   (`VALID_INDICATOR_SLEEVES` in `src/strategy_profiles.py`), but it is
+   architecturally unrelated to what was validated — it still requires the
+   full trend/RS gate stack (price > MA50, MA50 > MA200, near 52-week highs,
+   positive 13/26-week returns, etc.) and uses only the standard percent
+   trailing stop as its exit, and is disabled by default because a version of
+   it already underperformed. Simply enabling
+   `VELOCITY_INDICATOR_SWING_STRATEGIES=bollinger_reversion` would have
+   deployed that old, already-rejected variant. This required a genuinely
+   new, standalone, additive code path instead of a config flip.
+
+   Design, deliberately minimizing changes to the existing `indicator_swing`
+   path (the codebase's most serious historical bugs have all been in broker
+   stop-order management — see the entries above):
+
+   - **New standalone module** `src/bollinger_standalone.py`:
+     `evaluate_bollinger_standalone_entry(ctx)` (liquidity + spread +
+     `bb_reclaim_lower` only, deliberately NO trend/RS gates),
+     `bollinger_standalone_rank(ctx)`, `bollinger_standalone_midline_reclaim(row)`,
+     `bollinger_standalone_time_stop_due(bars)`. Kept separate from
+     `src/strategy_profiles.py` since that module's `get_strategy_profile()`/
+     `evaluate_entry_rules()` explicitly declare themselves single-profile and
+     raise `ValueError` for anything else.
+   - **New config** (`src/config.py`): `BOLLINGER_STANDALONE_ENABLED` (env
+     `VELOCITY_BOLLINGER_STANDALONE_ENABLED`, default OFF — explicit opt-in
+     required), `BOLLINGER_STANDALONE_MIN_DOLLAR_VOL` (default `1,000,000.0`),
+     `BOLLINGER_STANDALONE_HARD_STOP_PCT` (`0.05`),
+     `BOLLINGER_STANDALONE_TIME_STOP_DAYS` (`7`),
+     `BOLLINGER_STANDALONE_MAX_OPEN` (`1`).
+   - **Exit safety net preserved, not replaced.** The broker-side TRAIL
+     (`TRAIL_PCT`, already 5% by default — matches what was backtested) and
+     the generic 7% software `HARD_STOP_PCT` keep applying unchanged to every
+     position, Bollinger included. New Bollinger-specific exits (midline
+     reclaim take-profit, 7-day time-stop) were added via the existing
+     `_indicator_strategy_exit_required()` dispatch point in
+     `src/engine_exits.py` (already branched on `entry_strategy` for
+     `ma_cross`/`bollinger_reversion`/`psar_flip`; those branches are
+     untouched). A tighter 5% Bollinger-specific loss cut was added as one
+     new conditional immediately before the generic 7% hard-stop check in
+     `manage_position_exits()`, keyed off
+     `entry_strategy == 'bollinger_reversion_standalone'`. Net effect: live
+     positions get a strict superset of the backtested protections, so live
+     behavior is expected to be somewhat more conservative than the raw
+     backtest, not less. `_audit_stop_orders()`, `_position_needs_stop_audit()`,
+     and the TRAIL-placement mechanics were NOT modified — every position
+     always has broker-side protection.
+   - **Position cap: 1 concurrent slot, not a literal 10%-of-equity dollar
+     cap.** The backtest's 10% cap was validated at $100k/15-slot scale; at
+     this account's actual scale (~$2,000 equity, `MIN_BUCKET_SIZE=$500` →
+     ~4 total slots), a literal 10% cap (~$200) would be smaller than
+     sensible bucket economics support. Capping Bollinger to at most
+     `BOLLINGER_STANDALONE_MAX_OPEN` (1) open position, sized through the
+     exact same `_calc_entry_allocation()`/`MIN_BUCKET_SIZE` machinery
+     `indicator_swing` already uses, achieves the same real goal without
+     inventing sizing math inconsistent with how this account works.
+     Bollinger draws from the SAME total slot pool as `indicator_swing` (not
+     an additive extra slot) — total concurrent risk does not increase.
+   - **New candidate feed via the existing premarket prefilter, not a new
+     scanner.** The IBKR scan codes and the existing prefilter are both
+     momentum-tuned and would never surface a beaten-down mean-reversion
+     candidate. `_prefilter_symbol()` in `src/engine_scanner.py` already
+     builds a full per-symbol daily `ctx` (including `bb_reclaim_lower`,
+     `dollar_vol_20d`) for every universe symbol before checking
+     `indicator_swing`'s gates — one independent, additional check was added
+     there (liquidity + BB reclaim only), populating a **separate**
+     `self._prefilter_bollinger_candidates` list and caching bars for
+     tagged symbols, entirely independent of the existing
+     `candidates`/`reject_reasons` output. Persisted in the prefilter cache
+     JSON as a new `bollinger_candidates` key (extra keys are safely ignored
+     by all existing readers). `bb_mid` was added to both
+     `_build_prefilter_context()` and `get_technical_context()`'s ctx dicts
+     (needed for the midline-reclaim exit and the ranking formula; wasn't
+     previously copied out of the enriched daily dataframe).
+   - **New, purpose-built order-placement routine**, not a refactor of the
+     existing indicator_swing loop. The original plan called for extracting
+     the BUY→confirm→TRAIL sequence in `engine.py` into a shared helper used
+     by both paths; this was deliberately NOT done — touching the existing,
+     already-live 700-line entry loop mid-session under real-money stakes
+     was judged higher-risk than a small amount of duplicated glue code.
+     `EntriesMixin._scan_and_enter_bollinger_standalone()` and
+     `EntriesMixin._place_bollinger_standalone_order()` (`src/engine_entries.py`)
+     are new, fully self-contained methods that reuse the same underlying
+     primitives (`_preflight_order`, `_calc_entry_limit_price`,
+     `_confirm_protective_stop`, `_mark_position_protection`,
+     `_audit_stop_orders`, `_entry_good_after_time`, `_stop_good_after_time`)
+     but never touch or restructure the existing indicator_swing code path.
+     `_scan_and_enter_bollinger_standalone()` re-derives its own
+     window/account/VIX/SPY-regime checks independently rather than
+     depending on indicator_swing's `run_cycle()` branch having executed
+     this cycle, and is called from a single new line in `run_cycle()`
+     right before `_update_position_prices()` — outside all of
+     indicator_swing's nested conditional blocks, so it runs correctly
+     whether or not that branch ran, was skipped, or returned early this
+     cycle. Bear-phase participation is disabled for this strategy (mean
+     reversion in a genuine downtrend is a materially different risk than in
+     `indicator_swing`'s trend-following context).
+
+   Residual risk, disclosed and accepted by the user, not eliminated by this
+   implementation:
+
+   - No paper-trading validation occurs before this touches real capital.
+   - The 5%/7-day parameter combo carries a confirmed hindsight-bias risk.
+   - Live exit behavior is a strict superset of what was backtested (more
+     protective layers stack on top), so live results are not a clean read
+     of the raw backtested numbers.
+   - Worst-case single-trade exposure is capped at one bucket-size slot
+     (roughly $500 or less depending on live equity/settled cash at the
+     time) via the 1-open-position limit.
+   - Candidate supply may be sparse — BB-reclaim + $1M-liquidity setups will
+     not appear every trading day.
+
+   Validation:
+
+   ```bash
+   .venv/bin/python -m py_compile src/config.py src/bollinger_standalone.py src/engine_scanner.py src/engine_exits.py src/engine_entries.py src/engine_base.py src/engine.py tests/test_bollinger_standalone.py
+   VELOCITY_BASE_DIR=/tmp/velocity-test PYTHONPYCACHEPREFIX=/tmp/velocity-pycache .venv/bin/python -m pytest -q -p no:cacheprovider
+   ```
+
+   Results:
+
+   - `py_compile`: passed.
+   - Full suite: 406 passed (381 prior + 25 new `tests/test_bollinger_standalone.py` tests, zero regressions).

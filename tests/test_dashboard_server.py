@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 
 import pytz
@@ -153,6 +154,23 @@ def test_dashboard_equity_chart_uses_intraday_time_labels():
     # commit 8588cbf; enforce that they stay gone.
     assert "<th>R</th>" not in html
     assert "<th>RS 63D</th>" not in html
+    # STRATEGY column removed 2026-08-05: with only one strategy taking new
+    # entries (bollinger_reversion_standalone), per-row strategy attribution
+    # no longer earns a dedicated column.
+    assert "<th>STRATEGY</th>" not in html
+    # SCORE column removed 2026-08-05: bollinger_reversion_standalone (the
+    # only strategy taking new entries) never populates p.score, so the
+    # column would render '—' for every row once ma_cross positions close.
+    assert "<th>SCORE</th>" not in html
     assert "B:${buyVotes" in html
     assert "__SWING_" not in html
     assert "Velocity Exit" not in html
+
+    # Every colspan on the empty-state placeholder rows must match the actual
+    # number of <th> columns in the open-positions table, or the "waiting for
+    # data" / "no open positions" rows render with a broken/misaligned width.
+    th_count = html.count("<th>")
+    for colspan_html in re.findall(r'colspan="(\d+)"', html):
+        assert int(colspan_html) == th_count, (
+            f"colspan={colspan_html} does not match actual <th> count={th_count}"
+        )

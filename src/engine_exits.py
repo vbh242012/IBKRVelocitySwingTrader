@@ -2,10 +2,12 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+from pandas.tseries.holiday import USFederalHolidayCalendar
 
 from src.config import (
     ANALYST_RATING_EXIT_ENABLED,
     ANALYST_RATING_SELL_THRESHOLD,
+    BOLLINGER_STANDALONE_HARD_STOP_PCT,
     DAILY_BAR_SIZE,
     EOD_EXIT_TIME,
     EOD_HOLD_MIN_PROFIT_PCT,
@@ -26,16 +28,41 @@ from src.config import (
     STRATEGY_PROFILE,
 )
 from src.strategy_profiles import get_strategy_profile
+from src.bollinger_standalone import (
+    ENTRY_STRATEGY_NAME as BOLLINGER_STANDALONE_STRATEGY,
+    bollinger_standalone_midline_reclaim,
+    bollinger_standalone_time_stop_due,
+)
+
+
+_US_HOLIDAY_CACHE: Dict[int, set] = {}
+
+
+def _us_market_holidays(year: int) -> set:
+    """US federal holidays for `year`, cached per year.
+
+    Not a perfect NYSE calendar -- NYSE additionally closes for Good Friday
+    (not a federal holiday) and stays open on Columbus Day/Veterans Day
+    (federal holidays) -- but it correctly captures the holidays that matter
+    most for time-based exit counting (New Year's, MLK, Presidents Day,
+    Memorial Day, Juneteenth, July 4th, Labor Day, Thanksgiving, Christmas)
+    without adding a new dependency (pandas is already required).
+    """
+    if year not in _US_HOLIDAY_CACHE:
+        cal = USFederalHolidayCalendar()
+        holidays = cal.holidays(start=f"{year}-01-01", end=f"{year}-12-31")
+        _US_HOLIDAY_CACHE[year] = {d.date() for d in holidays}
+    return _US_HOLIDAY_CACHE[year]
 
 
 def _count_trading_days(entry_dt: datetime, now: datetime) -> int:
-    """Count complete Mon-Fri trading sessions elapsed between entry_dt and now."""
+    """Count complete Mon-Fri, non-holiday trading sessions elapsed between entry_dt and now."""
     entry_date = entry_dt.date()
     now_date   = now.date()
     count      = 0
     cursor     = entry_date
     while cursor < now_date:
-        if cursor.weekday() < 5:
+        if cursor.weekday() < 5 and cursor not in _us_market_holidays(cursor.year):
             count += 1
         cursor += timedelta(days=1)
     return count
@@ -232,9 +259,13 @@ class ExitsMixin:
             )
         return False, f"analyst rating score {rating_score:+.2f}"
 
-    def _indicator_strategy_exit_required(self, sym: str, data: dict) -> tuple[bool, str]:
+    def _indicator_strategy_exit_required(
+        self, sym: str, data: dict, trading_bars_held: int = 0,
+    ) -> tuple[bool, str]:
         strategy = str(data.get('entry_strategy') or '').strip().lower()
-        if strategy not in {'ma_cross', 'bollinger_reversion', 'psar_flip'}:
+        if strategy not in {
+            'ma_cross', 'bollinger_reversion', 'psar_flip', BOLLINGER_STANDALONE_STRATEGY,
+        }:
             return False, "not an indicator-swing position"
 
         last = self._daily_indicator_exit_row(sym)
@@ -247,6 +278,11 @@ class ExitsMixin:
             return True, "two closes above upper Bollinger Band"
         if strategy == "psar_flip" and bool(last.get('PSAR_BEAR_3', False)):
             return True, "three PSAR dots above price"
+        if strategy == BOLLINGER_STANDALONE_STRATEGY:
+            if bollinger_standalone_midline_reclaim(last):
+                return True, "closed back above Bollinger midline (reclaim take-profit)"
+            if bollinger_standalone_time_stop_due(trading_bars_held):
+                return True, f"held {trading_bars_held} trading days without a midline reclaim"
         return False, "strategy exit not triggered"
 
     def _momentum_hold_passes(self, sym: str) -> Tuple[Optional[bool], str]:
@@ -402,6 +438,18 @@ class ExitsMixin:
 
             # ── 1. Intraday hard stop — requires a fresh broker price
             drawdown = (cur - entry_price) / entry_price
+            entry_strategy_hint = str(data.get('entry_strategy') or '').strip().lower()
+            if (
+                entry_strategy_hint == BOLLINGER_STANDALONE_STRATEGY
+                and drawdown <= -BOLLINGER_STANDALONE_HARD_STOP_PCT
+            ):
+                logger.warning(
+                    f"BOLLINGER HARD STOP: {sym} down {drawdown*100:.1f}% from entry "
+                    f"(${cur:.2f} vs entry ${entry_price:.2f}), tighter "
+                    f"{BOLLINGER_STANDALONE_HARD_STOP_PCT*100:.0f}% threshold. Forcing exit."
+                )
+                self.liquidate(sym, reason='bollinger_hard_stop')
+                continue
             if drawdown <= -HARD_STOP_PCT:
                 logger.warning(
                     f"HARD STOP: {sym} down {drawdown*100:.1f}% from entry "
@@ -429,15 +477,6 @@ class ExitsMixin:
                 self.liquidate(sym, reason='analyst_downgrade')
                 continue
 
-            strategy_exit, strategy_reason = self._indicator_strategy_exit_required(sym, data)
-            if strategy_exit:
-                logger.warning(
-                    f"STRATEGY EXIT: {sym} [{data.get('entry_strategy', 'unknown')}] "
-                    f"{strategy_reason}. Closing."
-                )
-                self.liquidate(sym, reason='strategy_exit')
-                continue
-
             entry_time_raw = data.get('time')
             trading_bars_held = 0
             try:
@@ -449,6 +488,17 @@ class ExitsMixin:
                 trading_bars_held = _count_trading_days(entry_dt, now_et)
             except (TypeError, ValueError):
                 trading_bars_held = 0
+
+            strategy_exit, strategy_reason = self._indicator_strategy_exit_required(
+                sym, data, trading_bars_held,
+            )
+            if strategy_exit:
+                logger.warning(
+                    f"STRATEGY EXIT: {sym} [{data.get('entry_strategy', 'unknown')}] "
+                    f"{strategy_reason}. Closing."
+                )
+                self.liquidate(sym, reason='strategy_exit')
+                continue
 
             if profile.time_stop_bars is not None and trading_bars_held >= int(profile.time_stop_bars):
                 min_profit = float(profile.time_stop_min_profit or 0.0)

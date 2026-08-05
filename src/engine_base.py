@@ -170,6 +170,7 @@ class VelocityEngineBase:
         self._prefilter_date: Optional[str] = None
         self._prefilter_status: str = "not_started"
         self._prefilter_candidates: list[str] = []
+        self._prefilter_bollinger_candidates: list[str] = []
         self._prefilter_stats: dict = {}
         self._historical_data_health: Dict[str, dict] = {}
 

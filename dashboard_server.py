@@ -18,6 +18,7 @@ Closing/restarting this server never affects the running AutoTrader.
 import json
 import math
 import os
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -73,14 +74,27 @@ app.add_middleware(
 )
 
 
+_LOCAL_CLIENT_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
 def _request_authorized(request: Request) -> bool:
     """Optional bearer/query-token auth for non-local dashboard deployments."""
     if not DASHBOARD_TOKEN:
-        return True
+        # No token configured is only safe for a request actually arriving
+        # over the loopback interface. The __main__ CLI guard below refuses
+        # to bind to a non-localhost host without a token, but that check
+        # only runs on that one launch path -- this request-level check
+        # protects the app itself even if served by a different ASGI
+        # runner (a bare `uvicorn dashboard_server:app --host 0.0.0.0`)
+        # that bypasses __main__ entirely.
+        client_host = getattr(request.client, "host", None)
+        return client_host in _LOCAL_CLIENT_HOSTS
     auth = request.headers.get("authorization", "")
-    if auth == f"Bearer {DASHBOARD_TOKEN}":
+    expected = f"Bearer {DASHBOARD_TOKEN}"
+    if secrets.compare_digest(auth, expected):
         return True
-    return request.query_params.get("token") == DASHBOARD_TOKEN
+    query_token = request.query_params.get("token", "")
+    return secrets.compare_digest(query_token, DASHBOARD_TOKEN)
 
 
 @app.middleware("http")
@@ -235,13 +249,19 @@ def get_state():
         sl           = float(d.get("stop_loss",     0))
         effective_sl = float(d.get("effective_stop", sl))  # IB trail watermark if tracked
         vol      = float(d.get("volume",      0))
-        entry_ts = d.get("time", now.isoformat())
+        entry_ts = d.get("time") or now.isoformat()
         try:
+            # TypeError as well as ValueError: entry_ts can be present but
+            # non-string (e.g. a stray null/number in state), which
+            # fromisoformat() rejects with TypeError, not ValueError. This
+            # endpoint has no per-position exception isolation, so leaving
+            # TypeError uncaught would take down the entire dashboard
+            # (every position, equity, cash) over one malformed record.
             entry_dt = datetime.fromisoformat(entry_ts)
             if entry_dt.tzinfo is None:
                 entry_dt = tz_ny.localize(entry_dt)
             hold_h = (now - entry_dt).total_seconds() / 3600
-        except ValueError:
+        except (ValueError, TypeError):
             hold_h = 0.0
         unreal     = round((cur - ep) * qty, 2)
         unreal_pct = round((cur - ep) / ep * 100, 2) if ep else 0.0
@@ -679,8 +699,6 @@ footer a{color:var(--dim);text-decoration:none;}
       <thead>
         <tr>
           <th>SYMBOL</th>
-          <th>STRATEGY</th>
-          <th>SCORE</th>
           <th>ENTRY PRICE</th>
           <th>UNIT PRICE</th>
           <th>CURRENT PRICE</th>
@@ -695,7 +713,7 @@ footer a{color:var(--dim);text-decoration:none;}
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr class="empty"><td colspan="14">Waiting for data…</td></tr>
+        <tr class="empty"><td colspan="12">Waiting for data…</td></tr>
       </tbody>
     </table>
   </div>
@@ -819,7 +837,7 @@ function render(d) {
   document.getElementById('mkt-value').textContent = $f(d.mkt_value||0);
   document.getElementById('bucket').textContent    = $f(d.bucket_size||0);
   document.getElementById('alloc').textContent    = (d.allocation_pct||0).toFixed(1)+'%';
-  document.getElementById('poscount').textContent = `${d.position_count||0} / ${d.max_positions||3}`;
+  document.getElementById('poscount').textContent = `${d.position_count??0} / ${d.max_positions??0}`;
 
   const strat = d.strategy || {};
   const strategyBadge = document.getElementById('strategy-badge');
@@ -908,7 +926,7 @@ function render(d) {
   // Portfolio
   const tb = document.getElementById('tbody');
   if (!d.positions || d.positions.length === 0) {
-    tb.innerHTML = '<tr class="empty"><td colspan="16">No open positions</td></tr>';
+    tb.innerHTML = '<tr class="empty"><td colspan="12">No open positions</td></tr>';
     return;
   }
   tb.innerHTML = d.positions.map(p => {
@@ -916,8 +934,6 @@ function render(d) {
     const unrP  = p.unrealized_pct ?? 0;
     const ucls  = unr > 0 ? 'up' : unr < 0 ? 'un' : 'uz';
     const usign = unr >= 0 ? '+' : '';
-    const sc    = p.score != null ? p.score.toFixed(1) : '—';
-    const scCls = p.score != null ? (p.score >= 70 ? 'g' : p.score >= 45 ? 'y' : 'r') : 'd';
     const ar    = p.analyst_rating_score;
     const arCls = ar == null ? 'd' : ar > 0.15 ? 'g' : ar < -0.15 ? 'r' : 'y';
     const arTxt = ar == null
@@ -937,8 +953,6 @@ function render(d) {
     const protCls = p.protection_status === 'confirmed' ? 'g' : p.protection_status === 'pending' ? 'y' : 'd';
     return `<tr>
       <td>${p.symbol}</td>
-      <td style="font-size:10px">${cleanLabel(p.entry_strategy_label || p.entry_strategy || p.strategy_profile || '—')}</td>
-      <td class="${scCls}" style="font-weight:700">${sc}</td>
       <td>${$f(p.entry_price)}</td>
       <td class="c" style="font-size:11px">${p.unit_price != null ? $f(p.unit_price) : '<span style="color:var(--dim)">pending</span>'}</td>
       <td>${$f(p.current_price)}</td>

@@ -3,32 +3,53 @@ Automated Swing Trading For Small Cash Account With T+1 Settlement Days Using In
 
 ## Strategy
 
-The default profile is now `indicator_swing`.
+Two strategies can hold live positions, both gated by independent kill
+switches in the profile's `.env.*.local` file. Both share the same broker
+order-placement/protection machinery, the same slot pool, and the same
+account-level safety controls (VIX regime filter, spread cap, correlation
+cap, sector cap, settled-cash sizing, T+1 settlement).
 
-The bot is a short swing system. The old ORB/legacy strategy profiles have
-been removed; `indicator_swing` is the only maintained strategy profile:
+### `indicator_swing` — relative-strength-first swing momentum
 
-- The default profile is relative-strength first. A stock must pass trend,
-  liquidity, relative-strength, weekly-uptrend, MA50/MA200, 52-week-high
-  proximity, ATR, spread, and volume gates before an indicator sleeve can buy.
-- EMA20 above SMA50 is the default trend state; fresh crosses, MA reclaims, or
-  prior-high breaks can time entries after the RS gate passes. Bollinger lower
-  band reclaim and PSAR flip are optional `indicator_swing` sleeves, but they
-  are not enabled by default because multi-year validation did not justify
-  using them as primary live triggers.
-- RSI momentum/recovery plus at least two of MACD, stochastic, OBV, PSAR, and
-  volume pace must confirm. Analyst ratings can adjust score, but cannot create
-  a buy by themselves. The default minimum entry score is 50.
-- Each position stores the sleeve that opened it and exits on that same sleeve's
-  sell rule.
-- Swing exits avoid same-day EOD churn: winners trim nearest whole-share
-  cumulative profit tiers at +1R, +1.5R, and +2R so roughly 20%, 40%, and 60%
-  of the original position has been sold. `R` is the original per-share
-  Chandelier risk distance captured at entry. The remaining runner is protected
-  by the broker Chandelier stop; software hard stop, close-confirmed break-even
-  protection after +1R/first tier, analyst downgrade only with price weakness,
-  and a 10-bar no-progress time stop remain active safety exits. Position size
-  is based on the broker-protected Chandelier distance.
+The primary, trend-following profile (`VELOCITY_INDICATOR_SWING_ENTRIES_ENABLED`,
+default on):
+
+- Relative-strength first. A stock must pass trend, liquidity,
+  relative-strength, weekly-uptrend, MA50/MA200, 52-week-high proximity, ATR,
+  spread, and volume gates before an indicator sleeve can buy.
+- EMA20 above SMA50 is the default trend state; MA reclaims or prior-high
+  breaks time entries after the RS gate passes. Bollinger lower-band reclaim
+  and PSAR flip are optional additional sleeves inside this same
+  trend/RS-gated profile (`VELOCITY_INDICATOR_SWING_STRATEGIES`), not enabled
+  by default.
+- RSI momentum/recovery plus at least two of MACD, stochastic, OBV, and PSAR
+  must confirm. Volume pace is a separate hard gate, not a confirmation vote.
+  Analyst ratings can adjust score but cannot create a buy by themselves. The
+  default minimum entry score is 50.
+- Each position stores the sleeve that opened it and exits on that sleeve's
+  rule.
+- Exits: a broker-side flat percent TRAIL order (`TRAIL_PCT`, default 5% from
+  peak price) is the primary, always-on protection. A software hard stop and
+  a same-day (15:50 ET) EOD quality-hold rule — liquidate unless price is
+  above VWAP/entry, near the day high, and outperforming SPY intraday — back
+  it up. A periodic momentum-stall check can also close a position that has
+  stopped making fresh progress even while still profitable. Friday close and
+  analyst-downgrade-with-price-confirmation are additional safety exits.
+
+### Standalone Bollinger mean reversion
+
+A separate, additive strategy (`VELOCITY_BOLLINGER_STANDALONE_ENABLED`,
+default off) with no trend/RS gates at all — entry is liquidity + spread +
+`BB_RECLAIM_LOWER` (two prior closes below the lower Bollinger band, then a
+reclaim). Exit is midline reclaim, a tighter 5% hard stop, or a 7-day time
+stop, on top of the same broker percent TRAIL every position gets. Capped to
+`BOLLINGER_STANDALONE_MAX_OPEN` (default 1) concurrent position, drawn from
+the same slot pool as `indicator_swing` rather than an additive extra slot.
+See `src/bollinger_standalone.py`.
+
+Check `.env.live.local` / `.env.paper.local` for which of the two is actually
+enabled for new entries in a given deployment — both can be toggled
+independently.
 
 Analyst ratings are optional confirmation. Live and paper trading use a dated
 local CSV first, Finnhub recommendation trends when `VELOCITY_FINNHUB_API_KEY`

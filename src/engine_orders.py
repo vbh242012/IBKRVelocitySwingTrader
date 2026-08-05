@@ -27,6 +27,23 @@ from src.engine_base import VelocityEngineBase
 class OrdersMixin:
 
     @staticmethod
+    def _resolve_order_client_id(order) -> int:
+        """Return the order's real IB clientId, defaulting only when absent.
+
+        `getattr(order, 'clientId', IB_CLIENT_ID) or IB_CLIENT_ID` treats a
+        clientId of 0 (IBKR's convention for orders placed manually via
+        TWS/Gateway's own GUI, not through the API) the same as a genuinely
+        missing attribute, silently misclassifying a manually-placed order as
+        belonging to this engine. 0 is distinguished from "attribute absent"
+        by checking for None explicitly, not falsiness.
+        """
+        raw = getattr(order, 'clientId', None)
+        try:
+            return int(raw) if raw is not None else IB_CLIENT_ID
+        except (TypeError, ValueError):
+            return IB_CLIENT_ID
+
+    @staticmethod
     def _trail_order_protection(order, pos_data: dict) -> Tuple[bool, str, float, float]:
         """Interpret IB TRAIL SELL fields as (valid, display, stop_dist, stop_loss).
 
@@ -223,10 +240,7 @@ class OrdersMixin:
         if current_gat == gate_str:
             return trade, True
 
-        try:
-            order_client_id = int(getattr(order, 'clientId', IB_CLIENT_ID) or IB_CLIENT_ID)
-        except (TypeError, ValueError):
-            order_client_id = IB_CLIENT_ID
+        order_client_id = self._resolve_order_client_id(order)
         if order_client_id != IB_CLIENT_ID:
             self._alert(
                 "CRITICAL",
@@ -532,6 +546,22 @@ class OrdersMixin:
                 )
                 continue
 
+            if pos_data.get('pending_exit'):
+                # liquidate() may have just cancelled the TRAIL and submitted a
+                # market SELL that hasn't confirmed terminal status yet. If the
+                # audit runs in that window it can misclassify the resting SELL
+                # as a stray non-TRAIL order, cancel it, and rebuild a fresh
+                # TRAIL — reversing an in-flight risk-control exit decision.
+                # _sync_positions_from_ibkr() self-heals a stuck pending_exit
+                # (position still present after two confirming snapshots), so
+                # skipping here is bounded, not a permanent protection gap.
+                logger.info(
+                    f"AUDIT: {sym} skipped — liquidation in progress "
+                    "(pending_exit); not rebuilding protection over an "
+                    "in-flight exit."
+                )
+                continue
+
             qty = float(pos_data.get('qty', 0))
             if qty <= 0:
                 logger.warning(f"AUDIT: {sym} — qty={qty}, cannot place stop")
@@ -606,12 +636,7 @@ class OrdersMixin:
             # Respect clientId: only attempt cancellation of orders this engine owns.
             if trail_orders and trail_meta.get(id(trail_orders[0]), {}).get('trail_pct') is None:
                 primary = trail_orders[0]
-                try:
-                    order_client_id = int(
-                        getattr(primary.order, 'clientId', IB_CLIENT_ID) or IB_CLIENT_ID
-                    )
-                except (TypeError, ValueError):
-                    order_client_id = IB_CLIENT_ID
+                order_client_id = self._resolve_order_client_id(primary.order)
                 if order_client_id != IB_CLIENT_ID:
                     logger.warning(
                         f"AUDIT: {sym} — dollar TRAIL (id={primary.order.orderId}) "
@@ -636,22 +661,45 @@ class OrdersMixin:
 
             if trail_orders:
                 primary_trail = trail_orders[0]
-                meta = trail_meta.get(id(primary_trail), {})
                 primary_trail, gate_ok = self._replace_trail_with_stop_activation_gate(
                     primary_trail,
                     sym,
                     qty,
                     self._stop_good_after_time(),
                 )
-                stop_dist = float(meta.get('stop_dist') or 0.0)
-                stop_loss = float(meta.get('stop_loss') or 0.0)
-                if stop_dist > 0:
-                    self.state[sym]['stop_dist'] = round(stop_dist, 2)
-                if stop_loss > 0:
-                    self.state[sym]['stop_loss'] = round(stop_loss, 2)
-                    self.state[sym]['effective_stop'] = round(stop_loss, 2)
-                trail_pct = meta.get('trail_pct')
-                if trail_pct:
+                # gate_ok only reports whether the gate replacement itself
+                # succeeded, not whether protection actually survives at the
+                # broker — a rejected/failed gate replacement can fall back
+                # through a restore attempt that also fails, cancelling the
+                # last live order and returning a stale, now-cancelled trade
+                # reference. Re-verify against the order the call actually
+                # returned rather than trusting gate_ok or the pre-replacement
+                # meta computed from the order that may no longer exist.
+                if not self._trade_is_matching_trail_sell(primary_trail, sym, qty):
+                    self._mark_position_protection(
+                        sym,
+                        'unconfirmed',
+                        'stop_gate_replacement_left_no_live_trail',
+                    )
+                    self._alert(
+                        "CRITICAL",
+                        f"AUDIT: {sym} — stop-activation-gate replacement did not "
+                        f"leave a live TRAIL SELL at the broker; position is "
+                        f"unprotected — will retry on next cycle."
+                    )
+                    continue
+
+                trail_ok, trail_desc, trail_dist, trail_stop = self._trail_order_protection(
+                    primary_trail.order, pos_data
+                )
+                if trail_dist > 0:
+                    self.state[sym]['stop_dist'] = round(trail_dist, 2)
+                if trail_stop > 0:
+                    self.state[sym]['stop_loss'] = round(trail_stop, 2)
+                    self.state[sym]['effective_stop'] = round(trail_stop, 2)
+                aux_dist = self._coerce_order_number(getattr(primary_trail.order, 'auxPrice', None))
+                trail_pct = self._coerce_order_number(getattr(primary_trail.order, 'trailingPercent', None))
+                if aux_dist is None and trail_pct:
                     self.state[sym]['stop_mode'] = 'percent'
                     self.state[sym]['trailing_percent'] = round(float(trail_pct), 4)
                 else:
@@ -665,7 +713,7 @@ class OrdersMixin:
                 logger.info(
                     f"AUDIT: {sym} — TRAIL SELL confirmed "
                     f"(id={primary_trail.order.orderId} "
-                    f"{meta.get('desc', 'protection fields unavailable')} "
+                    f"{trail_desc} "
                     f"entry_gate={'ok' if gate_ok else 'failed'})"
                 )
                 continue
@@ -962,10 +1010,19 @@ class OrdersMixin:
             )
 
     def _active_open_trades_for_symbol(self, symbol: str) -> list:
-        """Return non-terminal open trades for one symbol."""
+        """Return non-terminal open trades for one symbol.
+
+        Uses the same reqAllOpenOrders()-warmed lookup as the protective-stop
+        audit (_open_trades_for_audit), not the bare openTrades() cache alone
+        -- ib.openTrades() can be empty for a still-live GTC TRAIL until this
+        API client has requested the broker's all-open-orders feed, which
+        would otherwise let a liquidation "see" no protective order and
+        proceed straight to a market SELL that IBKR then rejects as a
+        potential cash-account short sale.
+        """
         from src.engine_base import logger, _REJECTED_ORDER_STATUSES
         try:
-            open_trades = self.ib.openTrades()
+            open_trades = self._open_trades_for_audit()
         except Exception as e:
             logger.warning(f"LIQUIDATE {symbol}: could not query open trades: {e}")
             return []
@@ -1006,6 +1063,19 @@ class OrdersMixin:
             "before cash-account market exit"
         )
         for trade in open_trades:
+            # Only cancel orders this engine actually owns -- unlike the
+            # audit path, this loop had no clientId ownership check at all
+            # and would blindly cancel any open order for the symbol,
+            # including one placed manually or by a different API client.
+            order_client_id = self._resolve_order_client_id(trade.order)
+            if order_client_id != IB_CLIENT_ID:
+                logger.warning(
+                    f"LIQUIDATE {symbol}: order (id={getattr(trade.order, 'orderId', None)}) "
+                    f"belongs to clientId={order_client_id}, not this engine "
+                    f"(clientId={IB_CLIENT_ID}); not cancelling -- it may still "
+                    "block the market exit and require manual review."
+                )
+                continue
             try:
                 self.ib.cancelOrder(trade.order)
             except Exception as e:
@@ -1042,6 +1112,13 @@ class OrdersMixin:
                     if symbol in self.state:
                         self.state[symbol].pop('pending_exit', None)
                         self.save_state()
+                    # Cancellation may have actually succeeded at the broker
+                    # slowly, just not within our confirmation poll window —
+                    # unlike every other failure branch below, this one must
+                    # also re-audit so a genuinely cancelled TRAIL gets rebuilt
+                    # rather than silently left unprotected until the next
+                    # scheduled audit.
+                    self._audit_stop_orders()
                     continue
 
                 if symbol in self.state:

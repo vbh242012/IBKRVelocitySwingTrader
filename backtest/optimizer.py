@@ -76,6 +76,7 @@ def _prepare_base(
     max_symbols: int | None = None,
     scoring_model: str | None = None,
     strategy_profile: str | None = None,
+    liquidity_cutoff: str | None = None,
 ) -> VelocityBacktest:
     base = VelocityBacktest(
         start=start,
@@ -98,7 +99,12 @@ def _prepare_base(
             base._save_cache()
     if not base._data:
         raise RuntimeError("No usable data downloaded. Check tickers / dates.")
-    _limit_symbols(base, max_symbols)
+    # Rank liquidity only through liquidity_cutoff (the train/forward split)
+    # when given, not all the way to base.end -- otherwise which symbols
+    # even make it into a bounded (--max-symbols) run's universe is decided
+    # using dollar-volume data from the forward/holdout period itself, a
+    # look-ahead bias in universe selection.
+    _limit_symbols(base, max_symbols, end=liquidity_cutoff or end)
     base._validate_regime_data()
     return base
 
@@ -117,14 +123,14 @@ def _symbol_liquidity_score(df: pd.DataFrame, start: str, end: str) -> float:
     return score if math.isfinite(score) else float("-inf")
 
 
-def _limit_symbols(base: VelocityBacktest, max_symbols: int | None) -> None:
+def _limit_symbols(base: VelocityBacktest, max_symbols: int | None, end: str | None = None) -> None:
     """Keep the most liquid symbols for fast optimization smoke passes."""
     if max_symbols is None or max_symbols <= 0 or len(base._data) <= max_symbols:
         return
 
     ranked = sorted(
         (
-            (_symbol_liquidity_score(df, base.start, base.end), sym)
+            (_symbol_liquidity_score(df, base.start, end or base.end), sym)
             for sym, df in base._data.items()
         ),
         reverse=True,
@@ -212,6 +218,7 @@ def run_optimization(
         max_symbols=max_symbols,
         scoring_model=scoring_model,
         strategy_profile=strategy_profile,
+        liquidity_cutoff=split,
     )
     candidates = list(grid or default_grid())
     runs: List[OptimizationRun] = []
@@ -228,6 +235,15 @@ def run_optimization(
         forward = _run_with_params(base, split, end, params)
         train_score = score_metrics(train.metrics, min_train_trades)
         forward_score = score_metrics(forward.metrics, min_forward_trades)
+        # robust_score is kept and reported for diagnostic visibility only --
+        # it must NOT be used to select the winner (see the sort key below).
+        # Selecting on min(train, forward) bakes each candidate's own
+        # "out-of-sample" forward result directly into its own selection
+        # criterion, which defeats the point of a blind holdout: every
+        # candidate is partly chosen because of how well it happened to do
+        # in the very period meant to test it. The correct walk-forward
+        # procedure selects using the train period alone and reports the
+        # forward result purely as an after-the-fact check.
         robust_score = round(min(train_score, forward_score), 6)
         runs.append(
             OptimizationRun(
@@ -241,18 +257,22 @@ def run_optimization(
         )
         if progress:
             print(
-                f"  [{idx:>2}/{len(candidates)}] robust={robust_score:.2f} "
+                f"  [{idx:>2}/{len(candidates)}] train={train_score:.2f} "
                 f"forward={forward_score:.2f} trades_f={forward.metrics.get('total_trades', 0)} "
                 f"trail_pct={params.trail_pct:.0%}",
                 flush=True,
             )
-    runs.sort(key=lambda r: (r.robust_score, r.forward_score, r.train_score), reverse=True)
+    runs.sort(key=lambda r: (r.train_score, r.forward_score), reverse=True)
     return runs[:top_n]
 
 
 def format_optimization_table(runs: Iterable[OptimizationRun]) -> str:
+    # Ranked by (train_score, forward_score) -- see run_optimization(). robust
+    # (min(train, forward)) is reported last, for diagnostic visibility only;
+    # it does NOT drive this ordering, so it will not generally be monotonic
+    # down the table.
     lines = [
-        "rank robust forward train trades_f ret_f sharpe_f dd_f params",
+        "rank train forward robust(diag) trades_f ret_f sharpe_f dd_f params",
         "-" * 120,
     ]
     for rank, run in enumerate(runs, start=1):
@@ -260,8 +280,8 @@ def format_optimization_table(runs: Iterable[OptimizationRun]) -> str:
         tm = run.train_metrics
         p = run.params
         lines.append(
-            f"{rank:>4} {run.robust_score:>6.2f} {run.forward_score:>7.2f} "
-            f"{run.train_score:>6.2f} {fm.get('total_trades', 0):>8} "
+            f"{rank:>4} {run.train_score:>6.2f} {run.forward_score:>7.2f} "
+            f"{run.robust_score:>12.2f} {fm.get('total_trades', 0):>8} "
             f"{fm.get('total_return_pct', 0.0):>6.1f}% "
             f"{fm.get('sharpe_ratio', 0.0):>7.2f} "
             f"{fm.get('max_drawdown_pct', 0.0):>6.1f}% "
