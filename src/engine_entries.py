@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
@@ -14,6 +15,7 @@ from src.config import (
     ATR_PCT_MAX,
     SPREAD_MAX_PCT,
     STRATEGY_PROFILE,
+    POSITIONS_RECHECK_TIMEOUT_SEC,
     ENTRY_START, ENTRY_END, STOP_ACTIVATION_TIME,
     MARKET_CLOSE_TIME, PREMARKET_READINESS_TIME, POST_CLOSE_MAINTENANCE_TIME,
     APP_PREFILTER_ENABLED, APP_PREFILTER_START_TIME,
@@ -399,6 +401,47 @@ class EntriesMixin:
         """
         from src.engine_base import logger, _TZ_NY
         ibkr_pos = {p.contract.symbol: p for p in self.ib.positions()}
+
+        # ib.positions() is a passive client-side cache; it can read
+        # completely empty right after a connect/reconnect whose startup sync
+        # didn't fully land (see IB_CONNECT_SYNC_TIMEOUT_SEC in config.py for
+        # the fix to that specific gap). If every currently tracked symbol
+        # would read as flat in this same pass, that is a much stronger
+        # anomaly signal than one position closing -- a real broker-side
+        # stop/target essentially never fires for multiple independent
+        # positions in the same ~60s cycle, but a stale/empty cache snapshot
+        # does exactly this every time. Re-verify with one fresh, bounded,
+        # non-cached request before trusting a full wipeout. (2026-08-08: this
+        # gap wrongly deleted two live positions' state and cancelled their
+        # real protective TRAIL stops during an IBKR data-farm outage.)
+        if self.state and not self._force_exit_active() and not any(
+            sym in ibkr_pos and float(ibkr_pos[sym].position) > 0 for sym in self.state
+        ):
+            try:
+                fresh = self.ib.run(
+                    asyncio.wait_for(self.ib.reqPositionsAsync(), POSITIONS_RECHECK_TIMEOUT_SEC)
+                )
+                ibkr_pos = {p.contract.symbol: p for p in fresh}
+            except Exception as e:
+                logger.warning(
+                    f"SYNC: every one of {len(self.state)} tracked position(s) read as "
+                    f"missing from the cached snapshot, and the confirming reqPositions() "
+                    f"re-check failed ({e}); skipping reconciliation this cycle rather than "
+                    "trusting a possibly-stale/empty snapshot."
+                )
+                return
+            if any(sym in ibkr_pos and float(ibkr_pos[sym].position) > 0 for sym in self.state):
+                logger.warning(
+                    "SYNC: cached ib.positions() read every tracked position as missing, "
+                    "but a fresh reqPositions() re-check found at least one still open -- "
+                    "the cached snapshot was stale; using the fresh result instead."
+                )
+            else:
+                logger.warning(
+                    f"SYNC: fresh reqPositions() re-check confirms all {len(self.state)} "
+                    "tracked position(s) are flat at IBKR."
+                )
+
         missing_counts = getattr(self, '_missing_position_counts', {})
         changed  = False
 

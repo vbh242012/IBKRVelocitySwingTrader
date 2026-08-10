@@ -96,6 +96,19 @@ def _mock_ib():
     # No open IBKR positions — so _sync_positions_from_ibkr leaves state alone
     ib.positions.return_value = []
 
+    # Fresh, non-cached positions re-check used by _sync_positions_from_ibkr()'s
+    # "every tracked position vanished at once" guard. Mirrors
+    # ib.positions.return_value by default so existing sync-removal tests see
+    # the same result from both the cached and fresh paths; tests exercising
+    # the guard itself override ib.run.side_effect directly. Closes (rather
+    # than awaits) the coroutine argument to avoid a spurious "coroutine was
+    # never awaited" warning -- this test double never actually runs it.
+    def _fake_ib_run(coro, *a, **kw):
+        if hasattr(coro, 'close'):
+            coro.close()
+        return ib.positions.return_value
+    ib.run.side_effect = _fake_ib_run
+
     # loopUntil must return an iterable — engine: 'for _ in ib.loopUntil(...): pass'
     ib.loopUntil.return_value = [True]
 
@@ -2902,6 +2915,94 @@ class TestEdgeCases:
         engine._sync_positions_from_ibkr()
 
         assert 'AAPL' not in engine.state
+
+    def test_sync_stale_empty_cache_corrected_by_fresh_recheck(self):
+        """2026-08-08 regression: a stale/empty ib.positions() cache must not
+        wipe out real positions when a fresh reqPositions() re-check disagrees.
+        """
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        engine.state = {
+            'BNY':  {'price': 159.94, 'qty': 3.0, 'stop_loss': 151.94,
+                     'volume': 0, 'score': 50,
+                     'time': datetime.now(pytz.timezone('US/Eastern')).isoformat()},
+            'CTRI': {'price': 22.80, 'qty': 23.0, 'stop_loss': 21.66,
+                     'volume': 0, 'score': 50,
+                     'time': datetime.now(pytz.timezone('US/Eastern')).isoformat()},
+        }
+
+        # Cached ib.positions() reads empty (e.g. right after a connect whose
+        # startup sync didn't fully land), but both positions are still real
+        # and open — the fresh, non-cached re-check must find them.
+        ib.positions.return_value = []
+        bny = MagicMock()
+        bny.contract.symbol = 'BNY'
+        bny.position        = 3.0
+        bny.avgCost         = 159.94
+        ctri = MagicMock()
+        ctri.contract.symbol = 'CTRI'
+        ctri.position         = 23.0
+        ctri.avgCost          = 22.80
+
+        def _fake_ib_run(coro, *a, **kw):
+            if hasattr(coro, 'close'):
+                coro.close()
+            return [bny, ctri]
+        ib.run.side_effect = _fake_ib_run
+
+        engine._sync_positions_from_ibkr()
+
+        assert 'BNY' in engine.state
+        assert 'CTRI' in engine.state
+        assert engine._missing_position_counts.get('BNY', 0) == 0
+        assert engine._missing_position_counts.get('CTRI', 0) == 0
+
+    def test_sync_all_positions_genuinely_flat_confirmed_by_fresh_recheck(self):
+        """When the fresh re-check also agrees everything is flat, removal proceeds."""
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        engine.state = {
+            'BNY':  {'price': 159.94, 'qty': 3.0, 'stop_loss': 151.94,
+                     'volume': 0, 'score': 50,
+                     'time': datetime.now(pytz.timezone('US/Eastern')).isoformat()},
+            'CTRI': {'price': 22.80, 'qty': 23.0, 'stop_loss': 21.66,
+                     'volume': 0, 'score': 50,
+                     'time': datetime.now(pytz.timezone('US/Eastern')).isoformat()},
+        }
+        ib.positions.return_value = []
+        ib.openTrades.return_value = []
+        # ib.run.side_effect defaults to mirroring ib.positions.return_value.
+
+        engine._sync_positions_from_ibkr()
+        engine._sync_positions_from_ibkr()
+
+        assert 'BNY' not in engine.state
+        assert 'CTRI' not in engine.state
+
+    def test_sync_skips_reconciliation_when_fresh_recheck_fails(self):
+        """A failed fresh re-check must not remove state on unverified data."""
+        ib     = _mock_ib()
+        engine = _make_engine(ib)
+        engine.state = {
+            'AAPL': {
+                'price': 175.0, 'qty': 5.0, 'stop_loss': 160.0,
+                'volume': 0, 'score': 50,
+                'time': datetime.now(pytz.timezone('US/Eastern')).isoformat(),
+            }
+        }
+        ib.positions.return_value = []
+
+        def _fake_ib_run_fails(coro, *a, **kw):
+            if hasattr(coro, 'close'):
+                coro.close()
+            raise RuntimeError("positions request timed out")
+        ib.run.side_effect = _fake_ib_run_fails
+
+        engine._sync_positions_from_ibkr()
+        engine._sync_positions_from_ibkr()
+
+        assert 'AAPL' in engine.state
+        assert engine._missing_position_counts.get('AAPL', 0) == 0
 
     def test_sync_avgcost_zero_position_skips_eod_profit_cleanup_check(self):
         """Position synced with avgCost=0 must not crash EOD exit management."""

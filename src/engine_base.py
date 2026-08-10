@@ -25,7 +25,7 @@ from src.config import (
     ALERT_WEBHOOK_URL, ALERT_TIMEOUT_SEC,
     IB_ERROR_DEDUP_WINDOW_SEC,
     RECONNECT_INITIAL_WAIT_SEC, RECONNECT_MAX_WAIT_SEC, ALERT_DEDUP_WINDOW_SEC,
-    CONNECT_MAX_ATTEMPTS,
+    CONNECT_MAX_ATTEMPTS, IB_CONNECT_SYNC_TIMEOUT_SEC,
     ACCOUNT_CURRENCY,
     LOG_BACKUP_COUNT,
     ERROR_WAIT,
@@ -246,7 +246,10 @@ class VelocityEngineBase:
                         f"IB Gateway API port {IB_HOST}:{IB_PORT} is unavailable "
                         "and auto-start is disabled."
                     )
-                self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
+                self.ib.connect(
+                    IB_HOST, IB_PORT, clientId=IB_CLIENT_ID,
+                    timeout=IB_CONNECT_SYNC_TIMEOUT_SEC, raiseSyncErrors=True,
+                )
                 self.ib.reqMarketDataType(MARKET_DATA_TYPE)
                 self.ib.errorEvent            += self._on_ib_error
                 self.ib.disconnectedEvent     += self._on_ib_disconnect
@@ -499,7 +502,10 @@ class VelocityEngineBase:
                         f"IB Gateway API port {IB_HOST}:{IB_PORT} is unavailable "
                         "and auto-start is disabled."
                     )
-                self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
+                self.ib.connect(
+                    IB_HOST, IB_PORT, clientId=IB_CLIENT_ID,
+                    timeout=IB_CONNECT_SYNC_TIMEOUT_SEC, raiseSyncErrors=True,
+                )
                 self.ib.reqMarketDataType(MARKET_DATA_TYPE)
                 logger.info(f"RECONNECT: success on attempt {attempt}")
                 self._metric_inc('reconnect_successes')

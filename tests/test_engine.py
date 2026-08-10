@@ -667,6 +667,14 @@ class TestConnectionSafety:
 
         mock_ready.assert_called_once()
         ib.connect.assert_called_once()
+        # 2026-08-08 regression: without raiseSyncErrors=True, ib_async's
+        # connect() silently swallows a timed-out positions/orders/account
+        # startup sync and still reports success, leaving ib.positions()
+        # empty/stale. That let _sync_positions_from_ibkr() wrongly delete
+        # two live positions' state and cancel their real protective stops
+        # during an IBKR data-farm outage.
+        assert ib.connect.call_args.kwargs.get('raiseSyncErrors') is True
+        assert ib.connect.call_args.kwargs.get('timeout') is not None
         mock_dash.assert_called_once_with(connected=True)
         mock_warmup.assert_called_once_with(reason="connect")
 
@@ -691,6 +699,25 @@ class TestConnectionSafety:
             args[0] == 'CRITICAL' and 'CONNECTION FAILED' in args[1]
             for args, _ in mock_alert.call_args_list
         )
+
+    def test_reconnect_also_requires_sync_errors_to_raise(self):
+        """_reconnect() must use the same raiseSyncErrors=True guard as connect()."""
+        from src.engine import VelocityEngine
+
+        ib = _mock_ib()
+        engine = VelocityEngine.__new__(VelocityEngine)
+        engine.ib = ib
+
+        with patch.object(engine, '_validate_deployment_mode'), \
+             patch.object(engine, '_write_dashboard_data'), \
+             patch.object(engine, '_warmup_historical_data'), \
+             patch.object(engine, '_metric_inc'), \
+             patch('src.engine_base.ensure_ib_gateway_ready', return_value=True):
+            result = engine._reconnect()
+
+        assert result is True
+        assert ib.connect.call_args.kwargs.get('raiseSyncErrors') is True
+        assert ib.connect.call_args.kwargs.get('timeout') is not None
 
     def test_run_cycle_skips_when_reconnect_fails(self):
         ib     = _mock_ib()

@@ -398,6 +398,26 @@ RECONNECT_MAX_WAIT_SEC = float(os.getenv("VELOCITY_RECONNECT_MAX_WAIT_SEC", "300
 # Maximum in-process connection attempts before giving up and calling sys.exit().
 # Each retry uses exponential backoff (RECONNECT_INITIAL_WAIT_SEC × 2^attempt).
 CONNECT_MAX_ATTEMPTS = int(os.getenv("VELOCITY_CONNECT_MAX_ATTEMPTS", "5"))
+# ib_async's connect() runs its startup sync (positions, open/completed orders,
+# account updates, executions) with a default 4s per-request timeout and, by
+# default, only logs a timeout rather than failing the connection
+# (raiseSyncErrors=False upstream). That let a 2026-08-08 IBKR data-farm outage
+# leave ib.positions() silently empty after a "successful" reconnect, which
+# _sync_positions_from_ibkr() then trusted as ground truth and cancelled two
+# live positions' real protective stops. connect()/_reconnect() now pass
+# raiseSyncErrors=True with this more generous timeout so a broken startup
+# sync counts as a failed connection attempt (existing retry/backoff handles
+# it) instead of a false "connected" state with stale broker data.
+IB_CONNECT_SYNC_TIMEOUT_SEC = float(os.getenv("VELOCITY_IB_CONNECT_SYNC_TIMEOUT_SEC", "20"))
+# Defense-in-depth for the same 2026-08-08 failure class: if every currently
+# tracked position reads as flat in ib.positions()'s passive client-side
+# cache in the same reconciliation pass, _sync_positions_from_ibkr() re-checks
+# with one fresh, bounded, non-cached reqPositions() call before trusting a
+# full wipeout, since a real broker-side stop/target essentially never closes
+# multiple independent positions in the same ~60s cycle the way a stale/empty
+# cache snapshot does. Kept short since it is a single lightweight request,
+# not the multi-request connect() sync.
+POSITIONS_RECHECK_TIMEOUT_SEC = float(os.getenv("VELOCITY_POSITIONS_RECHECK_TIMEOUT_SEC", "15"))
 # Suppress identical CRITICAL/ERROR alerts within this window (seconds) to
 # prevent webhook and log floods during prolonged outages.
 ALERT_DEDUP_WINDOW_SEC = float(os.getenv("VELOCITY_ALERT_DEDUP_WINDOW_SEC", "600"))
